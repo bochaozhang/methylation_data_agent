@@ -1,0 +1,93 @@
+llm:
+  backend: openai          # openai | anthropic | ollama
+  model: gpt-4o
+  api_key_env: OPENAI_API_KEY
+  temperature: 0
+  max_tokens: 4096
+
+download:
+  output_dir: ./data/methylation
+  max_concurrent: 5
+  retry_attempts: 3
+  retry_delay: 2           # seconds, exponential backoff base
+  chunk_size_mb: 10
+  timeout: 300             # seconds per request
+
+registry:
+  db_path: ./registry/methyagent.db
+
+geo:
+  api_key_env: NCBI_API_KEY   # optional, raises rate limit from 3 to 10 req/s
+  base_url: https://eutils.ncbi.nlm.nih.gov/entrez/eutils
+  ftp_base: ftp://ftp.ncbi.nlm.nih.gov/geo/series
+
+tcga:
+  gdc_api_base: https://api.gdc.cancer.gov
+  gdc_token_env: GDC_TOKEN   # optional, only needed for controlled-access data
+
+literature:
+  max_papers_per_query: 50
+  sources:
+    - pubmed
+    - pmc
+    - biorxiv
+  extract_supplementary: true
+  biorxiv_api_base: https://api.biorxiv.org
+  pmc_fulltext_base: https://eutils.ncbi.nlm.nih.gov/entrez/eutils
+
+  # ── LLM-assisted PDF accession extraction ──────────────────────────────
+  llm_extraction:
+    enabled: true
+
+    # When to trigger LLM extraction:
+    #   regex_fallback  → only when regex finds 0 accessions (recommended, lowest cost)
+    #   always          → always run LLM regardless of regex result
+    #   keyword_trigger → only when trigger keywords are present in section text
+    trigger: regex_fallback
+
+    # Minimum confidence level to write to registry:
+    #   high   → only auto-verified accessions
+    #   medium → also include pending_review accessions (recommended)
+    #   low    → include all (not recommended, high noise)
+    min_confidence: medium
+
+    # Confidence threshold for automatic download (without human review):
+    #   high   → only explicitly stated accessions trigger auto-download
+    auto_download_confidence: high
+
+    # Run GEO API verification to filter LLM hallucinations (recommended)
+    verify_with_geo_api: true
+
+    # Cache LLM results by DOI to avoid redundant API calls
+    cache_results: true
+    cache_db_path: /workspace/methyagent_llm_cache.db
+
+    # Maximum characters of section text to send to LLM per call
+    max_section_chars: 3000
+
+    # Target sections to extract from PDF (ordered by priority)
+    target_sections:
+      # English
+      - data availability statement
+      - data availability
+      - data access
+      - availability of data and materials
+      - accession numbers
+      - accession codes
+      - data deposition
+      - key resources table        # Cell series
+      - reporting summary          # Nature series
+      - materials and methods
+      - methods
+      # Chinese
+      - 数据可用性声明
+      - 数据可用性
+      - 数据获取
+      - 登录号
+      - 材料与方法
+
+logging:
+  level: INFO
+  # Log file uses /workspace (local scratch) by default.
+  # Override via METHYAGENT_LOG_FILE environment variable.
+  log_file: /workspace/methyagent_logs/methyagent.log
