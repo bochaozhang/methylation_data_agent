@@ -1,0 +1,646 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MethyAgent Dashboard</title>
+  <style>
+    /* ---- Reset & base ---- */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #f5f6fa;
+      color: #2d3436;
+      min-height: 100vh;
+    }
+
+    /* ---- Layout ---- */
+    header {
+      background: #2d3436;
+      color: #fff;
+      padding: 14px 28px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    header h1 { font-size: 1.25rem; font-weight: 600; letter-spacing: .5px; }
+    header .subtitle { font-size: .8rem; color: #b2bec3; margin-top: 2px; }
+
+    .health-bar {
+      display: flex;
+      gap: 16px;
+      margin-left: auto;
+      align-items: center;
+      font-size: .8rem;
+    }
+    .dot {
+      display: inline-block;
+      width: 10px; height: 10px;
+      border-radius: 50%;
+      margin-right: 4px;
+    }
+    .dot.alive  { background: #00b894; }
+    .dot.dead   { background: #d63031; }
+    .dot.unknown{ background: #636e72; }
+
+    nav {
+      background: #fff;
+      border-bottom: 1px solid #dfe6e9;
+      display: flex;
+      gap: 0;
+      padding: 0 28px;
+    }
+    nav button {
+      background: none;
+      border: none;
+      border-bottom: 3px solid transparent;
+      padding: 14px 20px;
+      font-size: .9rem;
+      cursor: pointer;
+      color: #636e72;
+      transition: color .15s, border-color .15s;
+    }
+    nav button.active, nav button:hover {
+      color: #0984e3;
+      border-bottom-color: #0984e3;
+    }
+
+    main { padding: 28px; max-width: 1200px; margin: 0 auto; }
+
+    .section { display: none; }
+    .section.active { display: block; }
+
+    /* ---- Cards ---- */
+    .card {
+      background: #fff;
+      border-radius: 8px;
+      box-shadow: 0 1px 4px rgba(0,0,0,.08);
+      padding: 20px 24px;
+      margin-bottom: 20px;
+    }
+    .card h2 { font-size: 1rem; font-weight: 600; margin-bottom: 14px; color: #2d3436; }
+
+    /* ---- Form ---- */
+    .form-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: flex-end; }
+    .form-group { display: flex; flex-direction: column; gap: 4px; }
+    .form-group label { font-size: .8rem; color: #636e72; font-weight: 500; }
+    input[type="text"], select {
+      border: 1px solid #dfe6e9;
+      border-radius: 6px;
+      padding: 8px 12px;
+      font-size: .9rem;
+      outline: none;
+      transition: border-color .15s;
+    }
+    input[type="text"] { width: 380px; }
+    input[type="text"]:focus, select:focus { border-color: #0984e3; }
+    button.btn {
+      background: #0984e3;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      padding: 9px 20px;
+      font-size: .9rem;
+      cursor: pointer;
+      transition: background .15s;
+    }
+    button.btn:hover { background: #0773c5; }
+    button.btn.danger { background: #d63031; }
+    button.btn.danger:hover { background: #b71c1c; }
+    button.btn.success { background: #00b894; }
+    button.btn.success:hover { background: #00a381; }
+    button.btn.sm { padding: 5px 12px; font-size: .8rem; }
+
+    /* ---- Alert ---- */
+    .alert {
+      padding: 10px 14px;
+      border-radius: 6px;
+      font-size: .85rem;
+      margin-top: 12px;
+      display: none;
+    }
+    .alert.info  { background: #dfe6e9; color: #2d3436; }
+    .alert.ok    { background: #d4edda; color: #155724; }
+    .alert.error { background: #f8d7da; color: #721c24; }
+
+    /* ---- Tables ---- */
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: .85rem; }
+    th {
+      background: #f5f6fa;
+      text-align: left;
+      padding: 9px 12px;
+      font-weight: 600;
+      color: #636e72;
+      border-bottom: 2px solid #dfe6e9;
+      white-space: nowrap;
+    }
+    td {
+      padding: 9px 12px;
+      border-bottom: 1px solid #f0f0f0;
+      vertical-align: top;
+    }
+    tr:hover td { background: #f9f9f9; }
+
+    /* ---- Badges ---- */
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 12px;
+      font-size: .75rem;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+    .badge.pending     { background: #ffeaa7; color: #6c5a00; }
+    .badge.running     { background: #74b9ff; color: #003580; }
+    .badge.done        { background: #d4edda; color: #155724; }
+    .badge.failed      { background: #f8d7da; color: #721c24; }
+    .badge.cancelled   { background: #dfe6e9; color: #636e72; }
+    .badge.downloading { background: #a29bfe; color: #2d0080; }
+    .badge.skipped     { background: #dfe6e9; color: #636e72; }
+    .badge.review      { background: #ffeaa7; color: #6c5a00; }
+
+    /* ---- Review cards ---- */
+    .review-card {
+      border: 1px solid #dfe6e9;
+      border-radius: 8px;
+      padding: 16px 20px;
+      margin-bottom: 14px;
+      background: #fff;
+    }
+    .review-card h3 { font-size: .95rem; font-weight: 600; margin-bottom: 6px; }
+    .review-card .evidence {
+      background: #f5f6fa;
+      border-left: 3px solid #0984e3;
+      padding: 8px 12px;
+      font-size: .82rem;
+      color: #636e72;
+      margin: 10px 0;
+      border-radius: 0 4px 4px 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    .review-card .meta { font-size: .78rem; color: #b2bec3; margin-bottom: 10px; }
+    .review-actions { display: flex; gap: 8px; }
+
+    /* ---- Stats row ---- */
+    .stats-row { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 20px; }
+    .stat-box {
+      background: #fff;
+      border-radius: 8px;
+      box-shadow: 0 1px 4px rgba(0,0,0,.08);
+      padding: 16px 22px;
+      min-width: 130px;
+      text-align: center;
+    }
+    .stat-box .num { font-size: 1.8rem; font-weight: 700; color: #0984e3; }
+    .stat-box .lbl { font-size: .75rem; color: #636e72; margin-top: 2px; }
+
+    /* ---- Refresh indicator ---- */
+    .refresh-info { font-size: .75rem; color: #b2bec3; text-align: right; margin-bottom: 8px; }
+
+    /* ---- Empty state ---- */
+    .empty { text-align: center; padding: 40px; color: #b2bec3; font-size: .9rem; }
+
+    /* ---- Truncate long text ---- */
+    .truncate { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  </style>
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>&#129516; MethyAgent Dashboard</h1>
+    <div class="subtitle">Dual-agent methylation dataset acquisition system</div>
+  </div>
+  <div class="health-bar" id="healthBar">
+    <span><span class="dot unknown" id="dot1"></span>agent1</span>
+    <span><span class="dot unknown" id="dot2"></span>agent2</span>
+    <span id="healthStatus" style="color:#b2bec3">checking...</span>
+  </div>
+</header>
+
+<nav>
+  <button class="active" onclick="showTab('query')">&#128269; Submit Query</button>
+  <button onclick="showTab('tasks')">&#128203; Tasks</button>
+  <button onclick="showTab('datasets')">&#128190; Datasets</button>
+  <button onclick="showTab('review')">&#9989; Review Queue <span id="reviewBadge"></span></button>
+</nav>
+
+<main>
+
+  <!-- ===== QUERY TAB ===== -->
+  <div id="tab-query" class="section active">
+    <div class="card">
+      <h2>Submit a New Query</h2>
+      <div class="form-row">
+        <div class="form-group">
+          <label>Search Query</label>
+          <input type="text" id="queryInput" placeholder="e.g. lung adenocarcinoma methylation 450k" />
+        </div>
+        <div class="form-group">
+          <label>Agent</label>
+          <select id="agentSelect">
+            <option value="both">Both agents</option>
+            <option value="database">Database agent only</option>
+            <option value="literature">Literature agent only</option>
+          </select>
+        </div>
+        <div class="form-group" style="justify-content:flex-end">
+          <button class="btn" onclick="submitQuery()">Submit</button>
+        </div>
+      </div>
+      <div class="alert" id="queryAlert"></div>
+    </div>
+
+    <div class="card">
+      <h2>Recent Tasks</h2>
+      <div class="refresh-info" id="queryRefreshInfo"></div>
+      <div class="table-wrap">
+        <table id="recentTasksTable">
+          <thead>
+            <tr>
+              <th>Task ID</th><th>Query</th><th>Agent</th>
+              <th>Status</th><th>Created</th><th>Duration</th>
+            </tr>
+          </thead>
+          <tbody id="recentTasksBody">
+            <tr><td colspan="6" class="empty">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== TASKS TAB ===== -->
+  <div id="tab-tasks" class="section">
+    <div class="card">
+      <h2>All Tasks</h2>
+      <div class="form-row" style="margin-bottom:12px">
+        <div class="form-group">
+          <label>Filter by status</label>
+          <select id="taskStatusFilter" onchange="loadTasks()">
+            <option value="">All</option>
+            <option value="pending">Pending</option>
+            <option value="running">Running</option>
+            <option value="done">Done</option>
+            <option value="failed">Failed</option>
+            <option value="cancelled">Cancelled</option>
+          </select>
+        </div>
+        <div class="form-group" style="justify-content:flex-end">
+          <button class="btn" onclick="loadTasks()">&#8635; Refresh</button>
+        </div>
+      </div>
+      <div class="refresh-info" id="tasksRefreshInfo"></div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Task ID</th><th>Query</th><th>Agent</th>
+              <th>Status</th><th>Created</th><th>Finished</th><th>Datasets Found</th>
+            </tr>
+          </thead>
+          <tbody id="tasksBody">
+            <tr><td colspan="7" class="empty">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== DATASETS TAB ===== -->
+  <div id="tab-datasets" class="section">
+    <div id="statsRow" class="stats-row"></div>
+    <div class="card">
+      <h2>Dataset Registry</h2>
+      <div class="form-row" style="margin-bottom:12px">
+        <div class="form-group">
+          <label>Filter by status</label>
+          <select id="datasetStatusFilter" onchange="loadDatasets()">
+            <option value="">All</option>
+            <option value="pending">Pending</option>
+            <option value="downloading">Downloading</option>
+            <option value="done">Done</option>
+            <option value="failed">Failed</option>
+            <option value="skipped">Skipped</option>
+          </select>
+        </div>
+        <div class="form-group" style="justify-content:flex-end">
+          <button class="btn" onclick="loadDatasets()">&#8635; Refresh</button>
+        </div>
+      </div>
+      <div class="refresh-info" id="datasetsRefreshInfo"></div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Accession</th><th>Source</th><th>Title</th><th>Cancer Type</th>
+              <th>Platform</th><th>Samples</th><th>Status</th><th>Discovered By</th>
+            </tr>
+          </thead>
+          <tbody id="datasetsBody">
+            <tr><td colspan="8" class="empty">Loading...</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== REVIEW TAB ===== -->
+  <div id="tab-review" class="section">
+    <div class="card">
+      <h2>Pending Review Queue</h2>
+      <p style="font-size:.85rem;color:#636e72;margin-bottom:16px">
+        These datasets were extracted by the LLM with <strong>medium confidence</strong>.
+        Review the evidence and approve or reject each one.
+      </p>
+      <div class="refresh-info" id="reviewRefreshInfo"></div>
+      <div id="reviewList">
+        <div class="empty">Loading...</div>
+      </div>
+    </div>
+  </div>
+
+</main>
+
+<script>
+// ============================================================
+// Utilities
+// ============================================================
+function fmtDate(iso) {
+  if (!iso) return '—';
+  const d = new Date(iso);
+  return d.toLocaleString();
+}
+
+function duration(start, end) {
+  if (!start || !end) return '—';
+  const s = (new Date(end) - new Date(start)) / 1000;
+  if (s < 60) return s.toFixed(0) + 's';
+  return (s / 60).toFixed(1) + 'm';
+}
+
+function badge(status) {
+  const map = {
+    pending: 'pending', running: 'running', done: 'done',
+    failed: 'failed', cancelled: 'cancelled',
+    downloading: 'downloading', skipped: 'skipped',
+    pending_review: 'review',
+  };
+  const cls = map[status] || 'pending';
+  return `<span class="badge ${cls}">${status}</span>`;
+}
+
+function shortId(id) {
+  return id ? id.slice(0, 8) + '…' : '—';
+}
+
+function showAlert(id, msg, type) {
+  const el = document.getElementById(id);
+  el.textContent = msg;
+  el.className = `alert ${type}`;
+  el.style.display = 'block';
+  setTimeout(() => { el.style.display = 'none'; }, 6000);
+}
+
+function nowStr() {
+  return 'Last updated: ' + new Date().toLocaleTimeString();
+}
+
+// ============================================================
+// Tab navigation
+// ============================================================
+function showTab(name) {
+  document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
+  document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.add('active');
+  const idx = ['query','tasks','datasets','review'].indexOf(name);
+  document.querySelectorAll('nav button')[idx].classList.add('active');
+  if (name === 'tasks')    loadTasks();
+  if (name === 'datasets') loadDatasets();
+  if (name === 'review')   loadReview();
+}
+
+// ============================================================
+// Health check
+// ============================================================
+async function loadHealth() {
+  try {
+    const r = await fetch('/health');
+    const d = await r.json();
+    document.getElementById('dot1').className = 'dot ' + (d.agent1_alive ? 'alive' : 'dead');
+    document.getElementById('dot2').className = 'dot ' + (d.agent2_alive ? 'alive' : 'dead');
+    document.getElementById('healthStatus').textContent =
+      d.status === 'ok' ? '✓ All agents alive' : '⚠ Some agents offline';
+    document.getElementById('healthStatus').style.color =
+      d.status === 'ok' ? '#00b894' : '#e17055';
+  } catch(e) {
+    document.getElementById('healthStatus').textContent = 'API unreachable';
+  }
+}
+
+// ============================================================
+// Submit Query
+// ============================================================
+async function submitQuery() {
+  const query = document.getElementById('queryInput').value.trim();
+  const agentType = document.getElementById('agentSelect').value;
+  if (!query) { showAlert('queryAlert', 'Please enter a query.', 'error'); return; }
+
+  try {
+    const r = await fetch('/query', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query, agent_type: agentType }),
+    });
+    const d = await r.json();
+    if (!r.ok) { showAlert('queryAlert', d.detail || 'Error submitting query.', 'error'); return; }
+    showAlert('queryAlert', `Task created: ${d.task_id} (status: ${d.status})`, 'ok');
+    document.getElementById('queryInput').value = '';
+    loadRecentTasks();
+  } catch(e) {
+    showAlert('queryAlert', 'Network error: ' + e.message, 'error');
+  }
+}
+
+// ============================================================
+// Recent tasks (query tab)
+// ============================================================
+async function loadRecentTasks() {
+  try {
+    const r = await fetch('/tasks?limit=10');
+    const d = await r.json();
+    const tbody = document.getElementById('recentTasksBody');
+    document.getElementById('queryRefreshInfo').textContent = nowStr();
+    if (!d.tasks.length) {
+      tbody.innerHTML = '<tr><td colspan="6" class="empty">No tasks yet.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = d.tasks.map(t => `
+      <tr>
+        <td title="${t.task_id}"><code>${shortId(t.task_id)}</code></td>
+        <td class="truncate" title="${t.query}">${t.query}</td>
+        <td>${t.agent_type}</td>
+        <td>${badge(t.status)}</td>
+        <td>${fmtDate(t.created_at)}</td>
+        <td>${duration(t.started_at, t.finished_at)}</td>
+      </tr>`).join('');
+  } catch(e) { console.error(e); }
+}
+
+// ============================================================
+// Tasks tab
+// ============================================================
+async function loadTasks() {
+  const status = document.getElementById('taskStatusFilter').value;
+  const url = '/tasks?limit=100' + (status ? '&status=' + status : '');
+  try {
+    const r = await fetch(url);
+    const d = await r.json();
+    const tbody = document.getElementById('tasksBody');
+    document.getElementById('tasksRefreshInfo').textContent = nowStr();
+    if (!d.tasks.length) {
+      tbody.innerHTML = '<tr><td colspan="7" class="empty">No tasks found.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = d.tasks.map(t => {
+      const found = t.result ? (t.result.datasets_found ?? '—') : '—';
+      return `<tr>
+        <td title="${t.task_id}"><code>${shortId(t.task_id)}</code></td>
+        <td class="truncate" title="${t.query}">${t.query}</td>
+        <td>${t.agent_type}</td>
+        <td>${badge(t.status)}</td>
+        <td>${fmtDate(t.created_at)}</td>
+        <td>${fmtDate(t.finished_at)}</td>
+        <td>${found}</td>
+      </tr>`;
+    }).join('');
+  } catch(e) { console.error(e); }
+}
+
+// ============================================================
+// Datasets tab
+// ============================================================
+async function loadDatasets() {
+  const status = document.getElementById('datasetStatusFilter').value;
+  const url = '/datasets?limit=500' + (status ? '&status=' + status : '');
+  try {
+    const r = await fetch(url);
+    const d = await r.json();
+    document.getElementById('datasetsRefreshInfo').textContent = nowStr();
+
+    // Stats row
+    const counts = {};
+    d.datasets.forEach(ds => { counts[ds.download_status] = (counts[ds.download_status]||0)+1; });
+    const statsHtml = [
+      { num: d.total, lbl: 'Total' },
+      { num: counts['done'] || 0, lbl: 'Done' },
+      { num: counts['pending'] || 0, lbl: 'Pending' },
+      { num: counts['failed'] || 0, lbl: 'Failed' },
+      { num: counts['skipped'] || 0, lbl: 'Skipped' },
+    ].map(s => `<div class="stat-box"><div class="num">${s.num}</div><div class="lbl">${s.lbl}</div></div>`).join('');
+    document.getElementById('statsRow').innerHTML = statsHtml;
+
+    const tbody = document.getElementById('datasetsBody');
+    if (!d.datasets.length) {
+      tbody.innerHTML = '<tr><td colspan="8" class="empty">No datasets found.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = d.datasets.map(ds => `
+      <tr>
+        <td><code>${ds.accession}</code></td>
+        <td>${ds.source}</td>
+        <td class="truncate" title="${ds.title||''}">${ds.title || '—'}</td>
+        <td>${ds.cancer_type || '—'}</td>
+        <td>${ds.platform || '—'}</td>
+        <td>${ds.sample_count ?? '—'}</td>
+        <td>${badge(ds.needs_review ? 'pending_review' : ds.download_status)}</td>
+        <td>${ds.discovered_by}</td>
+      </tr>`).join('');
+  } catch(e) { console.error(e); }
+}
+
+// ============================================================
+// Review tab
+// ============================================================
+async function loadReview() {
+  try {
+    const r = await fetch('/review');
+    const d = await r.json();
+    document.getElementById('reviewRefreshInfo').textContent = nowStr();
+
+    // Update nav badge
+    const badge_el = document.getElementById('reviewBadge');
+    badge_el.textContent = d.total > 0 ? ` (${d.total})` : '';
+
+    const container = document.getElementById('reviewList');
+    if (!d.items.length) {
+      container.innerHTML = '<div class="empty">No items pending review. &#127881;</div>';
+      return;
+    }
+    container.innerHTML = d.items.map(item => `
+      <div class="review-card" id="rc-${item.accession}">
+        <h3><code>${item.accession}</code> &mdash; ${item.source}</h3>
+        <div class="meta">
+          ${item.title ? `<strong>${item.title}</strong><br>` : ''}
+          ${item.paper_doi ? `DOI: <a href="https://doi.org/${item.paper_doi}" target="_blank">${item.paper_doi}</a> &nbsp;` : ''}
+          ${item.paper_pmid ? `PMID: ${item.paper_pmid}` : ''}
+          &nbsp;| Added: ${fmtDate(item.created_at)}
+        </div>
+        ${item.llm_evidence ? `<div class="evidence">${item.llm_evidence}</div>` : ''}
+        <div class="review-actions">
+          <button class="btn success sm" onclick="reviewAction('${item.accession}','approve')">&#10003; Approve</button>
+          <button class="btn danger sm" onclick="reviewAction('${item.accession}','reject')">&#10007; Reject</button>
+        </div>
+      </div>`).join('');
+  } catch(e) { console.error(e); }
+}
+
+async function reviewAction(accession, action) {
+  try {
+    const r = await fetch(`/review/${encodeURIComponent(accession)}/${action}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    const d = await r.json();
+    if (!r.ok) { alert(d.detail || 'Error'); return; }
+    // Remove card from DOM
+    const card = document.getElementById('rc-' + accession);
+    if (card) card.remove();
+    // Update badge
+    const remaining = document.querySelectorAll('[id^="rc-"]').length;
+    document.getElementById('reviewBadge').textContent = remaining > 0 ? ` (${remaining})` : '';
+    if (remaining === 0) {
+      document.getElementById('reviewList').innerHTML =
+        '<div class="empty">No items pending review. &#127881;</div>';
+    }
+  } catch(e) { alert('Network error: ' + e.message); }
+}
+
+// ============================================================
+// Auto-refresh
+// ============================================================
+function autoRefresh() {
+  loadHealth();
+  loadRecentTasks();
+  // Refresh active tab data
+  const active = document.querySelector('.section.active');
+  if (active && active.id === 'tab-tasks')    loadTasks();
+  if (active && active.id === 'tab-datasets') loadDatasets();
+  if (active && active.id === 'tab-review')   loadReview();
+}
+
+// Initial load
+autoRefresh();
+// Refresh every 15 seconds
+setInterval(autoRefresh, 15000);
+
+// Submit on Enter key in query input
+document.getElementById('queryInput').addEventListener('keydown', e => {
+  if (e.key === 'Enter') submitQuery();
+});
+</script>
+</body>
+</html>

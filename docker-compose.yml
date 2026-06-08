@@ -1,0 +1,130 @@
+# ============================================================
+# MethyAgent — Docker Compose
+#
+# Services:
+#   agent1  — DatabaseAgent daemon (always-on, polls task_queue)
+#   agent2  — LiteratureAgent daemon (always-on, polls task_queue)
+#   webui   — FastAPI web interface on port 80
+#
+# Shared volumes:
+#   ./registry  → /app/registry   (SQLite registry + task queue)
+#   ./data      → /app/data       (downloaded methylation datasets)
+#
+# Quick start:
+#   cp .env.example .env          # fill in your API keys
+#   mkdir -p registry data
+#   docker compose up -d
+#   open http://localhost:80
+# ============================================================
+services:
+
+  # ----------------------------------------------------------
+  # agent1 — DatabaseAgent (TCGA / GEO downloads)
+  # Always running; picks up tasks with agent_type IN ('database','both')
+  # ----------------------------------------------------------
+  agent1:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: methyagent:latest
+    container_name: methyagent-agent1
+    command: python scripts/agent_daemon.py --agent database
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      REGISTRY_PATH: /app/registry/methyagent.db
+      DATA_DIR: /app/data
+      POLL_INTERVAL: "5"
+      HEARTBEAT_INTERVAL: "30"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+    volumes:
+      - ./registry:/app/registry
+      - ./data:/app/data
+    networks:
+      - methynet
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  # ----------------------------------------------------------
+  # agent2 — LiteratureAgent (PubMed / PDF / LLM extraction)
+  # Always running; picks up tasks with agent_type IN ('literature','both')
+  # ----------------------------------------------------------
+  agent2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: methyagent:latest
+    container_name: methyagent-agent2
+    command: python scripts/agent_daemon.py --agent literature
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      REGISTRY_PATH: /app/registry/methyagent.db
+      DATA_DIR: /app/data
+      POLL_INTERVAL: "5"
+      HEARTBEAT_INTERVAL: "30"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+    volumes:
+      - ./registry:/app/registry
+      - ./data:/app/data
+    networks:
+      - methynet
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  # ----------------------------------------------------------
+  # webui — FastAPI dashboard + REST API
+  # Exposes port 8080; writes tasks to the shared SQLite queue
+  # ----------------------------------------------------------
+  webui:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: methyagent:latest
+    container_name: methyagent-webui
+    command: >
+      uvicorn api.main:app
+        --host 0.0.0.0
+        --port 80
+        --workers 2
+        --log-level ${LOG_LEVEL:-info}
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    env_file: .env
+    environment:
+      REGISTRY_PATH: /app/registry/methyagent.db
+      HEARTBEAT_STALE_SECS: "120"
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
+    volumes:
+      - ./registry:/app/registry
+      - ./data:/app/data
+    networks:
+      - methynet
+    depends_on:
+      - agent1
+      - agent2
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+# ----------------------------------------------------------
+# Networks
+# ----------------------------------------------------------
+networks:
+  methynet:
+    driver: bridge

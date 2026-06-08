@@ -1,0 +1,48 @@
+# ============================================================
+# docker-compose.override.yml — Development overrides
+#
+# Automatically applied on top of docker-compose.yml when you run:
+#   docker compose up
+#
+# Features:
+#   - Hot-reload for webui (uvicorn --reload)
+#   - Source code mounted as a volume (no rebuild needed for code changes)
+#   - Single uvicorn worker for easier debugging
+#   - DEBUG log level
+#
+# To use production settings only:
+#   docker compose -f docker-compose.yml up
+# ============================================================
+services:
+
+  agent1:
+    volumes:
+      - .:/app                    # Mount source for live code changes
+      - ./registry:/app/registry  # Keep registry mount explicit
+      - ./data:/app/data
+    environment:
+      LOG_LEVEL: "DEBUG"
+      POLL_INTERVAL: "3"
+
+  agent2:
+    volumes:
+      - .:/app
+      - ./registry:/app/registry
+      - ./data:/app/data
+    environment:
+      LOG_LEVEL: "DEBUG"
+      POLL_INTERVAL: "3"
+
+  webui:
+    command: >
+      uvicorn api.main:app
+        --host 0.0.0.0
+        --port 80
+        --reload
+        --log-level debug
+    volumes:
+      - .:/app
+      - ./registry:/app/registry
+      - ./data:/app/data
+    environment:
+      LOG_LEVEL: "debug"
