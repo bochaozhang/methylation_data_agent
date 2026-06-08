@@ -61,6 +61,153 @@ PLATFORM_MAP = {
     "bisulfite": "WGBS",
 }
 
+# Sample type keywords → canonical sample type codes
+# Each entry maps a keyword (English or Chinese) to a canonical sample type.
+# The canonical types are:
+#   tumor        — 癌症组织 / tumor tissue
+#   adjacent     — 癌旁组织 / adjacent normal tissue
+#   normal       — 正常组织 / normal tissue (from healthy individuals)
+#   non_cancer   — 非癌对照组织 / non-cancer control tissue (e.g. benign, inflammation)
+#   wbc          — 白细胞 / white blood cells / buffy coat / PBMC
+#   cfdna        — cfDNA / cell-free DNA / circulating DNA / 血浆cfDNA
+#   plasma       — 血浆 / plasma (broader than cfDNA, often used interchangeably)
+#   serum        — 血清 / serum
+#   whole_blood  — 全血 / whole blood
+SAMPLE_TYPE_MAP = {
+    # --- Tumor tissue ---
+    "tumor tissue": "tumor",
+    "tumour tissue": "tumor",
+    "tumor": "tumor",
+    "tumour": "tumor",
+    "cancer tissue": "tumor",
+    "primary tumor": "tumor",
+    "primary tumour": "tumor",
+    "malignant": "tumor",
+    "neoplasm": "tumor",
+    "癌症组织": "tumor",
+    "癌组织": "tumor",
+    "肿瘤组织": "tumor",
+    "原发灶": "tumor",
+    "原发肿瘤": "tumor",
+    # --- Adjacent normal tissue ---
+    "adjacent normal": "adjacent",
+    "adjacent tissue": "adjacent",
+    "adjacent": "adjacent",
+    "paratumor": "adjacent",
+    "paratumour": "adjacent",
+    "peritumoral": "adjacent",
+    "margin": "adjacent",
+    "癌旁": "adjacent",
+    "癌旁组织": "adjacent",
+    "旁组织": "adjacent",
+    "癌旁正常": "adjacent",
+    # --- Normal tissue (healthy individuals) ---
+    "normal tissue": "normal",
+    "normal": "normal",
+    "healthy tissue": "normal",
+    "healthy control": "normal",
+    "正常组织": "normal",
+    "正常": "normal",
+    "健康组织": "normal",
+    # --- Non-cancer control ---
+    "non-cancer": "non_cancer",
+    "non-cancer control": "non_cancer",
+    "noncancer": "non_cancer",
+    "non-cancerous": "non_cancer",
+    "benign": "non_cancer",
+    "benign control": "non_cancer",
+    "control tissue": "non_cancer",
+    "非癌对照": "non_cancer",
+    "非癌": "non_cancer",
+    "非癌症": "non_cancer",
+    "良性": "non_cancer",
+    "良性对照": "non_cancer",
+    # --- White blood cells ---
+    "wbc": "wbc",
+    "white blood cell": "wbc",
+    "white blood cells": "wbc",
+    "leukocyte": "wbc",
+    "leukocytes": "wbc",
+    "buffy coat": "wbc",
+    "pbmc": "wbc",
+    "peripheral blood mononuclear": "wbc",
+    "peripheral blood": "wbc",
+    "白细胞": "wbc",
+    "外周血单个核细胞": "wbc",
+    "外周血白细胞": "wbc",
+    "血细胞": "wbc",
+    # --- cfDNA ---
+    "cfdna": "cfdna",
+    "cfDNA": "cfdna",
+    "cell-free dna": "cfdna",
+    "cell free dna": "cfdna",
+    "cell-free DNA": "cfdna",
+    "circulating dna": "cfdna",
+    "circulating tumor dna": "cfdna",
+    "ctdna": "cfdna",
+    "ctDNA": "cfdna",
+    "cfDNA甲基化": "cfdna",
+    "血浆cfDNA": "cfdna",
+    "血浆cfDNA甲基化": "cfdna",
+    "游离DNA": "cfdna",
+    "循环DNA": "cfdna",
+    "循环肿瘤DNA": "cfdna",
+    # --- Plasma ---
+    "plasma": "plasma",
+    "blood plasma": "plasma",
+    "血浆": "plasma",
+    "血浆样本": "plasma",
+    # --- Serum ---
+    "serum": "serum",
+    "blood serum": "serum",
+    "血清": "serum",
+    # --- Whole blood ---
+    "whole blood": "whole_blood",
+    "全血": "whole_blood",
+    "血液": "whole_blood",
+}
+
+# Canonical sample type → GEO search terms (for building search strings)
+SAMPLE_TYPE_GEO_TERMS = {
+    "cfdna": "(cfDNA OR cell-free DNA OR circulating DNA OR ctdna OR plasma DNA)",
+    "plasma": "(plasma OR blood plasma)",
+    "serum": "(serum OR blood serum)",
+    "wbc": "(WBC OR leukocyte OR buffy coat OR PBMC OR peripheral blood mononuclear)",
+    "whole_blood": "(whole blood)",
+    "tumor": "(tumor OR tumour OR cancer tissue OR primary tumor OR malignant)",
+    "adjacent": "(adjacent normal OR paratumor OR peritumoral OR margin)",
+    "normal": "(normal tissue OR healthy tissue OR healthy control)",
+    "non_cancer": "(non-cancer OR benign OR control tissue OR noncancerous)",
+}
+
+# Canonical sample type → PubMed search terms
+SAMPLE_TYPE_PUBMED_TERMS = {
+    "cfdna": '("cell-free DNA" OR cfDNA OR "circulating DNA" OR "circulating tumor DNA" OR ctDNA)',
+    "plasma": '(plasma OR "blood plasma")',
+    "serum": '(serum OR "blood serum")',
+    "wbc": '(leukocyte OR WBC OR "buffy coat" OR PBMC OR "peripheral blood mononuclear cell")',
+    "whole_blood": '"whole blood"',
+    "tumor": '(tumor OR tumour OR "cancer tissue" OR "primary tumor" OR malignant)',
+    "adjacent": '("adjacent normal" OR paratumor OR peritumoral)',
+    "normal": '("normal tissue" OR "healthy tissue" OR "healthy control")',
+    "non_cancer": '("non-cancer" OR benign OR noncancerous OR "control tissue")',
+}
+
+# Sample type hierarchy: which types are "related" for filtering purposes
+# When a user asks for cfDNA, we should also consider plasma (superset)
+# When a user asks for non_cancer, we should also consider normal and adjacent
+SAMPLE_TYPE_RELATED = {
+    "cfdna": {"cfdna", "plasma"},           # cfDNA is from plasma
+    "plasma": {"plasma", "cfdna"},           # plasma may contain cfDNA
+    "serum": {"serum"},
+    "wbc": {"wbc", "whole_blood"},
+    "whole_blood": {"whole_blood", "wbc"},
+    "tumor": {"tumor"},
+    "adjacent": {"adjacent", "normal"},      # adjacent is a type of normal
+    "normal": {"normal", "non_cancer"},      # normal is a type of non_cancer
+    "non_cancer": {"non_cancer", "normal", "adjacent"},  # non_cancer includes normal + adjacent
+}
+
 # Cancer type keywords → canonical TCGA project codes
 CANCER_MAP = {
     "乳腺癌": "BRCA",
@@ -112,6 +259,26 @@ CANCER_MAP = {
     "白血病": "LAML",
     "leukemia": "LAML",
     "laml": "LAML",
+}
+
+# TCGA code → English display name (for GEO/PubMed queries which require English)
+TCGA_CODE_TO_ENGLISH = {
+    "BRCA": "breast cancer",
+    "LUAD": "lung adenocarcinoma",
+    "LUSC": "lung squamous cell carcinoma",
+    "COAD": "colorectal cancer",
+    "LIHC": "liver cancer",
+    "STAD": "stomach cancer",
+    "PRAD": "prostate cancer",
+    "OV": "ovarian cancer",
+    "CESC": "cervical cancer",
+    "PAAD": "pancreatic cancer",
+    "BLCA": "bladder cancer",
+    "KIRC": "kidney cancer",
+    "THCA": "thyroid cancer",
+    "SKCM": "melanoma",
+    "GBM": "glioblastoma",
+    "LAML": "leukemia",
 }
 
 
@@ -188,6 +355,51 @@ def _extract_cancer_type(text: str):
     return None, None
 
 
+def _extract_sample_type(text: str) -> Optional[str]:
+    """
+    Extract sample type from text and return canonical code.
+    
+    Priority: longer/more specific matches first.
+    e.g. "cfDNA" should match before "plasma", "癌旁组织" before "癌旁"
+    
+    Returns canonical sample type code (e.g. 'cfdna', 'tumor', 'wbc')
+    or None if no sample type keyword found.
+    """
+    text_lower = text.lower()
+    # Sort by keyword length (longest first) to prioritize specific matches
+    # e.g. "血浆cfDNA甲基化" (7 chars) > "血浆cfDNA" (5 chars) > "cfDNA" (4 chars)
+    sorted_keywords = sorted(SAMPLE_TYPE_MAP.keys(), key=len, reverse=True)
+    for keyword in sorted_keywords:
+        # Use keyword.lower() for comparison since text is lowered
+        # This handles mixed-case keys like "cfDNA", "ctDNA", "血浆cfDNA"
+        if keyword.lower() in text_lower:
+            return SAMPLE_TYPE_MAP[keyword]
+    return None
+
+
+def _extract_sample_types(text: str) -> List[str]:
+    """
+    Extract ALL sample types mentioned in text.
+    Returns list of canonical sample type codes (deduplicated, order of first appearance).
+    
+    Example: "colorectal cancer和非癌对照的cfDNA甲基化数据"
+    → ['non_cancer', 'cfdna']
+    """
+    text_lower = text.lower()
+    found = []
+    seen = set()
+    # Sort by keyword length (longest first) for priority
+    sorted_keywords = sorted(SAMPLE_TYPE_MAP.keys(), key=len, reverse=True)
+    for keyword in sorted_keywords:
+        # Use keyword.lower() for comparison since text is lowered
+        if keyword.lower() in text_lower:
+            canonical = SAMPLE_TYPE_MAP[keyword]
+            if canonical not in seen:
+                found.append(canonical)
+                seen.add(canonical)
+    return found
+
+
 def parse_query_rules(query: str) -> Dict[str, Any]:
     """
     Fast rule-based query parser (no LLM).
@@ -200,6 +412,9 @@ def parse_query_rules(query: str) -> Dict[str, Any]:
     year_range = _extract_year_range(query)
     platform = _extract_platform(query)
     cancer_display, cancer_code = _extract_cancer_type(query)
+    sample_types = _extract_sample_types(query)
+    # Primary sample type: the first (most specific) one found
+    primary_sample_type = sample_types[0] if sample_types else None
 
     return {
         "raw_query": query,
@@ -208,6 +423,8 @@ def parse_query_rules(query: str) -> Dict[str, Any]:
         "platform": platform,
         "cancer_type_display": cancer_display,
         "cancer_type_code": cancer_code,
+        "sample_type": primary_sample_type,
+        "sample_types": sample_types,
         "year_start": year_range[0] if year_range else None,
         "year_end": year_range[1] if year_range else None,
     }
@@ -236,11 +453,13 @@ Output ONLY valid JSON with these fields (use null for missing values):
   },
   "platform": "450K" | "EPIC" | "WGBS" | "RRBS" | null,
   "data_type": "array" | "sequencing" | "both" | null,
+  "sample_type": "cfdna" | "plasma" | "serum" | "wbc" | "whole_blood" | "tumor" | "adjacent" | "normal" | "non_cancer" | null,
+  "sample_types": ["cfdna", "non_cancer"],
   "year_start": 2024,
   "year_end": 2024,
-  "sample_type": "tumor" | "normal" | "both" | null,
-  "geo_search_query": "breast cancer EPIC methylation[GEO]",
-  "pubmed_search_query": "breast cancer DNA methylation EPIC array 2024",
+  "sample_type_detail": "Brief description of what sample types the user wants",
+  "geo_search_query": "colorectal cancer cfDNA methylation[GEO]",
+  "pubmed_search_query": "colorectal cancer DNA methylation cfDNA cell-free DNA 2024",
   "notes": "any special instructions"
 }
 
@@ -248,8 +467,24 @@ Rules:
 - If the query contains explicit accession numbers (GSE..., TCGA-...), set mode="accession"
 - For Chinese cancer names: 乳腺癌=BRCA, 肺癌=LUAD, 肝癌=LIHC, 胃癌=STAD, 结直肠癌=COAD
 - For platform: EPIC/850K → "EPIC", 450K/HM450 → "450K", WGBS/全基因组亚硫酸盐 → "WGBS"
-- geo_search_query: construct an NCBI GEO-compatible search string
-- pubmed_search_query: construct a PubMed search string with MeSH terms where possible
+
+SAMPLE TYPE PARSING (CRITICAL for cfDNA/liquid biopsy queries):
+- cfDNA / cell-free DNA / circulating DNA / ctDNA / 游离DNA / 循环DNA → "cfdna"
+- plasma / 血浆 → "plasma"
+- serum / 血清 → "serum"
+- WBC / leukocyte / buffy coat / PBMC / 白细胞 / 血细胞 → "wbc"
+- whole blood / 全血 → "whole_blood"
+- tumor tissue / cancer tissue / 癌症组织 / 肿瘤组织 / 原发灶 → "tumor"
+- adjacent normal / paratumor / 癌旁 / 癌旁组织 → "adjacent"
+- normal tissue / healthy control / 正常组织 / 健康 → "normal"
+- non-cancer control / benign / 非癌对照 / 非癌 / 良性 → "non_cancer"
+
+- sample_type: the PRIMARY sample type the user wants (single value)
+- sample_types: ALL sample types mentioned in the query (list, may include multiple)
+- When user asks for "非癌对照" (non-cancer control), include both "non_cancer" and "normal" in sample_types
+- When user asks for cfDNA, also include "plasma" in sample_types (cfDNA comes from plasma)
+- geo_search_query: construct an NCBI GEO-compatible search string INCLUDING sample type terms
+- pubmed_search_query: construct a PubMed search string with MeSH terms AND sample type terms
 """
 
 
@@ -298,10 +533,12 @@ def build_geo_search_string(intent: Dict[str, Any]) -> str:
     Always includes a methylation platform filter so results are restricted
     to actual methylation datasets (450K, EPIC, WGBS, RRBS), not RNA-seq etc.
 
+    Now includes sample type terms when specified (e.g. cfDNA, plasma, WBC).
+
     Examples:
-        "lung cancer" →
-        'lung cancer[Title/Abstract] AND (GPL13534 OR GPL21145 OR GPL23976 OR
-         bisulfite OR methylation profiling) AND GSE[Entry Type]'
+        "lung cancer cfDNA" →
+        'lung cancer[Title/Abstract] AND (cfDNA OR cell-free DNA OR circulating DNA)
+         AND (GPL13534 OR ...) AND GSE[Entry Type]'
     """
     parts = []
 
@@ -315,6 +552,42 @@ def build_geo_search_string(intent: Dict[str, Any]) -> str:
                 parts.append(term)
         elif isinstance(ct, str):
             parts.append(ct)
+    elif intent.get("cancer_type_display"):
+        # Rule-based parser puts cancer info in cancer_type_display/cancer_type_code
+        # instead of the dict-format cancer_type field.
+        # Always prefer the canonical English name from TCGA_CODE_TO_ENGLISH
+        # when available — it provides the best search term for GEO/PubMed
+        # (handles both Chinese displays like "乳腺癌" and partial English
+        # matches like "colorectal" → "colorectal cancer").
+        if intent.get("cancer_type_code") and intent["cancer_type_code"] in TCGA_CODE_TO_ENGLISH:
+            parts.append(TCGA_CODE_TO_ENGLISH[intent["cancer_type_code"]])
+        else:
+            parts.append(intent["cancer_type_display"])
+
+    # Sample type — add sample type search terms
+    sample_type = intent.get("sample_type")
+    sample_types = intent.get("sample_types", [])
+    if sample_type and sample_type in SAMPLE_TYPE_GEO_TERMS:
+        parts.append(SAMPLE_TYPE_GEO_TERMS[sample_type])
+    elif sample_types:
+        # Combine multiple sample types with OR
+        geo_terms = []
+        seen = set()
+        for st in sample_types:
+            if st in SAMPLE_TYPE_GEO_TERMS and st not in seen:
+                geo_terms.append(SAMPLE_TYPE_GEO_TERMS[st])
+                seen.add(st)
+        # Also add related sample types
+        for st in sample_types:
+            for related in SAMPLE_TYPE_RELATED.get(st, set()):
+                if related in SAMPLE_TYPE_GEO_TERMS and related not in seen:
+                    geo_terms.append(SAMPLE_TYPE_GEO_TERMS[related])
+                    seen.add(related)
+        if geo_terms:
+            if len(geo_terms) == 1:
+                parts.append(geo_terms[0])
+            else:
+                parts.append("(" + " OR ".join(geo_terms) + ")")
 
     # Platform — use GPL accessions for precision, plus text fallback
     platform = intent.get("platform")

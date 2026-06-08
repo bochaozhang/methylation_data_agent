@@ -82,6 +82,7 @@ class Registry:
 
     def _init_db(self):
         """Create tables and add new columns if they don't exist."""
+        # Step 1: Create tables (no-op if they already exist)
         with self._get_conn() as conn:
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS datasets (
@@ -102,6 +103,7 @@ class Registry:
                     checksum_md5    TEXT,
                     needs_review    INTEGER DEFAULT 0,
                     llm_evidence    TEXT,
+                    sample_type     TEXT,
                     created_at      TEXT NOT NULL,
                     updated_at      TEXT NOT NULL
                 );
@@ -136,7 +138,15 @@ class Registry:
                     result_json TEXT,
                     error       TEXT
                 );
+            """)
 
+        # Step 2: Migrate existing databases BEFORE creating indexes
+        # (indexes on new columns will fail if the column doesn't exist yet)
+        self._migrate_schema()
+
+        # Step 3: Create indexes (safe after migration ensures columns exist)
+        with self._get_conn() as conn:
+            conn.executescript("""
                 CREATE INDEX IF NOT EXISTS idx_datasets_status
                     ON datasets(download_status);
                 CREATE INDEX IF NOT EXISTS idx_datasets_source
@@ -149,14 +159,12 @@ class Registry:
                     ON task_queue(status, agent_type);
             """)
 
-        # Migrate existing databases: add new columns if missing
-        self._migrate_schema()
-
     def _migrate_schema(self):
         """Add new columns to existing databases (safe no-op if already present)."""
         migrations = [
             "ALTER TABLE datasets ADD COLUMN needs_review INTEGER DEFAULT 0",
             "ALTER TABLE datasets ADD COLUMN llm_evidence TEXT",
+            "ALTER TABLE datasets ADD COLUMN sample_type TEXT",
         ]
         with self._get_conn() as conn:
             for sql in migrations:
@@ -201,6 +209,7 @@ class Registry:
         download_status: str = "pending",
         needs_review: bool = False,
         llm_evidence: Optional[str] = None,
+        sample_type: Optional[str] = None,
     ) -> bool:
         """
         Insert a new dataset or update metadata if it already exists.
@@ -230,13 +239,14 @@ class Registry:
                             paper_doi    = COALESCE(?, paper_doi),
                             needs_review = COALESCE(?, needs_review),
                             llm_evidence = COALESCE(?, llm_evidence),
+                            sample_type  = COALESCE(?, sample_type),
                             updated_at   = ?
                         WHERE accession = ?
                         """,
                         (
                             data_type, cancer_type, platform, sample_count,
                             year, title, paper_pmid, paper_doi,
-                            int(needs_review), llm_evidence,
+                            int(needs_review), llm_evidence, sample_type,
                             now, accession,
                         ),
                     )
@@ -248,15 +258,15 @@ class Registry:
                             accession, source, data_type, cancer_type, platform,
                             sample_count, year, title, download_status,
                             paper_pmid, paper_doi, discovered_by,
-                            needs_review, llm_evidence,
+                            needs_review, llm_evidence, sample_type,
                             created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             accession, source, data_type, cancer_type, platform,
                             sample_count, year, title, download_status,
                             paper_pmid, paper_doi, discovered_by,
-                            int(needs_review), llm_evidence,
+                            int(needs_review), llm_evidence, sample_type,
                             now, now,
                         ),
                     )
@@ -382,6 +392,12 @@ class Registry:
                     "SELECT data_type, COUNT(*) as cnt FROM datasets WHERE data_type IS NOT NULL GROUP BY data_type"
                 ).fetchall()
             }
+            by_sample_type = {
+                row["sample_type"]: row["cnt"]
+                for row in conn.execute(
+                    "SELECT sample_type, COUNT(*) as cnt FROM datasets WHERE sample_type IS NOT NULL GROUP BY sample_type"
+                ).fetchall()
+            }
             agent1_count = conn.execute(
                 "SELECT COUNT(*) FROM datasets WHERE discovered_by = 'agent1'"
             ).fetchone()[0]
@@ -400,6 +416,7 @@ class Registry:
             "by_status": by_status,
             "by_source": by_source,
             "by_data_type": by_type,
+            "by_sample_type": by_sample_type,
             "agent1_discovered": agent1_count,
             "agent2_discovered": agent2_count,
             "pending_review": pending_review_count,

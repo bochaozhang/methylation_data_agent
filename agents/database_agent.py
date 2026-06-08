@@ -6,9 +6,17 @@ matching the parsed user intent, then downloads them.
 
 Operates as a LangGraph node (function that takes/returns MethyAgentState).
 Uses a ReAct-style loop internally: search → filter → register → download.
+
+Sample type filtering:
+  When the user specifies a sample type (e.g. cfDNA, plasma, WBC),
+  DatabaseAgent applies a two-stage filter:
+    1. Search query: adds sample type terms to GEO/TCGA search string
+    2. Post-retrieval: filters metadata results by sample type keywords
+       in title/summary, removing datasets that clearly don't match
+       (e.g. tumor tissue datasets when user asked for cfDNA).
 """
 import os
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
@@ -21,6 +29,7 @@ from tools.download_tools import (
     build_tcga_download_tasks,
 )
 from tools.geo_tools import GEOClient
+from tools.parser_tools import SAMPLE_TYPE_RELATED, TCGA_CODE_TO_ENGLISH
 from tools.tcga_tools import GDCClient
 from utils.logger import get_logger
 from utils.llm_factory import get_llm
@@ -141,6 +150,7 @@ class DatabaseAgent:
                 sample_count=c.get("sample_count"),
                 year=c.get("year"),
                 title=c.get("title"),
+                sample_type=c.get("sample_type"),
                 download_status="pending",
             )
             self.registry.log_event(acc, "start", f"Registered by DatabaseAgent")
@@ -246,6 +256,18 @@ class DatabaseAgent:
                 for d in datasets:
                     if not d.get("cancer_type"):
                         d["cancer_type"] = cancer_label
+            elif intent.get("cancer_type_code") and intent["cancer_type_code"] in TCGA_CODE_TO_ENGLISH:
+                # Rule-based parser: use canonical English name
+                cancer_label = TCGA_CODE_TO_ENGLISH[intent["cancer_type_code"]]
+                for d in datasets:
+                    if not d.get("cancer_type"):
+                        d["cancer_type"] = cancer_label
+
+            # Apply sample type post-retrieval filter
+            sample_type = intent.get("sample_type")
+            sample_types = intent.get("sample_types", [])
+            if sample_type or sample_types:
+                datasets = self._filter_by_sample_type(datasets, sample_type, sample_types)
 
             return datasets
         except Exception as e:
@@ -265,11 +287,146 @@ class DatabaseAgent:
         return results
 
     # ------------------------------------------------------------------ #
+    #  Sample type filtering                                               #
+    # ------------------------------------------------------------------ #
+
+    def _filter_by_sample_type(
+        self,
+        datasets: List[Dict[str, Any]],
+        primary_sample_type: Optional[str] = None,
+        sample_types: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Post-retrieval filter: remove datasets whose title/summary clearly
+        indicate an incompatible sample type.
+
+        Strategy:
+          - Build a set of "wanted" sample types (user-specified + related)
+          - Build a set of "excluded" sample types (mutually exclusive with wanted)
+          - For each dataset, check title+summary for sample type keywords
+          - If a dataset clearly matches an EXCLUDED type, remove it
+          - If a dataset matches a WANTED type, boost it (keep)
+          - If unclear, keep it (don't over-filter)
+
+        This is intentionally conservative: we prefer false positives (keeping
+        irrelevant datasets) over false negatives (losing relevant ones).
+        The user can further filter in the review step.
+
+        Args:
+            datasets: List of GEO metadata dicts.
+            primary_sample_type: The main sample type the user wants.
+            sample_types: All sample types mentioned in the query.
+
+        Returns:
+            Filtered list of datasets.
+        """
+        if not primary_sample_type and not sample_types:
+            return datasets
+
+        # Build wanted and excluded sets
+        wanted = set(sample_types or [])
+        if primary_sample_type:
+            wanted.add(primary_sample_type)
+            # Add related types
+            wanted.update(SAMPLE_TYPE_RELATED.get(primary_sample_type, set()))
+
+        # All canonical sample types
+        all_types = {"tumor", "adjacent", "normal", "non_cancer", "wbc", "cfdna", "plasma", "serum", "whole_blood"}
+        excluded = all_types - wanted
+
+        # Keywords for each sample type (for text matching)
+        sample_type_keywords = {
+            "tumor": ["tumor", "tumour", "cancer tissue", "primary tumor", "malignant",
+                       "肿瘤组织", "癌组织", "癌症组织", "原发灶"],
+            "adjacent": ["adjacent normal", "paratumor", "peritumoral", "margin",
+                         "癌旁", "旁组织"],
+            "normal": ["normal tissue", "healthy tissue", "healthy control",
+                        "正常组织", "健康组织"],
+            "non_cancer": ["non-cancer", "benign", "noncancerous", "control tissue",
+                           "非癌", "良性"],
+            "wbc": ["wbc", "leukocyte", "buffy coat", "pbmc", "peripheral blood mononuclear",
+                     "白细胞", "血细胞", "外周血单个核"],
+            "cfdna": ["cfdna", "cell-free dna", "circulating dna", "ctdna",
+                       "游离dna", "循环dna", "循环肿瘤dna"],
+            "plasma": ["plasma", "blood plasma", "血浆"],
+            "serum": ["serum", "blood serum", "血清"],
+            "whole_blood": ["whole blood", "全血"],
+        }
+
+        filtered = []
+        for ds in datasets:
+            title = (ds.get("title") or "").lower()
+            summary = (ds.get("summary") or "").lower()
+            text = title + " " + summary
+
+            # Check if the dataset clearly matches an EXCLUDED sample type
+            excluded_match = None
+            for exc_type in excluded:
+                keywords = sample_type_keywords.get(exc_type, [])
+                for kw in keywords:
+                    if kw in text:
+                        excluded_match = exc_type
+                        break
+                if excluded_match:
+                    break
+
+            if excluded_match:
+                # Check if it ALSO matches a wanted type (e.g. "cfDNA from plasma vs tumor")
+                # If it matches both wanted and excluded, keep it (ambiguous)
+                wanted_match = False
+                for w_type in wanted:
+                    keywords = sample_type_keywords.get(w_type, [])
+                    for kw in keywords:
+                        if kw in text:
+                            wanted_match = True
+                            break
+                    if wanted_match:
+                        break
+
+                if not wanted_match:
+                    logger.info(
+                        f"Sample type filter: excluding {ds.get('accession', '?')} "
+                        f"— matches excluded type '{excluded_match}', "
+                        f"title: {title[:80]}"
+                    )
+                    continue
+
+            # Tag the dataset with detected sample type for downstream use
+            detected_types = []
+            for st_type, keywords in sample_type_keywords.items():
+                for kw in keywords:
+                    if kw in text:
+                        detected_types.append(st_type)
+                        break
+            ds["detected_sample_types"] = detected_types
+            if not ds.get("sample_type") and detected_types:
+                ds["sample_type"] = detected_types[0]
+
+            filtered.append(ds)
+
+        logger.info(
+            f"Sample type filter: {len(filtered)}/{len(datasets)} datasets passed "
+            f"(wanted={wanted}, excluded={excluded})"
+        )
+        return filtered
+
+    # ------------------------------------------------------------------ #
     #  TCGA search methods                                                 #
     # ------------------------------------------------------------------ #
 
     def _search_tcga(self, intent: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Search TCGA/GDC using the parsed intent."""
+        # TCGA only contains tumor tissue and adjacent normal samples.
+        # If the user wants cfDNA/plasma/serum/WBC, skip TCGA entirely.
+        sample_type = intent.get("sample_type")
+        tcga_compatible_types = {"tumor", "adjacent", "normal", "non_cancer", None}
+        if sample_type and sample_type not in tcga_compatible_types:
+            logger.info(
+                f"Skipping TCGA search: sample_type='{sample_type}' is not available in TCGA "
+                f"(TCGA only has tumor/adjacent normal tissue)"
+            )
+            return []
+
         cancer_type = intent.get("cancer_type", {})
         if isinstance(cancer_type, dict):
             cancer_code = cancer_type.get("tcga_code")

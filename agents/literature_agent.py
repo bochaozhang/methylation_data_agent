@@ -6,7 +6,11 @@ extracts dataset accession numbers, checks the shared registry to
 avoid duplicates, and downloads only datasets not already covered
 by Agent 1 (DatabaseAgent).
 
-Operates as a LangGraph node after DatabaseAgent completes.
+Sample type awareness:
+  When the user specifies a sample type (e.g. cfDNA, plasma, WBC),
+  LiteratureAgent adds sample type terms to the PubMed search query
+  and filters literature-mined datasets by sample type keywords
+  in title/abstract.
 
 LLM-assisted PDF extraction (Layer 2+3):
   - Triggered when regex finds no accessions in a PDF
@@ -24,6 +28,7 @@ from registry.registry import Registry
 from state.graph_state import MethyAgentState
 from tools.download_tools import DownloadEngine, build_geo_download_tasks
 from tools.geo_tools import GEOClient
+from tools.parser_tools import SAMPLE_TYPE_PUBMED_TERMS, SAMPLE_TYPE_RELATED, TCGA_CODE_TO_ENGLISH
 from tools.pubmed_tools import LiteratureClient, PDFSupplementaryParser
 from utils.logger import get_logger
 from utils.llm_factory import get_llm
@@ -147,7 +152,8 @@ class LiteratureAgent:
         )
 
         # Collect all unique accessions from literature
-        all_lit_accessions = self._collect_accessions(enriched_papers)
+        sample_types = intent.get("sample_types", [])
+        all_lit_accessions = self._collect_accessions(enriched_papers, sample_types=sample_types)
         logger.info(f"Total unique accessions from literature: {len(all_lit_accessions)}")
 
         # ---- Step 4: Dedup against registry (Agent 1 results) ----
@@ -206,6 +212,7 @@ class LiteratureAgent:
                 year=metadata.get("year") if metadata else acc_info.get("year"),
                 title=metadata.get("title") if metadata else acc_info.get("title"),
                 paper_pmid=pmid,
+                sample_type=metadata.get("sample_type") if metadata else None,
                 download_status=dl_status,
                 needs_review=needs_review,
                 llm_evidence=llm_evidence,
@@ -326,6 +333,14 @@ class LiteratureAgent:
                 parts.append(f'"{mesh}"[MeSH Terms]')
         elif isinstance(cancer_type, str) and cancer_type:
             parts.append(f'"{cancer_type}"[Title/Abstract]')
+        elif intent.get("cancer_type_display"):
+            # Rule-based parser: use canonical English name via TCGA code
+            # (handles Chinese displays and partial English matches)
+            if intent.get("cancer_type_code") and intent["cancer_type_code"] in TCGA_CODE_TO_ENGLISH:
+                english = TCGA_CODE_TO_ENGLISH[intent["cancer_type_code"]]
+                parts.append(f'"{english}"[Title/Abstract]')
+            else:
+                parts.append(f'"{intent["cancer_type_display"]}"[Title/Abstract]')
 
         platform = intent.get("platform")
         if platform:
@@ -337,25 +352,102 @@ class LiteratureAgent:
             }
             parts.append(platform_terms.get(platform, platform))
 
+        # Sample type — add to PubMed query for targeted literature search
+        sample_type = intent.get("sample_type")
+        sample_types = intent.get("sample_types", [])
+        if sample_type and sample_type in SAMPLE_TYPE_PUBMED_TERMS:
+            parts.append(SAMPLE_TYPE_PUBMED_TERMS[sample_type])
+        elif sample_types:
+            # Combine multiple sample types with OR
+            pubmed_terms = []
+            seen = set()
+            for st in sample_types:
+                if st in SAMPLE_TYPE_PUBMED_TERMS and st not in seen:
+                    pubmed_terms.append(SAMPLE_TYPE_PUBMED_TERMS[st])
+                    seen.add(st)
+            # Also add related sample types
+            for st in sample_types:
+                for related in SAMPLE_TYPE_RELATED.get(st, set()):
+                    if related in SAMPLE_TYPE_PUBMED_TERMS and related not in seen:
+                        pubmed_terms.append(SAMPLE_TYPE_PUBMED_TERMS[related])
+                        seen.add(related)
+            if pubmed_terms:
+                if len(pubmed_terms) == 1:
+                    parts.append(pubmed_terms[0])
+                else:
+                    parts.append("(" + " OR ".join(pubmed_terms) + ")")
+
         parts.append("DNA methylation[MeSH Terms]")
 
         return " AND ".join(parts) if parts else "DNA methylation"
 
     def _collect_accessions(
-        self, papers: List[Dict[str, Any]]
+        self, papers: List[Dict[str, Any]], sample_types: Optional[List[str]] = None
     ) -> List[Dict[str, Any]]:
         """
         Collect all unique accessions from enriched papers.
+        Optionally filter by sample type keywords in paper title/abstract.
+
         Returns list of dicts with accession, source, pmid, year, title.
         """
         seen = set()
         result = []
+
+        # Build sample type filter keywords if specified
+        sample_type_keywords = {}
+        if sample_types:
+            # Keywords that indicate the paper uses the wanted sample types
+            wanted_keywords = {
+                "cfdna": ["cfdna", "cell-free dna", "circulating dna", "ctdna",
+                           "游离dna", "循环dna"],
+                "plasma": ["plasma", "blood plasma", "血浆"],
+                "serum": ["serum", "blood serum", "血清"],
+                "wbc": ["wbc", "leukocyte", "buffy coat", "pbmc",
+                         "白细胞", "血细胞"],
+                "whole_blood": ["whole blood", "全血"],
+                "tumor": ["tumor", "tumour", "cancer tissue", "primary tumor",
+                           "肿瘤组织", "癌组织"],
+                "adjacent": ["adjacent normal", "paratumor", "peritumoral",
+                             "癌旁"],
+                "normal": ["normal tissue", "healthy tissue", "healthy control",
+                            "正常组织"],
+                "non_cancer": ["non-cancer", "benign", "control tissue",
+                                "非癌", "良性"],
+            }
+            # Expand with related types
+            expanded = set(sample_types)
+            for st in sample_types:
+                expanded.update(SAMPLE_TYPE_RELATED.get(st, set()))
+            for st in expanded:
+                if st in wanted_keywords:
+                    sample_type_keywords[st] = wanted_keywords[st]
 
         for paper in papers:
             accessions = paper.get("accessions", {})
             pmid = paper.get("pmid")
             year = paper.get("year")
             title = paper.get("title", "")
+            abstract = paper.get("abstract", "")
+            paper_text = (title + " " + abstract).lower()
+
+            # Check if paper mentions wanted sample types
+            paper_matches_sample_type = True  # Default: keep
+            if sample_type_keywords:
+                paper_matches_sample_type = False
+                for st_type, keywords in sample_type_keywords.items():
+                    for kw in keywords:
+                        if kw in paper_text:
+                            paper_matches_sample_type = True
+                            break
+                    if paper_matches_sample_type:
+                        break
+
+            if not paper_matches_sample_type:
+                logger.debug(
+                    f"Skipping paper PMID {pmid}: no matching sample type keywords "
+                    f"in title/abstract"
+                )
+                continue
 
             for acc in accessions.get("geo", []):
                 if acc not in seen and acc.startswith("GSE"):
