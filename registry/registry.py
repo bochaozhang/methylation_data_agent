@@ -5,15 +5,19 @@ Both DatabaseAgent and LiteratureAgent read/write this registry to:
   - Record discovered datasets and their download status
   - Prevent duplicate downloads across agents
   - Track download progress and errors
+  - Manage the task queue for daemon-based execution
 
 Tables:
   datasets              - One row per unique accession (primary dedup key)
   download_log          - Append-only event log for each accession
   llm_extraction_cache  - DOI-keyed cache for LLM extraction results
+  task_queue            - Task queue for agent daemon polling
 """
 import hashlib
+import json
 import sqlite3
 import threading
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,6 +37,11 @@ class Registry:
         # LLM extraction cache
         registry.cache_llm_result(doi="10.1038/...", accessions=["GSE124600"], ...)
         cached = registry.get_llm_cache(doi="10.1038/...")
+
+        # Task queue (daemon mode)
+        task_id = registry.create_task(agent_type="database", query="LUAD methylation")
+        task = registry.claim_task(agent_type="database")
+        registry.complete_task(task_id, result={"datasets": [...]})
     """
 
     # Valid download status values
@@ -42,6 +51,13 @@ class Registry:
     STATUS_FAILED = "failed"
     STATUS_SKIPPED = "skipped"
     STATUS_PENDING_REVIEW = "pending_review"   # LLM medium-confidence, awaiting human review
+
+    # Valid task status values
+    TASK_PENDING = "pending"
+    TASK_RUNNING = "running"
+    TASK_DONE = "done"
+    TASK_FAILED = "failed"
+    TASK_CANCELLED = "cancelled"
 
     def __init__(self, db_path: str = "./registry/methyagent.db"):
         self.db_path = Path(db_path)
@@ -109,6 +125,18 @@ class Registry:
                     hit_count       INTEGER DEFAULT 0
                 );
 
+                CREATE TABLE IF NOT EXISTS task_queue (
+                    task_id     TEXT PRIMARY KEY,
+                    agent_type  TEXT NOT NULL,
+                    query       TEXT NOT NULL,
+                    status      TEXT DEFAULT 'pending',
+                    created_at  TEXT NOT NULL,
+                    started_at  TEXT,
+                    finished_at TEXT,
+                    result_json TEXT,
+                    error       TEXT
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_datasets_status
                     ON datasets(download_status);
                 CREATE INDEX IF NOT EXISTS idx_datasets_source
@@ -117,6 +145,8 @@ class Registry:
                     ON datasets(needs_review);
                 CREATE INDEX IF NOT EXISTS idx_log_accession
                     ON download_log(accession);
+                CREATE INDEX IF NOT EXISTS idx_task_status
+                    ON task_queue(status, agent_type);
             """)
 
         # Migrate existing databases: add new columns if missing
@@ -175,11 +205,6 @@ class Registry:
         """
         Insert a new dataset or update metadata if it already exists.
 
-        Args:
-            needs_review: If True, marks this as a medium-confidence LLM extraction
-                          requiring human confirmation before download.
-            llm_evidence: The evidence quote from the LLM extraction (for review UI).
-
         Returns:
             True if a new record was inserted, False if updated.
         """
@@ -192,7 +217,6 @@ class Registry:
                 ).fetchone()
 
                 if existing:
-                    # Update metadata but preserve download_status if already done
                     conn.execute(
                         """
                         UPDATE datasets SET
@@ -264,10 +288,7 @@ class Registry:
                 )
 
     def approve_review(self, accession: str):
-        """
-        Approve a pending_review dataset for download.
-        Clears needs_review flag and sets status to 'pending'.
-        """
+        """Approve a pending_review dataset for download."""
         now = datetime.now(timezone.utc).isoformat()
         with self._lock:
             with self._get_conn() as conn:
@@ -283,9 +304,7 @@ class Registry:
                 )
 
     def reject_review(self, accession: str):
-        """
-        Reject a pending_review dataset (mark as skipped).
-        """
+        """Reject a pending_review dataset (mark as skipped)."""
         now = datetime.now(timezone.utc).isoformat()
         with self._lock:
             with self._get_conn() as conn:
@@ -328,7 +347,7 @@ class Registry:
             return [dict(r) for r in rows]
 
     def get_pending_review(self) -> List[Dict]:
-        """Return all datasets flagged for human review (medium-confidence LLM extractions)."""
+        """Return all datasets flagged for human review."""
         with self._get_conn() as conn:
             rows = conn.execute(
                 "SELECT * FROM datasets WHERE needs_review = 1 ORDER BY created_at"
@@ -399,17 +418,7 @@ class Registry:
         pdf_url: str = "",
         model_used: str = "",
     ) -> None:
-        """
-        Store LLM extraction result in the cache table.
-
-        Args:
-            doi: Paper DOI (cache key).
-            accessions: List of extracted accession strings.
-            extracted_json: Raw LLM JSON response.
-            pdf_url: Source PDF URL.
-            model_used: LLM model identifier.
-        """
-        import json
+        """Store LLM extraction result in the cache table."""
         now = datetime.now(timezone.utc).isoformat()
         with self._get_conn() as conn:
             conn.execute(
@@ -420,12 +429,7 @@ class Registry:
             )
 
     def get_llm_cache(self, doi: str) -> Optional[Dict[str, Any]]:
-        """
-        Retrieve cached LLM extraction result for a DOI.
-
-        Returns dict with 'accessions', 'model_used', 'hit_count', or None.
-        """
-        import json
+        """Retrieve cached LLM extraction result for a DOI."""
         if not doi:
             return None
         with self._get_conn() as conn:
@@ -456,6 +460,201 @@ class Registry:
             else:
                 cur = conn.execute("DELETE FROM llm_extraction_cache")
             return cur.rowcount
+
+    # ------------------------------------------------------------------ #
+    #  Task queue (daemon mode)                                           #
+    # ------------------------------------------------------------------ #
+
+    def create_task(
+        self,
+        query: str,
+        agent_type: str = "both",
+        task_id: Optional[str] = None,
+    ) -> str:
+        """
+        Create a new task in the queue.
+
+        Args:
+            query: The search query string.
+            agent_type: 'database', 'literature', or 'both'.
+            task_id: Optional explicit task ID; auto-generated if None.
+
+        Returns:
+            The task_id string.
+        """
+        if task_id is None:
+            task_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            with self._get_conn() as conn:
+                conn.execute(
+                    """INSERT INTO task_queue (task_id, agent_type, query, status, created_at)
+                       VALUES (?, ?, ?, 'pending', ?)""",
+                    (task_id, agent_type, query, now),
+                )
+        return task_id
+
+    def claim_task(self, agent_type: str) -> Optional[Dict]:
+        """
+        Atomically claim the oldest pending task for the given agent type.
+
+        For 'database': claims tasks with agent_type IN ('database', 'both').
+        For 'literature': claims tasks with agent_type IN ('literature', 'both').
+
+        Returns:
+            Task dict if claimed, None if no pending tasks.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            with self._get_conn() as conn:
+                if agent_type == "database":
+                    row = conn.execute(
+                        """SELECT task_id, query, agent_type FROM task_queue
+                           WHERE status = 'pending'
+                             AND agent_type IN ('database', 'both')
+                           ORDER BY created_at ASC LIMIT 1"""
+                    ).fetchone()
+                elif agent_type == "literature":
+                    row = conn.execute(
+                        """SELECT task_id, query, agent_type FROM task_queue
+                           WHERE status = 'pending'
+                             AND agent_type IN ('literature', 'both')
+                           ORDER BY created_at ASC LIMIT 1"""
+                    ).fetchone()
+                else:
+                    row = conn.execute(
+                        """SELECT task_id, query, agent_type FROM task_queue
+                           WHERE status = 'pending'
+                           ORDER BY created_at ASC LIMIT 1"""
+                    ).fetchone()
+
+                if row is None:
+                    return None
+
+                task_id = row["task_id"]
+                conn.execute(
+                    "UPDATE task_queue SET status = 'running', started_at = ? WHERE task_id = ?",
+                    (now, task_id),
+                )
+                return {
+                    "task_id": task_id,
+                    "query": row["query"],
+                    "agent_type": row["agent_type"],
+                }
+
+    def complete_task(self, task_id: str, result: Any = None) -> None:
+        """Mark a task as done and store the result JSON."""
+        now = datetime.now(timezone.utc).isoformat()
+        result_json = json.dumps(result) if result is not None else None
+        with self._lock:
+            with self._get_conn() as conn:
+                conn.execute(
+                    """UPDATE task_queue SET status = 'done', finished_at = ?, result_json = ?
+                       WHERE task_id = ?""",
+                    (now, result_json, task_id),
+                )
+
+    def fail_task(self, task_id: str, error: str = "") -> None:
+        """Mark a task as failed with an error message."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            with self._get_conn() as conn:
+                conn.execute(
+                    """UPDATE task_queue SET status = 'failed', finished_at = ?, error = ?
+                       WHERE task_id = ?""",
+                    (now, error, task_id),
+                )
+
+    def cancel_task(self, task_id: str) -> bool:
+        """Cancel a pending task. Returns True if cancelled."""
+        with self._lock:
+            with self._get_conn() as conn:
+                cur = conn.execute(
+                    "UPDATE task_queue SET status = 'cancelled' WHERE task_id = ? AND status = 'pending'",
+                    (task_id,),
+                )
+                return cur.rowcount > 0
+
+    def get_task(self, task_id: str) -> Optional[Dict]:
+        """Return a single task record as a dict, or None."""
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM task_queue WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            if row is None:
+                return None
+            d = dict(row)
+            if d.get("result_json"):
+                try:
+                    d["result"] = json.loads(d["result_json"])
+                except Exception:
+                    d["result"] = None
+            else:
+                d["result"] = None
+            return d
+
+    def list_tasks(
+        self,
+        status: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict]:
+        """
+        List tasks from the queue, ordered by created_at DESC.
+
+        Args:
+            status: Filter by status ('pending', 'running', 'done', 'failed').
+            limit: Maximum number of tasks to return.
+        """
+        with self._get_conn() as conn:
+            if status:
+                rows = conn.execute(
+                    """SELECT * FROM task_queue
+                       WHERE status = ? AND task_id NOT LIKE 'heartbeat_%'
+                       ORDER BY created_at DESC LIMIT ?""",
+                    (status, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """SELECT * FROM task_queue
+                       WHERE task_id NOT LIKE 'heartbeat_%'
+                       ORDER BY created_at DESC LIMIT ?""",
+                    (limit,),
+                ).fetchall()
+
+            result = []
+            for row in rows:
+                d = dict(row)
+                if d.get("result_json"):
+                    try:
+                        d["result"] = json.loads(d["result_json"])
+                    except Exception:
+                        d["result"] = None
+                else:
+                    d["result"] = None
+                result.append(d)
+            return result
+
+    def update_heartbeat(self, agent_type: str) -> None:
+        """Record a heartbeat timestamp for the given agent daemon."""
+        now = datetime.now(timezone.utc).isoformat()
+        heartbeat_id = f"heartbeat_{agent_type}"
+        with self._get_conn() as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO task_queue
+                   (task_id, agent_type, query, status, created_at, started_at)
+                   VALUES (?, ?, '__heartbeat__', 'running', ?, ?)""",
+                (heartbeat_id, agent_type, now, now),
+            )
+
+    def get_heartbeat(self, agent_type: str) -> Optional[str]:
+        """Return the last heartbeat ISO timestamp for the given agent, or None."""
+        heartbeat_id = f"heartbeat_{agent_type}"
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT started_at FROM task_queue WHERE task_id = ?",
+                (heartbeat_id,),
+            ).fetchone()
+            return row["started_at"] if row else None
 
     # ------------------------------------------------------------------ #
     #  Dedup utility for URL-based sources (supplementary files)          #

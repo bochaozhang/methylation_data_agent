@@ -113,11 +113,14 @@ class GEOClient:
         """
         Search GEO Series (GSE) directly.
         Returns list of GSE accession strings (e.g. ['GSE124600', ...]).
+
+        NCBI E-utilities uses db='gds' for GEO DataSets/Series searches.
+        The db='gse' alias is not reliably supported across all API versions.
         """
-        # GEO Series are in the 'gse' database via E-utilities
+        # Primary: use db='gds' which reliably returns GEO Series UIDs
         params = {
-            "db": "gse",
-            "term": query,
+            "db": "gds",
+            "term": query + " AND GSE[Entry Type]",
             "retmax": max_results,
             "retmode": "json",
         }
@@ -125,15 +128,32 @@ class GEOClient:
             resp = self._get("esearch.fcgi", params)
             data = resp.json()
             uids = data.get("esearchresult", {}).get("idlist", [])
-        except Exception:
-            # Fallback: search 'gds' database
-            uids = self.search(query, max_results, db="gds")
+            logger.info(f"GEO search (gds) '{query[:60]}' → {len(uids)} UIDs")
+        except Exception as e:
+            logger.warning(f"GEO search failed: {e}")
+            uids = []
+
+        # Fallback: try without Entry Type filter
+        if not uids:
+            try:
+                params2 = {
+                    "db": "gds",
+                    "term": query,
+                    "retmax": max_results,
+                    "retmode": "json",
+                }
+                resp2 = self._get("esearch.fcgi", params2)
+                uids = resp2.json().get("esearchresult", {}).get("idlist", [])
+                logger.info(f"GEO search fallback (gds, no filter) → {len(uids)} UIDs")
+            except Exception as e2:
+                logger.error(f"GEO search fallback also failed: {e2}")
+                return []
 
         if not uids:
             return []
 
-        # Convert UIDs to GSE accessions via esummary
-        return self._uids_to_accessions(uids, db="gse")
+        # Convert GDS UIDs to GSE accessions via esummary
+        return self._uids_to_accessions(uids, db="gds")
 
     def _uids_to_accessions(self, uids: List[str], db: str = "gds") -> List[str]:
         """Convert numeric UIDs to GSE accession strings."""
@@ -150,10 +170,41 @@ class GEOClient:
         accessions = []
         for uid in uids:
             item = result.get(uid, {})
+
+            # Primary: 'accession' field — may be 'GSE309199' (full) or just '309199'
             acc = item.get("accession", "")
-            if acc.startswith("GSE"):
-                accessions.append(acc.upper())
-        return accessions
+            if acc:
+                acc_upper = acc.upper()
+                if acc_upper.startswith("GSE"):
+                    accessions.append(acc_upper)
+                    continue
+                # Numeric-only: prepend GSE
+                if acc.isdigit():
+                    accessions.append(f"GSE{acc}")
+                    continue
+
+            # Fallback: 'gse' field — may be '309199' (no prefix) or 'GSE309199'
+            gse_val = item.get("gse", "")
+            if isinstance(gse_val, str) and gse_val:
+                gse_upper = gse_val.upper()
+                if gse_upper.startswith("GSE"):
+                    accessions.append(gse_upper)
+                elif gse_val.isdigit():
+                    accessions.append(f"GSE{gse_val}")
+            elif isinstance(gse_val, list):
+                for g in gse_val:
+                    if isinstance(g, str) and g:
+                        accessions.append(f"GSE{g}" if g.isdigit() else g.upper())
+
+        # Deduplicate while preserving order
+        seen = set()
+        unique = []
+        for a in accessions:
+            if a not in seen:
+                seen.add(a)
+                unique.append(a)
+        logger.info(f"_uids_to_accessions: {len(uids)} UIDs → {len(unique)} GSE accessions")
+        return unique
 
     # ------------------------------------------------------------------ #
     #  Metadata                                                            #
@@ -165,10 +216,13 @@ class GEOClient:
 
         Returns dict with: title, summary, platform, sample_count,
         data_type, year, supplementary_files.
+
+        Uses db='gds' throughout — the correct NCBI database for GEO Series.
+        db='gse' is not a valid E-utilities database name.
         """
-        # Use esearch to get UID, then esummary for metadata
+        # Step 1: resolve accession → UID using db='gds'
         params = {
-            "db": "gse",
+            "db": "gds",
             "term": f"{accession}[Accession]",
             "retmode": "json",
         }
@@ -176,21 +230,48 @@ class GEOClient:
         uids = resp.json().get("esearchresult", {}).get("idlist", [])
 
         if not uids:
-            logger.warning(f"No UID found for {accession}")
+            logger.warning(f"No UID found for {accession} in db=gds")
             return {"accession": accession, "error": "not_found"}
 
         uid = uids[0]
-        params = {"db": "gse", "id": uid, "retmode": "json"}
+
+        # Step 2: fetch summary using db='gds'
+        params = {"db": "gds", "id": uid, "retmode": "json"}
         resp = self._get("esummary.fcgi", params)
         data = resp.json().get("result", {}).get(uid, {})
 
-        # Parse platform info
+        # Parse platform info — gds esummary stores platforms in 'gpl' field.
+        # The value may be:
+        #   - a string like '13534' (numeric, no GPL prefix)  ← most common
+        #   - a string like 'GPL13534' (with prefix)
+        #   - a list of dicts with 'accession' key
+        #   - a list of strings
         platforms = []
-        for gpl_item in data.get("gpl", []):
-            if isinstance(gpl_item, dict):
-                platforms.append(gpl_item.get("accession", ""))
-            elif isinstance(gpl_item, str):
-                platforms.append(gpl_item)
+        gpl_field = data.get("gpl", "")
+
+        def _normalise_gpl(val: str) -> str:
+            """Ensure GPL prefix is present."""
+            val = val.strip()
+            if not val:
+                return ""
+            return val if val.upper().startswith("GPL") else f"GPL{val}"
+
+        if isinstance(gpl_field, list):
+            for gpl_item in gpl_field:
+                if isinstance(gpl_item, dict):
+                    raw = gpl_item.get("accession", "")
+                    if raw:
+                        platforms.append(_normalise_gpl(raw))
+                elif isinstance(gpl_item, str) and gpl_item.strip():
+                    # Each list item may itself be semicolon-separated
+                    for part in gpl_item.split(";"):
+                        if part.strip():
+                            platforms.append(_normalise_gpl(part))
+        elif isinstance(gpl_field, str) and gpl_field.strip():
+            # String may be semicolon-separated: "13534;570" or "GPL13534;GPL21145"
+            for part in gpl_field.split(";"):
+                if part.strip():
+                    platforms.append(_normalise_gpl(part))
 
         # Detect data type from title/summary
         title = data.get("title", "")
@@ -198,12 +279,20 @@ class GEOClient:
         combined_text = (title + " " + summary).lower()
         data_type = _detect_data_type(combined_text, platforms)
 
-        # Parse year from submission date
-        pub_date = data.get("pubdate", "") or data.get("submissiondate", "")
+        # Parse year — gds uses 'pdat' or 'submissiondate'
+        pub_date = (
+            data.get("pdat", "")
+            or data.get("pubdate", "")
+            or data.get("submissiondate", "")
+        )
         year = _parse_year(pub_date)
 
-        # Sample count
-        sample_count = int(data.get("n_samples", 0) or 0)
+        # Sample count — gds uses 'n_samples' or 'samplecount'
+        sample_count = int(
+            data.get("n_samples", 0)
+            or data.get("samplecount", 0)
+            or 0
+        )
 
         # Supplementary file URLs
         supp_files = self._get_supplementary_urls(accession)
@@ -220,6 +309,152 @@ class GEOClient:
             "supplementary_files": supp_files,
             "source": "GEO",
         }
+
+    def batch_get_series_metadata(
+        self,
+        accessions: List[str],
+        batch_size: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch metadata for multiple GSE accessions efficiently.
+
+        Instead of N×2 API calls (one esearch + one esummary per accession),
+        this method:
+          1. Batch-searches all accessions in one esearch call
+          2. Batch-fetches all summaries in one esummary call
+
+        Args:
+            accessions: List of GSE accession strings.
+            batch_size: Max accessions per API batch (default 50).
+
+        Returns:
+            List of metadata dicts (same format as get_series_metadata).
+        """
+        if not accessions:
+            return []
+
+        all_meta = []
+
+        for i in range(0, len(accessions), batch_size):
+            batch = accessions[i : i + batch_size]
+
+            # Step 1: batch esearch — one OR query for all accessions
+            term = " OR ".join(f"{acc}[Accession]" for acc in batch)
+            try:
+                resp = self._get("esearch.fcgi", {
+                    "db": "gds",
+                    "term": term,
+                    "retmax": len(batch) * 2,  # allow for multi-platform entries
+                    "retmode": "json",
+                })
+                uids = resp.json().get("esearchresult", {}).get("idlist", [])
+            except Exception as e:
+                logger.warning(f"batch_get_series_metadata esearch failed: {e}")
+                # Fall back to individual fetches
+                for acc in batch:
+                    meta = self.get_series_metadata(acc)
+                    all_meta.append(meta)
+                continue
+
+            if not uids:
+                logger.warning(f"batch_get_series_metadata: no UIDs for batch {batch}")
+                continue
+
+            # Step 2: batch esummary — one call for all UIDs
+            try:
+                resp = self._get("esummary.fcgi", {
+                    "db": "gds",
+                    "id": ",".join(uids),
+                    "retmode": "json",
+                })
+                result = resp.json().get("result", {})
+            except Exception as e:
+                logger.warning(f"batch_get_series_metadata esummary failed: {e}")
+                for acc in batch:
+                    meta = self.get_series_metadata(acc)
+                    all_meta.append(meta)
+                continue
+
+            # Build accession → uid map from results
+            acc_to_data: Dict[str, Any] = {}
+            for uid in uids:
+                item = result.get(uid, {})
+                acc_raw = item.get("accession", "")
+                if not acc_raw:
+                    continue
+                acc_norm = acc_raw.upper()
+                if not acc_norm.startswith("GSE"):
+                    acc_norm = f"GSE{acc_norm}" if acc_norm.isdigit() else acc_norm
+                acc_to_data[acc_norm] = (uid, item)
+
+            # Parse metadata for each requested accession
+            for acc in batch:
+                acc_upper = acc.upper()
+                if acc_upper not in acc_to_data:
+                    logger.warning(f"batch_get_series_metadata: {acc} not in esummary result")
+                    all_meta.append({"accession": acc, "error": "not_found"})
+                    continue
+
+                uid, data = acc_to_data[acc_upper]
+
+                def _normalise_gpl(val: str) -> str:
+                    val = val.strip()
+                    if not val:
+                        return ""
+                    return val if val.upper().startswith("GPL") else f"GPL{val}"
+
+                platforms = []
+                gpl_field = data.get("gpl", "")
+                if isinstance(gpl_field, list):
+                    for gpl_item in gpl_field:
+                        if isinstance(gpl_item, dict):
+                            raw = gpl_item.get("accession", "")
+                            if raw:
+                                platforms.append(_normalise_gpl(raw))
+                        elif isinstance(gpl_item, str) and gpl_item.strip():
+                            for part in gpl_item.split(";"):
+                                if part.strip():
+                                    platforms.append(_normalise_gpl(part))
+                elif isinstance(gpl_field, str) and gpl_field.strip():
+                    for part in gpl_field.split(";"):
+                        if part.strip():
+                            platforms.append(_normalise_gpl(part))
+
+                title = data.get("title", "")
+                summary = data.get("summary", "")
+                combined_text = (title + " " + summary).lower()
+                data_type = _detect_data_type(combined_text, platforms)
+
+                pub_date = (
+                    data.get("pdat", "")
+                    or data.get("pubdate", "")
+                    or data.get("submissiondate", "")
+                )
+                year = _parse_year(pub_date)
+
+                sample_count = int(
+                    data.get("n_samples", 0)
+                    or data.get("samplecount", 0)
+                    or 0
+                )
+
+                supp_files = self._get_supplementary_urls(acc_upper)
+
+                all_meta.append({
+                    "accession": acc_upper,
+                    "title": title,
+                    "summary": summary[:500] if summary else "",
+                    "platforms": platforms,
+                    "platform_canonical": _canonical_platform(platforms, combined_text),
+                    "sample_count": sample_count,
+                    "data_type": data_type,
+                    "year": year,
+                    "supplementary_files": supp_files,
+                    "source": "GEO",
+                })
+
+        logger.info(f"batch_get_series_metadata: fetched {len(all_meta)}/{len(accessions)} records")
+        return all_meta
 
     def get_accession_metadata(self, accession: str) -> Dict[str, Any]:
         """Alias for get_series_metadata — handles GSE accessions."""
@@ -275,33 +510,54 @@ class GEOClient:
         Returns:
             List of metadata dicts for datasets passing the filter.
         """
+        # Use batch fetch to reduce API calls (N×2 → 2 calls per batch of 50)
+        try:
+            all_meta = self.batch_get_series_metadata(accessions)
+        except Exception as e:
+            logger.warning(f"batch_get_series_metadata failed, falling back to individual: {e}")
+            all_meta = []
+            for acc in accessions:
+                try:
+                    all_meta.append(self.get_series_metadata(acc))
+                except Exception as e2:
+                    logger.warning(f"Error fetching metadata for {acc}: {e2}")
+
         results = []
-        for acc in accessions:
-            try:
-                meta = self.get_series_metadata(acc)
-                if meta.get("error"):
+        for meta in all_meta:
+            acc = meta.get("accession", "?")
+            if meta.get("error"):
+                logger.debug(f"Skipping {acc}: metadata error={meta.get('error')!r}")
+                continue
+
+            data_type = meta.get("data_type", "unknown")
+            platform_canonical = meta.get("platform_canonical")
+            logger.debug(
+                f"{acc}: data_type={data_type}, platform={platform_canonical}, "
+                f"year={meta.get('year')}, title={meta.get('title','')[:50]}"
+            )
+
+            # Platform filter — only exclude if platform is known AND mismatches
+            if platform_filter:
+                canonical = meta.get("platform_canonical")
+                if canonical and canonical != platform_filter:
+                    logger.debug(f"Skipping {acc}: platform {canonical} != {platform_filter}")
                     continue
+                # If canonical is None/unknown, keep the dataset (don't over-filter)
 
-                # Platform filter
-                if platform_filter:
-                    canonical = meta.get("platform_canonical", "")
-                    if canonical and canonical != platform_filter:
-                        logger.debug(f"Skipping {acc}: platform {canonical} != {platform_filter}")
-                        continue
+            # Year filter
+            year = meta.get("year")
+            if year_start and year and year < year_start:
+                logger.debug(f"Skipping {acc}: year {year} < {year_start}")
+                continue
+            if year_end and year and year > year_end:
+                logger.debug(f"Skipping {acc}: year {year} > {year_end}")
+                continue
 
-                # Year filter
-                year = meta.get("year")
-                if year_start and year and year < year_start:
-                    continue
-                if year_end and year and year > year_end:
-                    continue
+            logger.info(f"Accepted {acc}: data_type={data_type}, platform={platform_canonical}")
+            results.append(meta)
 
-                results.append(meta)
-            except Exception as e:
-                logger.warning(f"Error fetching metadata for {acc}: {e}")
-
+        logger.info(f"filter_methylation_datasets: {len(results)}/{len(accessions)} datasets passed")
         return results
-
     # ------------------------------------------------------------------ #
     #  Accession verification (LLM hallucination filter)                  #
     # ------------------------------------------------------------------ #

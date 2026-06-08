@@ -295,35 +295,52 @@ def build_geo_search_string(intent: Dict[str, Any]) -> str:
     """
     Build a GEO NCBI E-utilities search string from parsed intent.
 
+    Always includes a methylation platform filter so results are restricted
+    to actual methylation datasets (450K, EPIC, WGBS, RRBS), not RNA-seq etc.
+
     Examples:
-        "breast cancer EPIC methylation" →
-        "(breast cancer[Title/Abstract]) AND (EPIC[Platform]) AND (methylation[MeSH])"
+        "lung cancer" →
+        'lung cancer[Title/Abstract] AND (GPL13534 OR GPL21145 OR GPL23976 OR
+         bisulfite OR methylation profiling) AND GSE[Entry Type]'
     """
     parts = []
 
+    # Cancer type — use plain keyword (no field tag) for broadest GEO match
     if intent.get("cancer_type"):
         ct = intent["cancer_type"]
         if isinstance(ct, dict):
-            mesh = ct.get("mesh_term") or ct.get("display", "")
-            if mesh:
-                parts.append(f'"{mesh}"[MeSH Terms]')
+            # Prefer display name over MeSH term for GEO title matching
+            term = ct.get("display", "") or ct.get("mesh_term", "")
+            if term:
+                parts.append(term)
         elif isinstance(ct, str):
-            parts.append(f'"{ct}"[Title/Abstract]')
+            parts.append(ct)
 
-    if intent.get("platform"):
-        platform = intent["platform"]
+    # Platform — use GPL accessions for precision, plus text fallback
+    platform = intent.get("platform")
+    if platform:
         platform_terms = {
-            "EPIC": "(EPIC OR HumanMethylationEPIC OR 850K)",
-            "450K": "(HumanMethylation450 OR 450K OR HM450)",
-            "WGBS": "(WGBS OR whole genome bisulfite)",
-            "RRBS": "(RRBS OR reduced representation bisulfite)",
+            "EPIC":  "(GPL21145 OR GPL23976 OR HumanMethylationEPIC OR 850K)",
+            "450K":  "(GPL13534 OR HumanMethylation450 OR 450K OR HM450)",
+            "WGBS":  "(WGBS OR whole genome bisulfite OR bisulfite sequencing)",
+            "RRBS":  "(RRBS OR reduced representation bisulfite)",
         }
         parts.append(platform_terms.get(platform, platform))
+    else:
+        # No platform specified — restrict to known methylation platforms
+        # GPL13534=450K, GPL21145=EPIC v1, GPL23976=EPIC v2, GPL8490=27K
+        parts.append(
+            "(GPL13534 OR GPL21145 OR GPL23976 OR GPL8490"
+            " OR bisulfite OR methylation profiling)"
+        )
 
-    parts.append("methylation[All Fields]")
-
+    # Year range
     if intent.get("year_start") and intent.get("year_end"):
         y1, y2 = intent["year_start"], intent["year_end"]
         parts.append(f'("{y1}/01/01"[PDAT] : "{y2}/12/31"[PDAT])')
 
-    return " AND ".join(parts) if parts else "methylation"
+    # Always restrict to GSE entry type
+    parts.append("GSE[Entry Type]")
+
+    return " AND ".join(parts) if parts else \
+        "(GPL13534 OR GPL21145 OR GPL23976) AND GSE[Entry Type]"

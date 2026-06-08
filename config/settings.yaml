@@ -1,7 +1,18 @@
 llm:
-  backend: openai          # openai | anthropic | ollama
-  model: gpt-4o
-  api_key_env: OPENAI_API_KEY
+  # backend options: openai | zhipu | anthropic | ollama
+  #
+  # For ZhipuAI (智谱), set backend: zhipu and configure .env:
+  #   ZHIPU_API_KEY=your_key
+  #   ZHIPU_MODEL=glm-4-flash        # or glm-4-air, glm-4, glm-4-long
+  #
+  # Alternatively, keep backend: openai and set in .env:
+  #   OPENAI_API_KEY=your_zhipu_key
+  #   OPENAI_BASE_URL=https://open.bigmodel.cn/api/paas/v4
+  #   OPENAI_MODEL=glm-4-flash
+  # (the factory auto-detects bigmodel.cn and applies correct auth)
+  backend: zhipu
+  model: glm-4-flash
+  api_key_env: ZHIPU_API_KEY
   temperature: 0
   max_tokens: 4096
 
@@ -60,7 +71,7 @@ literature:
 
     # Cache LLM results by DOI to avoid redundant API calls
     cache_results: true
-    cache_db_path: /workspace/methyagent_llm_cache.db
+    cache_db_path: /app/data/methyagent_llm_cache.db
 
     # Maximum characters of section text to send to LLM per call
     max_section_chars: 3000
@@ -88,6 +99,4 @@ literature:
 
 logging:
   level: INFO
-  # Log file uses /workspace (local scratch) by default.
-  # Override via METHYAGENT_LOG_FILE environment variable.
-  log_file: /workspace/methyagent_logs/methyagent.log
+  log_file: /app/data/logs/methyagent.log

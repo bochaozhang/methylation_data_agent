@@ -214,7 +214,11 @@ class DatabaseAgent:
         """Search GEO using the parsed intent."""
         from tools.parser_tools import build_geo_search_string
 
-        search_query = intent.get("geo_search_query") or build_geo_search_string(intent)
+        # Always use build_geo_search_string to ensure methylation platform filters
+        # (GPL13534/GPL21145/etc.) are included. LLM-provided geo_search_query is
+        # intentionally ignored here because it typically omits GPL filters, causing
+        # the search to return RNA-seq and other non-methylation datasets.
+        search_query = build_geo_search_string(intent)
         if not search_query:
             return []
 
@@ -227,12 +231,23 @@ class DatabaseAgent:
             year_start = intent.get("year_start")
             year_end = intent.get("year_end")
 
-            return self.geo_client.filter_methylation_datasets(
+            datasets = self.geo_client.filter_methylation_datasets(
                 accessions,
                 platform_filter=platform_filter,
                 year_start=year_start,
                 year_end=year_end,
             )
+
+            # Inject cancer_type from intent into each GEO record
+            # (GEO metadata doesn't carry cancer type; we infer it from the search intent)
+            ct = intent.get("cancer_type")
+            if ct:
+                cancer_label = ct.get("display") if isinstance(ct, dict) else str(ct)
+                for d in datasets:
+                    if not d.get("cancer_type"):
+                        d["cancer_type"] = cancer_label
+
+            return datasets
         except Exception as e:
             logger.error(f"GEO search failed: {e}")
             return []
