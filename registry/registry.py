@@ -104,6 +104,14 @@ class Registry:
                     needs_review    INTEGER DEFAULT 0,
                     llm_evidence    TEXT,
                     sample_type     TEXT,
+                    disease_groups          TEXT,
+                    stage_treatment         TEXT,
+                    available_file_type     TEXT,
+                    sample_level_annotation TEXT,
+                    usable                  INTEGER DEFAULT 1,
+                    recommended_action      TEXT,
+                    reason                  TEXT,
+                    notes                   TEXT,
                     created_at      TEXT NOT NULL,
                     updated_at      TEXT NOT NULL
                 );
@@ -165,6 +173,15 @@ class Registry:
             "ALTER TABLE datasets ADD COLUMN needs_review INTEGER DEFAULT 0",
             "ALTER TABLE datasets ADD COLUMN llm_evidence TEXT",
             "ALTER TABLE datasets ADD COLUMN sample_type TEXT",
+            # v2 columns
+            "ALTER TABLE datasets ADD COLUMN disease_groups TEXT",
+            "ALTER TABLE datasets ADD COLUMN stage_treatment TEXT",
+            "ALTER TABLE datasets ADD COLUMN available_file_type TEXT",
+            "ALTER TABLE datasets ADD COLUMN sample_level_annotation TEXT",
+            "ALTER TABLE datasets ADD COLUMN usable INTEGER DEFAULT 1",
+            "ALTER TABLE datasets ADD COLUMN recommended_action TEXT",
+            "ALTER TABLE datasets ADD COLUMN reason TEXT",
+            "ALTER TABLE datasets ADD COLUMN notes TEXT",
         ]
         with self._get_conn() as conn:
             for sql in migrations:
@@ -210,6 +227,15 @@ class Registry:
         needs_review: bool = False,
         llm_evidence: Optional[str] = None,
         sample_type: Optional[str] = None,
+        # v2 columns
+        disease_groups: Optional[str] = None,
+        stage_treatment: Optional[str] = None,
+        available_file_type: Optional[str] = None,
+        sample_level_annotation: Optional[str] = None,
+        usable: int = 1,
+        recommended_action: Optional[str] = None,
+        reason: Optional[str] = None,
+        notes: Optional[str] = None,
     ) -> bool:
         """
         Insert a new dataset or update metadata if it already exists.
@@ -229,24 +255,35 @@ class Registry:
                     conn.execute(
                         """
                         UPDATE datasets SET
-                            data_type    = COALESCE(?, data_type),
-                            cancer_type  = COALESCE(?, cancer_type),
-                            platform     = COALESCE(?, platform),
-                            sample_count = COALESCE(?, sample_count),
-                            year         = COALESCE(?, year),
-                            title        = COALESCE(?, title),
-                            paper_pmid   = COALESCE(?, paper_pmid),
-                            paper_doi    = COALESCE(?, paper_doi),
-                            needs_review = COALESCE(?, needs_review),
-                            llm_evidence = COALESCE(?, llm_evidence),
-                            sample_type  = COALESCE(?, sample_type),
-                            updated_at   = ?
+                            data_type               = COALESCE(?, data_type),
+                            cancer_type             = COALESCE(?, cancer_type),
+                            platform                = COALESCE(?, platform),
+                            sample_count            = COALESCE(?, sample_count),
+                            year                    = COALESCE(?, year),
+                            title                   = COALESCE(?, title),
+                            paper_pmid              = COALESCE(?, paper_pmid),
+                            paper_doi               = COALESCE(?, paper_doi),
+                            needs_review            = COALESCE(?, needs_review),
+                            llm_evidence            = COALESCE(?, llm_evidence),
+                            sample_type             = COALESCE(?, sample_type),
+                            disease_groups          = COALESCE(?, disease_groups),
+                            stage_treatment         = COALESCE(?, stage_treatment),
+                            available_file_type     = COALESCE(?, available_file_type),
+                            sample_level_annotation = COALESCE(?, sample_level_annotation),
+                            usable                  = COALESCE(?, usable),
+                            recommended_action      = COALESCE(?, recommended_action),
+                            reason                  = COALESCE(?, reason),
+                            notes                   = COALESCE(?, notes),
+                            updated_at              = ?
                         WHERE accession = ?
                         """,
                         (
                             data_type, cancer_type, platform, sample_count,
                             year, title, paper_pmid, paper_doi,
                             int(needs_review), llm_evidence, sample_type,
+                            disease_groups, stage_treatment, available_file_type,
+                            sample_level_annotation, usable, recommended_action,
+                            reason, notes,
                             now, accession,
                         ),
                     )
@@ -259,14 +296,21 @@ class Registry:
                             sample_count, year, title, download_status,
                             paper_pmid, paper_doi, discovered_by,
                             needs_review, llm_evidence, sample_type,
+                            disease_groups, stage_treatment, available_file_type,
+                            sample_level_annotation, usable, recommended_action,
+                            reason, notes,
                             created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                                  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             accession, source, data_type, cancer_type, platform,
                             sample_count, year, title, download_status,
                             paper_pmid, paper_doi, discovered_by,
                             int(needs_review), llm_evidence, sample_type,
+                            disease_groups, stage_treatment, available_file_type,
+                            sample_level_annotation, usable, recommended_action,
+                            reason, notes,
                             now, now,
                         ),
                     )

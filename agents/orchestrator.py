@@ -146,7 +146,7 @@ def make_report_node(config: Dict[str, Any], registry: Registry):
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         json_path = output_dir / f"report_{ts}.json"
-        md_path = output_dir / f"report_{ts}.md"
+        md_path   = output_dir / f"report_{ts}.md"
 
         with open(json_path, "w", encoding="utf-8") as f:
             json.dump(report, f, ensure_ascii=False, indent=2)
@@ -155,7 +155,51 @@ def make_report_node(config: Dict[str, Any], registry: Registry):
         with open(md_path, "w", encoding="utf-8") as f:
             f.write(md_content)
 
-        logger.info(f"Report saved: {json_path}, {md_path}")
+        # ---- geo_candidates_<ts>.json ----
+        # Compact, machine-readable list of GEO candidates found by Agent 1.
+        # Includes LLM judge verdict fields (llm_keep, llm_confidence, llm_reason)
+        # and the new registry columns (usable, recommended_action, reason).
+        # Intended for downstream scripts, review UIs, and re-runs.
+        geo_candidates = [
+            c for c in state.get("db_candidates", [])
+            if c.get("source", "GEO") == "GEO"
+        ]
+        geo_candidates_payload = {
+            "query":     state.get("raw_query", ""),
+            "timestamp": report["timestamp"],
+            "total":     len(geo_candidates),
+            "candidates": [
+                {
+                    "accession":            c.get("accession"),
+                    "title":                c.get("title", "")[:200],
+                    "cancer_type":          c.get("cancer_type"),
+                    "platform":             c.get("platform_canonical") or c.get("platform"),
+                    "sample_count":         c.get("sample_count"),
+                    "year":                 c.get("year"),
+                    "data_type":            c.get("data_type"),
+                    "sample_type":          c.get("sample_type"),
+                    "detected_sample_types": c.get("detected_sample_types", []),
+                    "pubmed_ids":           c.get("pubmed_ids", []),
+                    "supplementary_files":  c.get("supplementary_files", [])[:3],
+                    # LLM judge fields
+                    "llm_keep":             c.get("llm_keep"),
+                    "llm_confidence":       c.get("llm_confidence"),
+                    "llm_reason":           c.get("llm_reason"),
+                    # Registry annotation fields
+                    "usable":               c.get("usable", 1),
+                    "recommended_action":   c.get("recommended_action"),
+                    "reason":               c.get("reason"),
+                    "notes":                c.get("notes"),
+                }
+                for c in geo_candidates
+            ],
+        }
+        geo_json_path = output_dir / f"geo_candidates_{ts}.json"
+        with open(geo_json_path, "w", encoding="utf-8") as f:
+            json.dump(geo_candidates_payload, f, ensure_ascii=False, indent=2)
+
+        logger.info(f"Report saved: {json_path}, {md_path}, {geo_json_path}")
+        report["geo_candidates_path"] = str(geo_json_path)
 
         return {**state, "final_report": report}
 
@@ -355,6 +399,14 @@ def _render_markdown_report(report: Dict[str, Any]) -> str:
 
     lines += [
         "",
+        "### 样本类型分布",
+        "",
+    ]
+    for stype, cnt in s.get("by_sample_type", {}).items():
+        lines.append(f"- **{stype}**: {cnt} 个数据集")
+
+    lines += [
+        "",
         "---",
         "",
         "## Agent 1 (DatabaseAgent) 详情",
@@ -376,8 +428,8 @@ def _render_markdown_report(report: Dict[str, Any]) -> str:
         "",
         "## 数据集列表",
         "",
-        "| Accession | 来源 | 平台 | 癌种 | 样本数 | 年份 | 状态 |",
-        "|-----------|------|------|------|--------|------|------|",
+        "| Accession | 来源 | 平台 | 样本类型 | 癌种 | 样本数 | 年份 | 状态 |",
+        "|-----------|------|------|----------|------|--------|------|------|",
     ]
 
     for ds in report.get("datasets", []):
@@ -385,6 +437,7 @@ def _render_markdown_report(report: Dict[str, Any]) -> str:
             f"| {ds.get('accession','')} "
             f"| {ds.get('source','')} "
             f"| {ds.get('platform') or '-'} "
+            f"| {ds.get('sample_type') or '-'} "
             f"| {ds.get('cancer_type') or '-'} "
             f"| {ds.get('sample_count') or '-'} "
             f"| {ds.get('year') or '-'} "

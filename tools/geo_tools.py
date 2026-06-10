@@ -576,6 +576,146 @@ class GEOClient:
             return []
 
     # ------------------------------------------------------------------ #
+    #  Sample-level annotation (GSM Characteristics)                      #
+    # ------------------------------------------------------------------ #
+
+    def get_gsm_details(
+        self,
+        accession: str,
+        max_samples: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch sample-level annotation for the first N GSMs of a GSE series.
+
+        Uses efetch with rettype=miniml to retrieve SOFT MiniML XML, which
+        contains per-sample Characteristics, Source-Name, and Extracted-Molecule
+        fields.  These are the most reliable signals for:
+          - Biological material type (plasma, PBMC, tumor tissue, cell line, ...)
+          - Disease state (cancer, healthy, adenoma, ...)
+          - Treatment status (pre/post-treatment, naive, ...)
+
+        Args:
+            accession: GSE accession string (e.g. 'GSE220160').
+            max_samples: Maximum number of GSMs to inspect (default 5).
+
+        Returns:
+            List of dicts, one per GSM, with keys:
+              gsm          : GSM accession string
+              source_name  : Source-Name field (e.g. "plasma", "tumor tissue")
+              molecule     : Extracted-Molecule field (e.g. "genomic DNA", "total RNA")
+              characteristics: dict of {tag: value} from Characteristics fields
+                               (e.g. {"tissue": "plasma", "disease state": "CRC"})
+            Returns [] on any error.
+        """
+        try:
+            # Step 1: get GSM accessions from esummary
+            params = {
+                "db": "gds",
+                "term": f"{accession}[Accession]",
+                "retmode": "json",
+            }
+            resp = self._get("esearch.fcgi", params)
+            uids = resp.json().get("esearchresult", {}).get("idlist", [])
+            gse_uid = next((u for u in uids if u.startswith("200")), uids[0] if uids else None)
+            if not gse_uid:
+                return []
+
+            sum_resp = self._get("esummary.fcgi", {"db": "gds", "id": gse_uid, "retmode": "json"})
+            data = sum_resp.json().get("result", {}).get(gse_uid, {})
+            samples_field = data.get("samples", [])
+
+            gsm_accessions = []
+            for s in samples_field[:max_samples]:
+                if isinstance(s, dict):
+                    gsm = s.get("accession", "")
+                elif isinstance(s, str):
+                    gsm = s
+                else:
+                    gsm = ""
+                if gsm:
+                    gsm_accessions.append(gsm.upper())
+
+            if not gsm_accessions:
+                logger.debug(f"get_gsm_details({accession}): no GSM accessions found")
+                return []
+
+            # Step 2: efetch MiniML XML for each GSM
+            results = []
+            for gsm in gsm_accessions:
+                try:
+                    fetch_resp = self._get("efetch.fcgi", {
+                        "db": "gsm",
+                        "acc": gsm,
+                        "rettype": "miniml",
+                        "retmode": "xml",
+                    })
+                    xml_text = fetch_resp.text
+                    details = self._parse_gsm_miniml(gsm, xml_text)
+                    results.append(details)
+                except Exception as e:
+                    logger.debug(f"get_gsm_details: efetch failed for {gsm}: {e}")
+                    results.append({"gsm": gsm, "source_name": "", "molecule": "", "characteristics": {}})
+
+            logger.debug(f"get_gsm_details({accession}): fetched {len(results)} GSMs")
+            return results
+
+        except Exception as e:
+            logger.warning(f"get_gsm_details({accession}) failed: {e}")
+            return []
+
+    @staticmethod
+    def _parse_gsm_miniml(gsm: str, xml_text: str) -> Dict[str, Any]:
+        """
+        Parse SOFT MiniML XML for a single GSM sample.
+
+        Extracts:
+          - Source-Name (biological material, e.g. "plasma", "tumor tissue")
+          - Extracted-Molecule (e.g. "genomic DNA", "total RNA")
+          - Characteristics (key-value pairs, e.g. tissue, disease state, age)
+
+        Returns a dict with keys: gsm, source_name, molecule, characteristics.
+        """
+        characteristics: Dict[str, str] = {}
+        source_name = ""
+        molecule = ""
+
+        try:
+            # Strip namespace for simpler XPath
+            xml_clean = xml_text.replace(' xmlns="http://www.ncbi.nlm.nih.gov/geo/info/MINiML"', "")
+            root = ET.fromstring(xml_clean)
+
+            sample_el = root.find(".//Sample")
+            if sample_el is None:
+                sample_el = root
+
+            # Source-Name
+            src_el = sample_el.find(".//Source-Name")
+            if src_el is not None and src_el.text:
+                source_name = src_el.text.strip()
+
+            # Extracted-Molecule
+            mol_el = sample_el.find(".//Extracted-Molecule")
+            if mol_el is not None and mol_el.text:
+                molecule = mol_el.text.strip()
+
+            # Characteristics — each has a tag attribute and text content
+            for ch_el in sample_el.findall(".//Characteristics"):
+                tag = (ch_el.get("tag") or "").strip().lower()
+                val = (ch_el.text or "").strip()
+                if tag:
+                    characteristics[tag] = val
+
+        except ET.ParseError as e:
+            logger.debug(f"_parse_gsm_miniml({gsm}): XML parse error: {e}")
+
+        return {
+            "gsm": gsm,
+            "source_name": source_name,
+            "molecule": molecule,
+            "characteristics": characteristics,
+        }
+
+    # ------------------------------------------------------------------ #
     #  Supplementary file discovery                                        #
     # ------------------------------------------------------------------ #
 

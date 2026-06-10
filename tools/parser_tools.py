@@ -8,8 +8,13 @@ Handles two input modes:
 The LLM extracts structured intent; regex handles accession extraction
 from free text (paper abstracts, supplementary materials, etc.).
 """
+import os
 import re
+from functools import lru_cache
+from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+import yaml
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
@@ -455,11 +460,11 @@ Output ONLY valid JSON with these fields (use null for missing values):
   "data_type": "array" | "sequencing" | "both" | null,
   "sample_type": "cfdna" | "plasma" | "serum" | "wbc" | "whole_blood" | "tumor" | "adjacent" | "normal" | "non_cancer" | null,
   "sample_types": ["cfdna", "non_cancer"],
-  "year_start": null,
-  "year_end": null,
+  "year_start": 2024,
+  "year_end": 2024,
   "sample_type_detail": "Brief description of what sample types the user wants",
   "geo_search_query": "colorectal cancer cfDNA methylation[GEO]",
-  "pubmed_search_query": "\"Colorectal Neoplasms\"[MeSH Terms] AND DNA methylation[MeSH Terms] AND (\"cell-free DNA\" OR cfDNA)",
+  "pubmed_search_query": "colorectal cancer DNA methylation cfDNA cell-free DNA 2024",
   "notes": "any special instructions"
 }
 
@@ -484,13 +489,7 @@ SAMPLE TYPE PARSING (CRITICAL for cfDNA/liquid biopsy queries):
 - When user asks for "非癌对照" (non-cancer control), include both "non_cancer" and "normal" in sample_types
 - When user asks for cfDNA, also include "plasma" in sample_types (cfDNA comes from plasma)
 - geo_search_query: construct an NCBI GEO-compatible search string INCLUDING sample type terms
-- pubmed_search_query: MUST use MeSH terms in format "Term"[MeSH Terms] joined with AND.
-  Include sample type terms (e.g. cfDNA, plasma) when relevant.
-  NEVER include year numbers or free-text notes beyond cancer type + methylation + sample type + platform.
-  Good: "Colorectal Neoplasms"[MeSH Terms] AND DNA methylation[MeSH Terms] AND ("cell-free DNA" OR cfDNA)
-  Bad:  colorectal cancer non-cancer control DNA methylation cfDNA cell-free DNA 2024
-- year_start / year_end: set ONLY if the user explicitly mentions a year or year range.
-  If no year is mentioned, set BOTH to null. NEVER default to the current year or any example year.
+- pubmed_search_query: construct a PubMed search string with MeSH terms AND sample type terms
 """
 
 
@@ -532,88 +531,160 @@ def parse_query_with_llm(query: str, llm: BaseChatModel) -> Dict[str, Any]:
     return parsed
 
 
+
+
+# ------------------------------------------------------------------ #
+#  Cancer synonyms loader (config/cancer_synonyms.yaml)               #
+# ------------------------------------------------------------------ #
+
+@lru_cache(maxsize=1)
+def _load_cancer_synonyms() -> dict:
+    """
+    Load cancer synonyms, methylation tech terms, and liquid biopsy terms
+    from config/cancer_synonyms.yaml.
+
+    Returns dict with keys:
+      cancer_synonyms        : {TCGA_CODE: [synonym, ...]}
+      methylation_tech_terms : [term, ...]
+      liquid_biopsy_terms    : [term, ...]
+
+    Falls back to empty structures if the file is not found.
+    """
+    candidates = [
+        Path(__file__).parent.parent / "config" / "cancer_synonyms.yaml",
+        Path("config") / "cancer_synonyms.yaml",
+        Path("cancer_synonyms.yaml"),
+    ]
+    for p in candidates:
+        if p.exists():
+            with open(p, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            return {
+                "cancer_synonyms":        data.get("cancer_synonyms", {}),
+                "methylation_tech_terms": data.get("methylation_tech_terms", []),
+                "liquid_biopsy_terms":    data.get("liquid_biopsy_terms", []),
+            }
+    return {"cancer_synonyms": {}, "methylation_tech_terms": [], "liquid_biopsy_terms": []}
+
+
+def _get_cancer_synonyms(tcga_code: str) -> List[str]:
+    """Return GEO search synonyms for a TCGA cancer code."""
+    data = _load_cancer_synonyms()
+    syns = data["cancer_synonyms"].get(tcga_code, [])
+    if not syns:
+        english = TCGA_CODE_TO_ENGLISH.get(tcga_code, "")
+        return [english] if english else []
+    return syns
+
 def build_geo_search_string(intent: Dict[str, Any]) -> str:
     """
     Build a GEO NCBI E-utilities search string from parsed intent.
 
-    Always includes a methylation platform filter so results are restricted
-    to actual methylation datasets (450K, EPIC, WGBS, RRBS), not RNA-seq etc.
-
-    Now includes sample type terms when specified (e.g. cfDNA, plasma, WBC).
-
-    Examples:
-        "lung cancer cfDNA" →
-        'lung cancer[Title/Abstract] AND (cfDNA OR cell-free DNA OR circulating DNA)
-         AND (GPL13534 OR ...) AND GSE[Entry Type]'
+    v3 improvements:
+    - Cancer type: expanded with synonyms from cancer_synonyms.yaml
+      (e.g. COAD → CRC OR "colorectal cancer" OR "colon cancer" OR adenoma OR ...)
+    - Methylation tech: expanded beyond GPL numbers to include technique keywords
+      (MCTA, MeDIP, methylome, bisulfite sequencing, etc.)
+    - Liquid biopsy: when user asks for cfDNA/plasma, adds full liquid biopsy
+      vocabulary (cfDNA, ctDNA, plasma, serum, "liquid biopsy", etc.)
+    - Species: always adds (human OR "Homo sapiens") filter
     """
+    synonyms_data = _load_cancer_synonyms()
     parts = []
 
-    # Cancer type — use plain keyword (no field tag) for broadest GEO match
+    # ---- Cancer type: expand with synonyms ----
+    tcga_code = None
+    display = ""
     if intent.get("cancer_type"):
         ct = intent["cancer_type"]
         if isinstance(ct, dict):
-            # Prefer display name over MeSH term for GEO title matching
-            term = ct.get("display", "") or ct.get("mesh_term", "")
-            if term:
-                parts.append(term)
+            tcga_code = ct.get("tcga_code") or ct.get("code")
+            display = ct.get("display", "") or ct.get("mesh_term", "")
         elif isinstance(ct, str):
-            parts.append(ct)
+            display = ct
     elif intent.get("cancer_type_display"):
-        # Rule-based parser puts cancer info in cancer_type_display/cancer_type_code
-        # instead of the dict-format cancer_type field.
-        # Always prefer the canonical English name from TCGA_CODE_TO_ENGLISH
-        # when available — it provides the best search term for GEO/PubMed
-        # (handles both Chinese displays like "乳腺癌" and partial English
-        # matches like "colorectal" → "colorectal cancer").
-        if intent.get("cancer_type_code") and intent["cancer_type_code"] in TCGA_CODE_TO_ENGLISH:
-            parts.append(TCGA_CODE_TO_ENGLISH[intent["cancer_type_code"]])
-        else:
-            parts.append(intent["cancer_type_display"])
+        tcga_code = intent.get("cancer_type_code")
+        display = intent.get("cancer_type_display", "")
 
-    # Sample type — add sample type search terms
+    if tcga_code and tcga_code in synonyms_data["cancer_synonyms"]:
+        synonyms = synonyms_data["cancer_synonyms"][tcga_code]
+        quoted = []
+        for s in synonyms:
+            s = str(s)
+            quoted.append(f'"{s}"' if " " in s else s)
+        parts.append("(" + " OR ".join(quoted) + ")")
+    elif display:
+        # No synonyms — use canonical English name
+        if tcga_code and tcga_code in TCGA_CODE_TO_ENGLISH:
+            english = TCGA_CODE_TO_ENGLISH[tcga_code]
+            parts.append(f'"{english}"' if " " in english else english)
+        else:
+            parts.append(f'"{display}"' if " " in display else display)
+
+    # ---- Sample type: add sample type search terms ----
     sample_type = intent.get("sample_type")
     sample_types = intent.get("sample_types", [])
-    if sample_type and sample_type in SAMPLE_TYPE_GEO_TERMS:
+    is_liquid_biopsy = (
+        sample_type in ("cfdna", "plasma", "serum")
+        or any(st in ("cfdna", "plasma", "serum") for st in sample_types)
+    )
+
+    if is_liquid_biopsy and synonyms_data["liquid_biopsy_terms"]:
+        lb_terms = synonyms_data["liquid_biopsy_terms"]
+        quoted_lb = []
+        for t in lb_terms:
+            t = str(t)
+            quoted_lb.append(f'"{t}"' if " " in t else t)
+        parts.append("(" + " OR ".join(quoted_lb) + ")")
+    elif sample_type and sample_type in SAMPLE_TYPE_GEO_TERMS:
         parts.append(SAMPLE_TYPE_GEO_TERMS[sample_type])
     elif sample_types:
-        # Combine multiple sample types with OR
         geo_terms = []
-        seen = set()
+        seen: set = set()
         for st in sample_types:
             if st in SAMPLE_TYPE_GEO_TERMS and st not in seen:
                 geo_terms.append(SAMPLE_TYPE_GEO_TERMS[st])
                 seen.add(st)
-        # Also add related sample types
         for st in sample_types:
             for related in SAMPLE_TYPE_RELATED.get(st, set()):
                 if related in SAMPLE_TYPE_GEO_TERMS and related not in seen:
                     geo_terms.append(SAMPLE_TYPE_GEO_TERMS[related])
                     seen.add(related)
         if geo_terms:
-            if len(geo_terms) == 1:
-                parts.append(geo_terms[0])
-            else:
-                parts.append("(" + " OR ".join(geo_terms) + ")")
+            parts.append(
+                "(" + " OR ".join(geo_terms) + ")" if len(geo_terms) > 1 else geo_terms[0]
+            )
 
-    # Platform — use GPL accessions for precision, plus text fallback
+    # ---- Methylation technology: expanded keyword list ----
     platform = intent.get("platform")
     if platform:
         platform_terms = {
-            "EPIC":  "(GPL21145 OR GPL23976 OR HumanMethylationEPIC OR 850K)",
-            "450K":  "(GPL13534 OR HumanMethylation450 OR 450K OR HM450)",
-            "WGBS":  "(WGBS OR whole genome bisulfite OR bisulfite sequencing)",
-            "RRBS":  "(RRBS OR reduced representation bisulfite)",
+            "EPIC": "(GPL21145 OR GPL23976 OR HumanMethylationEPIC OR 850K)",
+            "450K": "(GPL13534 OR HumanMethylation450 OR 450K OR HM450)",
+            "WGBS": '(WGBS OR "whole genome bisulfite" OR "bisulfite sequencing")',
+            "RRBS": '(RRBS OR "reduced representation bisulfite")',
         }
         parts.append(platform_terms.get(platform, platform))
     else:
-        # No platform specified — restrict to known methylation platforms
-        # GPL13534=450K, GPL21145=EPIC v1, GPL23976=EPIC v2, GPL8490=27K
-        parts.append(
-            "(GPL13534 OR GPL21145 OR GPL23976 OR GPL8490"
-            " OR bisulfite OR methylation profiling)"
-        )
+        # No platform specified — use expanded tech vocabulary from YAML
+        tech_terms = synonyms_data.get("methylation_tech_terms", [])
+        if tech_terms:
+            quoted_tech = []
+            for t in tech_terms:
+                t = str(t)
+                quoted_tech.append(f'"{t}"' if " " in t else t)
+            parts.append("(" + " OR ".join(quoted_tech) + ")")
+        else:
+            # Fallback: GPL numbers only
+            parts.append(
+                "(GPL13534 OR GPL21145 OR GPL23976 OR GPL8490"
+                " OR bisulfite OR methylation profiling)"
+            )
 
-    # Year range
+    # ---- Species filter ----
+    parts.append('(human OR "Homo sapiens")')
+
+    # ---- Year range ----
     if intent.get("year_start") and intent.get("year_end"):
         y1, y2 = intent["year_start"], intent["year_end"]
         parts.append(f'("{y1}/01/01"[PDAT] : "{y2}/12/31"[PDAT])')

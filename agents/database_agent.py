@@ -15,12 +15,11 @@ Sample type filtering:
        in title/summary, removing datasets that clearly don't match
        (e.g. tumor tissue datasets when user asked for cfDNA).
 """
+import asyncio
+import re
 import os
-import time
-import xml.etree.ElementTree as ET
+from typing import Any, Dict, List, Optional, Tuple
 
-import requests
-from typing import Any, Dict, List, Optional
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
@@ -40,6 +39,10 @@ from utils.llm_factory import get_llm
 
 logger = get_logger(__name__)
 
+# NOTE: Keep this string CONSTANT across all calls.
+# Z.AI (GLM) automatically caches identical system prompts — cached tokens are
+# billed at a lower rate and reduce latency. Any change to this string invalidates
+# the cache. Dynamic content (query, dataset info) must go in the user message only.
 SYSTEM_PROMPT = """You are DatabaseAgent, a specialized AI for discovering and downloading DNA methylation datasets from TCGA and GEO databases.
 
 Your workflow:
@@ -54,6 +57,29 @@ Always prefer:
 - Datasets with clear cancer type annotations
 
 Report your findings clearly, including how many datasets were found, filtered, and downloaded.
+"""
+
+# LLM judge system prompt — also kept constant for Z.AI system cache.
+# Instructs the LLM to evaluate a single GEO dataset and return a JSON verdict.
+LLM_JUDGE_SYSTEM_PROMPT = """You are a biomedical data curator specializing in DNA methylation datasets.
+
+Given metadata for a GEO dataset (title, summary, sample source, molecule type, characteristics),
+decide whether it is a valid methylation dataset matching the user's sample type requirement.
+
+Respond ONLY with a JSON object (no markdown, no explanation outside JSON):
+{
+  "keep": true or false,
+  "confidence": "high" | "medium" | "low",
+  "reason": "one sentence explaining the decision",
+  "detected_sample_type": "tumor|adjacent|normal|wbc|cfdna|plasma|serum|whole_blood|cell_line|unknown"
+}
+
+Rules:
+- keep=true  if the dataset matches the requested sample type
+- keep=false if it clearly does NOT match (e.g. cell lines when plasma requested,
+              tissue gDNA when cfDNA requested)
+- keep=true  if evidence is ambiguous or insufficient (conservative — prefer false positives)
+- Cell lines / organoids / in-vitro models → always keep=false
 """
 
 
@@ -122,16 +148,6 @@ class DatabaseAgent:
             geo_candidates = self._search_geo(intent)
             tcga_candidates = self._search_tcga(intent)
             candidates = geo_candidates + tcga_candidates
-
-        # ---- Step 2b: Paper-based verification for datasets with no sample type signal ----
-        # For GEO datasets where title+summary+sample_titles gave no sample type signal
-        # (detected_sample_types is empty), fetch the linked PubMed abstract and check
-        # for wanted/excluded keywords. This rescues false negatives like GSE124600
-        # where the GEO summary omits sample type info but the paper abstract mentions plasma.
-        sample_type = intent.get("sample_type")
-        sample_types = intent.get("sample_types", [])
-        if sample_type or sample_types:
-            candidates = self._verify_candidates_via_papers(candidates, sample_type, sample_types)
 
         logger.info(f"Total candidates found: {len(candidates)}")
 
@@ -277,11 +293,12 @@ class DatabaseAgent:
                     if not d.get("cancer_type"):
                         d["cancer_type"] = cancer_label
 
-            # Apply sample type post-retrieval filter
+            # Apply LLM-based sample type judge (replaces keyword filter)
             sample_type = intent.get("sample_type")
             sample_types = intent.get("sample_types", [])
             if sample_type or sample_types:
-                datasets = self._filter_by_sample_type(datasets, sample_type, sample_types)
+                wanted_label = sample_type or (sample_types[0] if sample_types else "")
+                datasets = self._llm_judge_datasets_concurrent(datasets, wanted_label)
 
             return datasets
         except Exception as e:
@@ -304,188 +321,201 @@ class DatabaseAgent:
     #  Sample type filtering                                               #
     # ------------------------------------------------------------------ #
 
-    def _filter_by_sample_type(
-        self,
-        datasets: List[Dict[str, Any]],
-        primary_sample_type: Optional[str] = None,
-        sample_types: Optional[List[str]] = None,
-    ) -> List[Dict[str, Any]]:
+    # ------------------------------------------------------------------ #
+    #  LLM-based dataset judge (replaces keyword filter)                  #
+    # ------------------------------------------------------------------ #
+
+    def _enrich_dataset_for_llm(self, ds: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Post-retrieval filter: remove datasets whose metadata clearly indicates
-        an incompatible sample type.
+        Enrich a GEO dataset dict with GSM-level details for LLM evaluation.
 
-        Three-layer verification strategy:
-          Layer 1 — title + summary keyword matching (fast, no extra API calls)
-          Layer 2 — sample_titles keyword matching (GSM titles from esummary,
-                    already fetched; resolves ambiguous cases where summary
-                    mentions cfDNA as research topic but samples are tissue)
-          Layer 3 — in-vitro exclusion (cell lines, organoids, supernatant)
-                    applied globally regardless of wanted/excluded sets
+        Calls get_gsm_details() to fetch Source-Name, Extracted-Molecule, and
+        Characteristics for the first 5 GSMs.  This gives the LLM concrete
+        sample-level evidence (e.g. "source: plasma", "tissue: CRC patient")
+        rather than relying solely on the dataset title/summary.
 
-        Decision logic:
-          - If Layer 3 in-vitro signal found → exclude (cell lines are never
-            valid cfDNA/plasma/tissue patient samples)
-          - If Layer 1 summary matches ONLY excluded type → exclude
-          - If Layer 1 summary matches BOTH wanted and excluded (ambiguous):
-              → check Layer 2 sample_titles
-              → if sample_titles match excluded → exclude
-              → if sample_titles match wanted or are ambiguous → keep
-          - If no signal → keep (conservative, prefer false positives)
+        Returns the dataset dict with an added 'gsm_details' key.
+        """
+        acc = ds.get("accession", "")
+        if not acc:
+            return ds
+        try:
+            gsm_details = self.geo_client.get_gsm_details(acc, max_samples=5)
+            ds = {**ds, "gsm_details": gsm_details}
+        except Exception as e:
+            logger.debug(f"_enrich_dataset_for_llm({acc}): {e}")
+            ds = {**ds, "gsm_details": []}
+        return ds
+
+    def _llm_judge_dataset(
+        self,
+        ds: Dict[str, Any],
+        wanted_sample_type: str,
+    ) -> Tuple[bool, str, str]:
+        """
+        Ask the LLM to judge whether a single GEO dataset matches the wanted
+        sample type.
+
+        Uses LLM_JUDGE_SYSTEM_PROMPT (constant) for Z.AI system cache.
+        Dynamic content (dataset metadata) goes in the user message only.
 
         Args:
-            datasets: List of GEO metadata dicts (must include 'sample_titles').
-            primary_sample_type: The main sample type the user wants.
-            sample_types: All sample types mentioned in the query.
+            ds: Dataset metadata dict (may include 'gsm_details').
+            wanted_sample_type: The sample type the user wants (e.g. 'cfdna').
 
         Returns:
-            Filtered list of datasets, each tagged with 'detected_sample_types'.
+            Tuple of (keep: bool, confidence: str, reason: str).
         """
-        if not primary_sample_type and not sample_types:
+        import json as _json
+
+        acc = ds.get("accession", "?")
+
+        # Build user message with all available evidence
+        gsm_lines = []
+        for g in ds.get("gsm_details", [])[:5]:
+            ch_str = "; ".join(f"{k}={v}" for k, v in g.get("characteristics", {}).items())
+            gsm_lines.append(
+                f"  GSM {g['gsm']}: source={g.get('source_name','?')!r}, "
+                f"molecule={g.get('molecule','?')!r}, characteristics={{{ch_str}}}"
+            )
+        gsm_block = "\n".join(gsm_lines) if gsm_lines else "  (no GSM details available)"
+
+        user_msg = (
+            f"Wanted sample type: {wanted_sample_type}\n\n"
+            f"Dataset: {acc}\n"
+            f"Title: {ds.get('title','')[:200]}\n"
+            f"Summary: {ds.get('summary','')[:400]}\n"
+            f"Platform: {ds.get('platform_canonical') or ds.get('platforms',[])}\n"
+            f"Sample count: {ds.get('sample_count')}\n"
+            f"Sample titles (first 5): {ds.get('sample_titles', [])[:5]}\n"
+            f"GSM details (first 5):\n{gsm_block}\n"
+        )
+
+        try:
+            from langchain_core.messages import HumanMessage, SystemMessage
+            response = self.llm.invoke([
+                SystemMessage(content=LLM_JUDGE_SYSTEM_PROMPT),
+                HumanMessage(content=user_msg),
+            ])
+            raw = response.content.strip()
+
+            # Log cached tokens if available (Z.AI system cache telemetry)
+            usage = getattr(response, "usage_metadata", None) or getattr(response, "response_metadata", {})
+            cached = 0
+            if isinstance(usage, dict):
+                cached = (
+                    usage.get("cached_tokens")
+                    or usage.get("prompt_tokens_details", {}).get("cached_tokens", 0)
+                    or 0
+                )
+            if cached:
+                logger.debug(f"LLM judge {acc}: cached_tokens={cached}")
+
+            # Parse JSON response
+            # Strip markdown code fences if present
+            if raw.startswith("```"):
+                raw = re.sub(r"^```[a-z]*\n?", "", raw)
+                raw = re.sub(r"\n?```$", "", raw)
+            verdict = _json.loads(raw)
+            keep = bool(verdict.get("keep", True))
+            confidence = verdict.get("confidence", "low")
+            reason = verdict.get("reason", "")
+            detected = verdict.get("detected_sample_type", "unknown")
+
+            logger.info(
+                f"LLM judge {acc}: keep={keep} conf={confidence} "
+                f"detected={detected} reason={reason[:80]}"
+            )
+            return keep, confidence, reason
+
+        except Exception as e:
+            # On any LLM/parse error: keep the dataset (conservative)
+            logger.warning(f"LLM judge failed for {acc}: {e} — keeping dataset")
+            return True, "low", f"LLM judge error: {e}"
+
+    def _llm_judge_datasets_concurrent(
+        self,
+        datasets: List[Dict[str, Any]],
+        wanted_sample_type: str,
+        max_concurrent: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """
+        Run LLM judgment on all datasets with up to max_concurrent parallel calls.
+
+        Pipeline per dataset:
+          1. _enrich_dataset_for_llm()  — fetch GSM details (NCBI API)
+          2. _llm_judge_dataset()       — LLM verdict (Z.AI, system-cached)
+
+        Uses asyncio + asyncio.Semaphore to cap concurrent LLM calls at 5,
+        preventing rate-limit errors while maximising throughput.
+
+        Args:
+            datasets: List of GEO metadata dicts.
+            wanted_sample_type: The sample type the user wants.
+            max_concurrent: Max parallel LLM calls (default 5).
+
+        Returns:
+            Filtered list of datasets that passed the LLM judge,
+            each tagged with 'llm_keep', 'llm_confidence', 'llm_reason'.
+        """
+        if not datasets or not wanted_sample_type:
             return datasets
 
-        # Build wanted and excluded sets
-        wanted = set(sample_types or [])
-        if primary_sample_type:
-            wanted.add(primary_sample_type)
-            wanted.update(SAMPLE_TYPE_RELATED.get(primary_sample_type, set()))
+        import concurrent.futures
 
-        all_types = {
-            "tumor", "adjacent", "normal", "non_cancer",
-            "wbc", "cfdna", "plasma", "serum", "whole_blood",
-        }
-        excluded = all_types - wanted
+        sem = asyncio.Semaphore(max_concurrent)
 
-        # Keywords for each sample type (for text matching)
-        sample_type_keywords = {
-            "tumor": [
-                "tumor", "tumour", "cancer tissue", "primary tumor", "malignant",
-                # "genomic dna" is a strong signal for tissue/cell gDNA extraction,
-                # as opposed to cfDNA which is fragmented cell-free DNA from plasma.
-                "genomic dna", "gdna", "tissue dna", "dna from tissue",
-                "formalin-fixed", "ffpe", "fresh frozen tissue",
-                "肿瘤组织", "癌组织", "癌症组织", "原发灶", "基因组dna",
-            ],
-            "adjacent": ["adjacent normal", "paratumor", "peritumoral", "margin",
-                         "癌旁", "旁组织"],
-            "normal": ["normal tissue", "healthy tissue", "healthy control",
-                       "正常组织", "健康组织"],
-            "non_cancer": ["non-cancer", "benign", "noncancerous", "control tissue",
-                           "非癌", "良性"],
-            "wbc": ["wbc", "leukocyte", "buffy coat", "pbmc",
-                    "peripheral blood mononuclear", "白细胞", "血细胞", "外周血单个核"],
-            "cfdna": ["cfdna", "cell-free dna", "circulating dna", "ctdna",
-                      "游离dna", "循环dna", "循环肿瘤dna"],
-            "plasma": ["plasma", "blood plasma", "血浆"],
-            "serum": ["serum", "blood serum", "血清"],
-            "whole_blood": ["whole blood", "全血"],
-        }
-
-        # Layer 3 keywords: in-vitro models are never valid patient samples.
-        # Applied globally — a dataset from cell lines or organoids is excluded
-        # regardless of whether cfDNA/tissue is mentioned in the summary.
-        IN_VITRO_KEYWORDS = [
-            "cell line", "cell lines", "cancer cell", "cancer cells",
-            "organoid", "organoids", "patient-derived organoid",
-            "in vitro", "supernatant", "culture medium",
-            "细胞系", "类器官", "体外",
-        ]
-
-        def _matches_keywords(text: str, kw_list: List[str]) -> bool:
-            return any(kw in text for kw in kw_list)
-
-        def _check_types(text: str, type_set) -> Optional[str]:
-            """Return first matching type from type_set, or None."""
-            for t in type_set:
-                if _matches_keywords(text, sample_type_keywords.get(t, [])):
-                    return t
-            return None
-
-        filtered = []
-        for ds in datasets:
-            acc = ds.get("accession", "?")
-            title = (ds.get("title") or "").lower()
-            summary = (ds.get("summary") or "").lower()
-            # Include sample_titles in layer1_text so that informative GSM titles
-            # (e.g. "genomic DNA from CRC patient") are checked alongside summary.
-            # This resolves cases where summary mentions cfDNA as a research topic
-            # but the actual samples are tissue gDNA.
-            sample_titles = ds.get("sample_titles") or []
-            sample_titles_text = " ".join(t.lower() for t in sample_titles)
-            layer1_text = title + " " + summary + " " + sample_titles_text
-
-            # ---- Layer 3: in-vitro exclusion (highest priority) ----
-            if _matches_keywords(layer1_text, IN_VITRO_KEYWORDS):
-                logger.info(
-                    f"Sample type filter [L3-vitro]: excluding {acc} "
-                    f"— in-vitro model detected, title: {title[:80]}"
+        async def _judge_one_async(ds: Dict[str, Any]) -> Dict[str, Any]:
+            async with sem:
+                loop = asyncio.get_event_loop()
+                # Run blocking I/O (NCBI + LLM) in thread pool
+                enriched = await loop.run_in_executor(
+                    None, self._enrich_dataset_for_llm, ds
                 )
-                continue
-
-            # ---- Layer 1: title + summary + sample_titles keyword matching ----
-            excluded_match = _check_types(layer1_text, excluded)
-            wanted_match = _check_types(layer1_text, wanted)
-
-            if excluded_match and not wanted_match:
-                # Clearly excluded, no wanted signal
-                logger.info(
-                    f"Sample type filter [L1]: excluding {acc} "
-                    f"— matches excluded '{excluded_match}', title: {title[:80]}"
+                keep, conf, reason = await loop.run_in_executor(
+                    None, self._llm_judge_dataset, enriched, wanted_sample_type
                 )
-                continue
+                return {
+                    **enriched,
+                    "llm_keep": keep,
+                    "llm_confidence": conf,
+                    "llm_reason": reason,
+                }
 
-            if excluded_match and wanted_match:
-                # Ambiguous — escalate to Layer 2: sample titles
-                # (sample_titles_text already computed above)
-                if sample_titles_text:
-                    titles_excluded = _check_types(sample_titles_text, excluded)
-                    titles_wanted = _check_types(sample_titles_text, wanted)
+        async def _run_all() -> List[Dict[str, Any]]:
+            tasks = [_judge_one_async(ds) for ds in datasets]
+            return await asyncio.gather(*tasks)
 
-                    if titles_excluded and not titles_wanted:
-                        # Sample titles confirm excluded type — reject
-                        logger.info(
-                            f"Sample type filter [L2]: excluding {acc} "
-                            f"— summary ambiguous but sample titles match "
-                            f"excluded '{titles_excluded}': {sample_titles[:3]}"
-                        )
-                        continue
-                    elif titles_wanted:
-                        logger.debug(
-                            f"Sample type filter [L2]: keeping {acc} "
-                            f"— sample titles confirm wanted '{titles_wanted}'"
-                        )
-                    else:
-                        # Sample titles also ambiguous — keep (conservative)
-                        logger.debug(
-                            f"Sample type filter [L2]: keeping {acc} "
-                            f"— sample titles inconclusive: {sample_titles[:3]}"
-                        )
-                else:
-                    # No sample titles available — keep (conservative)
-                    logger.debug(
-                        f"Sample type filter [L1-ambiguous]: keeping {acc} "
-                        f"— no sample titles to resolve ambiguity"
-                    )
+        # Run async pipeline — works whether or not there's an existing event loop
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # Inside Jupyter / existing loop — use thread executor
+                import concurrent.futures as _cf
+                with _cf.ThreadPoolExecutor() as pool:
+                    future = pool.submit(asyncio.run, _run_all())
+                    judged = future.result()
+            else:
+                judged = loop.run_until_complete(_run_all())
+        except RuntimeError:
+            judged = asyncio.run(_run_all())
 
-            # Tag the dataset with detected sample types for downstream use
-            detected_types = []
-            for st_type, keywords in sample_type_keywords.items():
-                if _matches_keywords(layer1_text, keywords):
-                    detected_types.append(st_type)
-            ds["detected_sample_types"] = detected_types
-            if not ds.get("sample_type") and detected_types:
-                ds["sample_type"] = detected_types[0]
-
-            filtered.append(ds)
+        # Filter: keep datasets where LLM said keep=True
+        kept = [d for d in judged if d.get("llm_keep", True)]
+        rejected = [d for d in judged if not d.get("llm_keep", True)]
 
         logger.info(
-            f"Sample type filter: {len(filtered)}/{len(datasets)} datasets passed "
-            f"(wanted={wanted}, excluded={excluded})"
+            f"LLM judge (concurrent={max_concurrent}): "
+            f"{len(kept)}/{len(datasets)} kept, "
+            f"{len(rejected)} rejected"
         )
-        return filtered
+        for d in rejected:
+            logger.info(
+                f"  Rejected {d.get('accession','?')}: "
+                f"conf={d.get('llm_confidence')} reason={d.get('llm_reason','')[:80]}"
+            )
 
-    # ------------------------------------------------------------------ #
-    #  TCGA search methods                                                 #
-    # ------------------------------------------------------------------ #
+        return kept
 
     def _search_tcga(self, intent: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Search TCGA/GDC using the parsed intent."""
@@ -573,184 +603,3 @@ class DatabaseAgent:
             f"  Downloaded accessions: {downloaded}\n"
             f"  Failed accessions: {failed}"
         )
-
-    # ------------------------------------------------------------------ #
-    #  Paper-based sample type verification                                #
-    # ------------------------------------------------------------------ #
-
-    def _verify_candidates_via_papers(
-        self,
-        candidates: List[Dict[str, Any]],
-        primary_sample_type: Optional[str],
-        sample_types: Optional[List[str]],
-    ) -> List[Dict[str, Any]]:
-        """
-        For GEO datasets with no sample type signal (detected_sample_types is empty),
-        fetch the linked PubMed abstract and verify sample type from the abstract text.
-
-        This rescues false negatives where the GEO summary omits sample type info
-        but the paper abstract clearly mentions the sample material (e.g. GSE124600:
-        GEO summary is method-focused but abstract says "plasma samples").
-
-        Only runs for datasets that:
-          1. Are GEO datasets (source == "GEO")
-          2. Have detected_sample_types == [] (no signal from title/summary/titles)
-          3. Have pubmed_ids available in metadata
-
-        Datasets with existing sample type signal are returned unchanged.
-        """
-        result = []
-        for ds in candidates:
-            # Only verify GEO datasets with no sample type signal
-            if ds.get("source") != "GEO" or ds.get("detected_sample_types"):
-                result.append(ds)
-                continue
-
-            pubmed_ids = ds.get("pubmed_ids") or []
-            if not pubmed_ids:
-                # No PMID — keep conservatively
-                result.append(ds)
-                continue
-
-            acc = ds.get("accession", "?")
-            decision, reason = self._verify_dataset_via_paper(
-                acc, pubmed_ids, primary_sample_type, sample_types
-            )
-
-            if decision == "excluded":
-                logger.info(
-                    f"Sample type filter [paper-verify]: excluding {acc} "
-                    f"— paper abstract confirms excluded type: {reason}"
-                )
-                continue
-            elif decision == "wanted":
-                logger.info(
-                    f"Sample type filter [paper-verify]: keeping {acc} "
-                    f"— paper abstract confirms wanted type: {reason}"
-                )
-                ds["detected_sample_types"] = [reason]
-                if not ds.get("sample_type"):
-                    ds["sample_type"] = reason
-            else:
-                # Unknown — keep conservatively
-                logger.debug(
-                    f"Sample type filter [paper-verify]: keeping {acc} "
-                    f"— paper abstract inconclusive"
-                )
-
-            result.append(ds)
-
-        return result
-
-    def _verify_dataset_via_paper(
-        self,
-        accession: str,
-        pubmed_ids: List[str],
-        primary_sample_type: Optional[str],
-        sample_types: Optional[List[str]],
-    ) -> tuple:
-        """
-        Fetch the PubMed abstract for the first available PMID and check
-        whether it confirms a wanted or excluded sample type.
-
-        Uses the same keyword lists as _filter_by_sample_type for consistency.
-
-        Args:
-            accession: GEO accession (for logging).
-            pubmed_ids: List of PMIDs linked to this dataset.
-            primary_sample_type: Primary sample type from user intent.
-            sample_types: All sample types from user intent.
-
-        Returns:
-            Tuple of (decision, reason) where:
-              decision: "wanted" | "excluded" | "unknown"
-              reason: matched sample type string or "" for unknown
-        """
-        # Build wanted/excluded sets (same logic as _filter_by_sample_type)
-        wanted = set(sample_types or [])
-        if primary_sample_type:
-            wanted.add(primary_sample_type)
-            wanted.update(SAMPLE_TYPE_RELATED.get(primary_sample_type, set()))
-
-        all_types = {
-            "tumor", "adjacent", "normal", "non_cancer",
-            "wbc", "cfdna", "plasma", "serum", "whole_blood",
-        }
-        excluded = all_types - wanted
-
-        sample_type_keywords = {
-            "tumor": [
-                "tumor", "tumour", "cancer tissue", "primary tumor", "malignant",
-                "genomic dna", "gdna", "tissue dna", "formalin-fixed", "ffpe",
-                "fresh frozen tissue", "肿瘤组织", "癌组织", "基因组dna",
-            ],
-            "adjacent": ["adjacent normal", "paratumor", "peritumoral", "癌旁"],
-            "normal": ["normal tissue", "healthy tissue", "正常组织"],
-            "non_cancer": ["non-cancer", "benign", "noncancerous", "非癌", "良性"],
-            "wbc": ["wbc", "leukocyte", "buffy coat", "pbmc",
-                    "peripheral blood mononuclear", "白细胞"],
-            "cfdna": ["cfdna", "cell-free dna", "circulating dna", "ctdna",
-                      "游离dna", "循环dna"],
-            "plasma": ["plasma", "blood plasma", "血浆"],
-            "serum": ["serum", "blood serum", "血清"],
-            "whole_blood": ["whole blood", "全血"],
-        }
-
-        pmid = str(pubmed_ids[0])
-        try:
-            # Fetch PubMed abstract via efetch
-            time.sleep(0.35)  # NCBI rate limit (no API key)
-            resp = requests.get(
-                "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi",
-                params={
-                    "db": "pubmed",
-                    "id": pmid,
-                    "retmode": "xml",
-                    "rettype": "abstract",
-                },
-                timeout=20,
-            )
-            resp.raise_for_status()
-
-            root = ET.fromstring(resp.content)
-            abstract_parts = root.findall(".//AbstractText")
-            abstract = " ".join(
-                (p.text or "") for p in abstract_parts if p.text
-            ).lower()
-
-            if not abstract:
-                logger.debug(
-                    f"Paper verify {accession} PMID {pmid}: no abstract available"
-                )
-                return ("unknown", "")
-
-            # Check wanted types first (positive signal).
-            # Use a fixed priority order so the most specific type wins
-            # (e.g. "cfdna" before "plasma" before "non_cancer") regardless
-            # of Python set iteration order.
-            WANTED_PRIORITY = ["cfdna", "plasma", "serum", "wbc", "whole_blood",
-                               "tumor", "adjacent", "normal", "non_cancer"]
-            for st in WANTED_PRIORITY:
-                if st not in wanted:
-                    continue
-                for kw in sample_type_keywords.get(st, []):
-                    if kw in abstract:
-                        return ("wanted", st)
-
-            # Check excluded types
-            EXCLUDED_PRIORITY = ["tumor", "adjacent", "normal", "non_cancer",
-                                  "wbc", "whole_blood", "serum", "plasma", "cfdna"]
-            for st in EXCLUDED_PRIORITY:
-                if st not in excluded:
-                    continue
-                for kw in sample_type_keywords.get(st, []):
-                    if kw in abstract:
-                        return ("excluded", st)
-
-            return ("unknown", "")
-
-        except Exception as e:
-            logger.debug(
-                f"Paper verify {accession} PMID {pmid}: fetch failed ({e})"
-            )
-            return ("unknown", "")
