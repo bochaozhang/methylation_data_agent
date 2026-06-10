@@ -38,8 +38,9 @@ class LiteratureClient:
         ncbi_api_key: Optional NCBI API key for higher rate limits.
     """
 
-    def __init__(self, ncbi_api_key: Optional[str] = None):
+    def __init__(self, ncbi_api_key: Optional[str] = None, geo_email: Optional[str] = None):
         self.ncbi_api_key = ncbi_api_key
+        self.geo_email = geo_email
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": "MethyAgent/1.0 (methylation literature miner)"
@@ -47,12 +48,33 @@ class LiteratureClient:
         self._rate_delay = 0.11 if ncbi_api_key else 0.34
 
     def _ncbi_get(self, endpoint: str, params: Dict) -> requests.Response:
-        """Rate-limited GET to NCBI E-utilities."""
+        """
+        Rate-limited GET to NCBI E-utilities.
+
+        Detects NCBI abuse redirect (302 → misuse.ncbi.nlm.nih.gov) and
+        automatically retries without the API key after a short delay.
+        """
         if self.ncbi_api_key:
             params["api_key"] = self.ncbi_api_key
+        # NCBI requires email & tool for E-utilities access;
+        # missing these is a common cause of IP bans (302 → misuse.ncbi.nlm.nih.gov)
+        if self.geo_email:
+            params["email"] = self.geo_email
+        params.setdefault("tool", "MethyAgent")
         url = f"{EUTILS_BASE}/{endpoint}"
         time.sleep(self._rate_delay)
-        resp = self.session.get(url, params=params, timeout=30)
+        resp = self.session.get(url, params=params, timeout=30, allow_redirects=True)
+
+        # Detect NCBI abuse redirect — key may be flagged or request rate too high
+        if "misuse.ncbi.nlm.nih.gov" in resp.url:
+            logger.warning(
+                f"NCBI abuse redirect detected for {endpoint}. "
+                "Retrying without API key after 5s delay."
+            )
+            time.sleep(5)
+            params_no_key = {k: v for k, v in params.items() if k != "api_key"}
+            resp = self.session.get(url, params=params_no_key, timeout=30)
+
         resp.raise_for_status()
         return resp
 
@@ -207,56 +229,138 @@ class LiteratureClient:
         max_results: int = 30,
     ) -> List[Dict[str, Any]]:
         """
-        Search bioRxiv preprints for methylation papers.
+        Search bioRxiv/medRxiv preprints for methylation papers.
 
-        Uses the bioRxiv API (https://api.biorxiv.org).
+        Uses Europe PMC (https://europepmc.org) which indexes bioRxiv/medRxiv
+        preprints with full-text keyword search — far more effective than the
+        bioRxiv date-range API which does not support keyword queries.
+
+        Falls back to the bioRxiv date-range API if Europe PMC is unavailable.
         """
-        # bioRxiv API uses date ranges
-        from datetime import date
+        # Build Europe PMC query
+        # Strip MeSH syntax for plain-text search
+        query_clean = re.sub(r'\[.*?\]', '', query).strip()
+        epmc_query = f"{query_clean} SRC:PPR"  # PPR = preprints (bioRxiv/medRxiv)
 
-        start_date = f"{year_start or 2000}-01-01"
-        end_date = f"{year_end or date.today().year}-12-31"
+        if year_start:
+            epmc_query += f" FIRST_PDATE:[{year_start}-01-01 TO {year_end or '3000'}-12-31]"
 
-        url = f"{BIORXIV_API}/{start_date}/{end_date}/0/json"
         try:
-            resp = self.session.get(url, timeout=30)
+            resp = self.session.get(
+                "https://www.ebi.ac.uk/europepmc/webservices/rest/search",
+                params={
+                    "query": epmc_query,
+                    "format": "json",
+                    "pageSize": min(max_results, 100),
+                    "resultType": "core",
+                    "sort": "CITED desc",
+                },
+                timeout=30,
+            )
             resp.raise_for_status()
             data = resp.json()
         except Exception as e:
-            logger.warning(f"bioRxiv API error: {e}")
-            return []
+            logger.warning(f"Europe PMC search failed: {e}. Falling back to bioRxiv API.")
+            return self._search_biorxiv_fallback(query, year_start, year_end, max_results)
 
         papers = []
-        query_lower = query.lower()
-        query_terms = [t.strip() for t in re.split(r"\s+AND\s+|\s+OR\s+", query_lower) if t.strip()]
-
-        for item in data.get("collection", [])[:max_results * 3]:
-            title = item.get("title", "").lower()
-            abstract = item.get("abstract", "").lower()
-            combined = title + " " + abstract
-
-            # Simple relevance filter
-            if not any(term in combined for term in query_terms[:3]):
-                continue
-
+        for item in data.get("resultList", {}).get("result", []):
             doi = item.get("doi", "")
-            accessions = extract_accessions(item.get("abstract", ""))
+            abstract = item.get("abstractText", "") or item.get("abstract", "")
+            accessions = extract_accessions(abstract)
 
             papers.append({
-                "pmid": None,
+                "pmid": item.get("pmid"),
                 "doi": doi,
                 "title": item.get("title", ""),
-                "abstract": item.get("abstract", ""),
-                "year": _parse_year_from_date(item.get("date", "")),
+                "abstract": abstract,
+                "year": item.get("pubYear"),
                 "source": "biorxiv",
                 "accessions": accessions,
                 "has_accessions": any(accessions[k] for k in ("geo", "tcga")),
             })
 
+        logger.info(
+            f"bioRxiv/preprint search (EuropePMC) '{query_clean[:50]}' "
+            f"→ {len(papers)} preprints (total hits: {data.get('hitCount', '?')})"
+        )
+        return papers
+
+    def _search_biorxiv_fallback(
+        self,
+        query: str,
+        year_start: Optional[int] = None,
+        year_end: Optional[int] = None,
+        max_results: int = 30,
+    ) -> List[Dict[str, Any]]:
+        """
+        Fallback bioRxiv search using the date-range API.
+        Only practical for narrow date ranges (≤1 year) due to lack of
+        keyword search support in the bioRxiv API.
+        """
+        from datetime import date
+
+        start_date = f"{year_start or 2020}-01-01"
+        end_date = f"{year_end or date.today().year}-12-31"
+
+        query_clean = re.sub(r'\[.*?\]', '', query).lower()
+        query_terms = [
+            t.strip().strip('"')
+            for t in re.split(r'\s+AND\s+|\s+OR\s+|\s+', query_clean)
+            if len(t.strip().strip('"')) > 3
+        ]
+        required_terms = [t for t in query_terms if "methylat" in t] or ["methylat"]
+        optional_terms = [t for t in query_terms if t not in required_terms]
+
+        papers = []
+        cursor = 0
+
+        for _ in range(5):  # max 5 pages in fallback
+            url = f"{BIORXIV_API}/{start_date}/{end_date}/{cursor}/json"
+            try:
+                resp = self.session.get(url, timeout=30)
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as e:
+                logger.warning(f"bioRxiv fallback API error (cursor={cursor}): {e}")
+                break
+
+            collection = data.get("collection", [])
+            if not collection:
+                break
+
+            for item in collection:
+                combined = (item.get("title", "") + " " + item.get("abstract", "")).lower()
+                if not all(t in combined for t in required_terms):
+                    continue
+                if optional_terms and not any(t in combined for t in optional_terms):
+                    continue
+
+                doi = item.get("doi", "")
+                abstract = item.get("abstract", "")
+                accessions = extract_accessions(abstract)
+                papers.append({
+                    "pmid": None,
+                    "doi": doi,
+                    "title": item.get("title", ""),
+                    "abstract": abstract,
+                    "year": _parse_year_from_date(item.get("date", "")),
+                    "source": "biorxiv",
+                    "accessions": accessions,
+                    "has_accessions": any(accessions[k] for k in ("geo", "tcga")),
+                })
+                if len(papers) >= max_results:
+                    break
+
             if len(papers) >= max_results:
                 break
 
-        logger.info(f"bioRxiv search → {len(papers)} relevant preprints")
+            total = int(data.get("messages", [{}])[0].get("total") or 0)
+            cursor += len(collection)
+            if cursor >= total:
+                break
+
+        logger.info(f"bioRxiv fallback search → {len(papers)} preprints")
         return papers
 
     # ------------------------------------------------------------------ #

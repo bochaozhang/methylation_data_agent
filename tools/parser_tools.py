@@ -455,11 +455,11 @@ Output ONLY valid JSON with these fields (use null for missing values):
   "data_type": "array" | "sequencing" | "both" | null,
   "sample_type": "cfdna" | "plasma" | "serum" | "wbc" | "whole_blood" | "tumor" | "adjacent" | "normal" | "non_cancer" | null,
   "sample_types": ["cfdna", "non_cancer"],
-  "year_start": 2024,
-  "year_end": 2024,
+  "year_start": null,
+  "year_end": null,
   "sample_type_detail": "Brief description of what sample types the user wants",
   "geo_search_query": "colorectal cancer cfDNA methylation[GEO]",
-  "pubmed_search_query": "colorectal cancer DNA methylation cfDNA cell-free DNA 2024",
+  "pubmed_search_query": "\"Colorectal Neoplasms\"[MeSH Terms] AND DNA methylation[MeSH Terms] AND (\"cell-free DNA\" OR cfDNA)",
   "notes": "any special instructions"
 }
 
@@ -484,7 +484,13 @@ SAMPLE TYPE PARSING (CRITICAL for cfDNA/liquid biopsy queries):
 - When user asks for "非癌对照" (non-cancer control), include both "non_cancer" and "normal" in sample_types
 - When user asks for cfDNA, also include "plasma" in sample_types (cfDNA comes from plasma)
 - geo_search_query: construct an NCBI GEO-compatible search string INCLUDING sample type terms
-- pubmed_search_query: construct a PubMed search string with MeSH terms AND sample type terms
+- pubmed_search_query: MUST use MeSH terms in format "Term"[MeSH Terms] joined with AND.
+  Include sample type terms (e.g. cfDNA, plasma) when relevant.
+  NEVER include year numbers or free-text notes beyond cancer type + methylation + sample type + platform.
+  Good: "Colorectal Neoplasms"[MeSH Terms] AND DNA methylation[MeSH Terms] AND ("cell-free DNA" OR cfDNA)
+  Bad:  colorectal cancer non-cancer control DNA methylation cfDNA cell-free DNA 2024
+- year_start / year_end: set ONLY if the user explicitly mentions a year or year range.
+  If no year is mentioned, set BOTH to null. NEVER default to the current year or any example year.
 """
 
 
