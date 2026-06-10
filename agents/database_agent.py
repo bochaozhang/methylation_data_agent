@@ -16,6 +16,10 @@ Sample type filtering:
        (e.g. tumor tissue datasets when user asked for cfDNA).
 """
 import os
+import time
+import xml.etree.ElementTree as ET
+
+import requests
 from typing import Any, Dict, List, Optional
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -118,6 +122,16 @@ class DatabaseAgent:
             geo_candidates = self._search_geo(intent)
             tcga_candidates = self._search_tcga(intent)
             candidates = geo_candidates + tcga_candidates
+
+        # ---- Step 2b: Paper-based verification for datasets with no sample type signal ----
+        # For GEO datasets where title+summary+sample_titles gave no sample type signal
+        # (detected_sample_types is empty), fetch the linked PubMed abstract and check
+        # for wanted/excluded keywords. This rescues false negatives like GSE124600
+        # where the GEO summary omits sample type info but the paper abstract mentions plasma.
+        sample_type = intent.get("sample_type")
+        sample_types = intent.get("sample_types", [])
+        if sample_type or sample_types:
+            candidates = self._verify_candidates_via_papers(candidates, sample_type, sample_types)
 
         logger.info(f"Total candidates found: {len(candidates)}")
 
@@ -297,28 +311,34 @@ class DatabaseAgent:
         sample_types: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """
-        Post-retrieval filter: remove datasets whose title/summary clearly
-        indicate an incompatible sample type.
+        Post-retrieval filter: remove datasets whose metadata clearly indicates
+        an incompatible sample type.
 
-        Strategy:
-          - Build a set of "wanted" sample types (user-specified + related)
-          - Build a set of "excluded" sample types (mutually exclusive with wanted)
-          - For each dataset, check title+summary for sample type keywords
-          - If a dataset clearly matches an EXCLUDED type, remove it
-          - If a dataset matches a WANTED type, boost it (keep)
-          - If unclear, keep it (don't over-filter)
+        Three-layer verification strategy:
+          Layer 1 — title + summary keyword matching (fast, no extra API calls)
+          Layer 2 — sample_titles keyword matching (GSM titles from esummary,
+                    already fetched; resolves ambiguous cases where summary
+                    mentions cfDNA as research topic but samples are tissue)
+          Layer 3 — in-vitro exclusion (cell lines, organoids, supernatant)
+                    applied globally regardless of wanted/excluded sets
 
-        This is intentionally conservative: we prefer false positives (keeping
-        irrelevant datasets) over false negatives (losing relevant ones).
-        The user can further filter in the review step.
+        Decision logic:
+          - If Layer 3 in-vitro signal found → exclude (cell lines are never
+            valid cfDNA/plasma/tissue patient samples)
+          - If Layer 1 summary matches ONLY excluded type → exclude
+          - If Layer 1 summary matches BOTH wanted and excluded (ambiguous):
+              → check Layer 2 sample_titles
+              → if sample_titles match excluded → exclude
+              → if sample_titles match wanted or are ambiguous → keep
+          - If no signal → keep (conservative, prefer false positives)
 
         Args:
-            datasets: List of GEO metadata dicts.
+            datasets: List of GEO metadata dicts (must include 'sample_titles').
             primary_sample_type: The main sample type the user wants.
             sample_types: All sample types mentioned in the query.
 
         Returns:
-            Filtered list of datasets.
+            Filtered list of datasets, each tagged with 'detected_sample_types'.
         """
         if not primary_sample_type and not sample_types:
             return datasets
@@ -327,77 +347,130 @@ class DatabaseAgent:
         wanted = set(sample_types or [])
         if primary_sample_type:
             wanted.add(primary_sample_type)
-            # Add related types
             wanted.update(SAMPLE_TYPE_RELATED.get(primary_sample_type, set()))
 
-        # All canonical sample types
-        all_types = {"tumor", "adjacent", "normal", "non_cancer", "wbc", "cfdna", "plasma", "serum", "whole_blood"}
+        all_types = {
+            "tumor", "adjacent", "normal", "non_cancer",
+            "wbc", "cfdna", "plasma", "serum", "whole_blood",
+        }
         excluded = all_types - wanted
 
         # Keywords for each sample type (for text matching)
         sample_type_keywords = {
-            "tumor": ["tumor", "tumour", "cancer tissue", "primary tumor", "malignant",
-                       "肿瘤组织", "癌组织", "癌症组织", "原发灶"],
+            "tumor": [
+                "tumor", "tumour", "cancer tissue", "primary tumor", "malignant",
+                # "genomic dna" is a strong signal for tissue/cell gDNA extraction,
+                # as opposed to cfDNA which is fragmented cell-free DNA from plasma.
+                "genomic dna", "gdna", "tissue dna", "dna from tissue",
+                "formalin-fixed", "ffpe", "fresh frozen tissue",
+                "肿瘤组织", "癌组织", "癌症组织", "原发灶", "基因组dna",
+            ],
             "adjacent": ["adjacent normal", "paratumor", "peritumoral", "margin",
                          "癌旁", "旁组织"],
             "normal": ["normal tissue", "healthy tissue", "healthy control",
-                        "正常组织", "健康组织"],
+                       "正常组织", "健康组织"],
             "non_cancer": ["non-cancer", "benign", "noncancerous", "control tissue",
                            "非癌", "良性"],
-            "wbc": ["wbc", "leukocyte", "buffy coat", "pbmc", "peripheral blood mononuclear",
-                     "白细胞", "血细胞", "外周血单个核"],
+            "wbc": ["wbc", "leukocyte", "buffy coat", "pbmc",
+                    "peripheral blood mononuclear", "白细胞", "血细胞", "外周血单个核"],
             "cfdna": ["cfdna", "cell-free dna", "circulating dna", "ctdna",
-                       "游离dna", "循环dna", "循环肿瘤dna"],
+                      "游离dna", "循环dna", "循环肿瘤dna"],
             "plasma": ["plasma", "blood plasma", "血浆"],
             "serum": ["serum", "blood serum", "血清"],
             "whole_blood": ["whole blood", "全血"],
         }
 
+        # Layer 3 keywords: in-vitro models are never valid patient samples.
+        # Applied globally — a dataset from cell lines or organoids is excluded
+        # regardless of whether cfDNA/tissue is mentioned in the summary.
+        IN_VITRO_KEYWORDS = [
+            "cell line", "cell lines", "cancer cell", "cancer cells",
+            "organoid", "organoids", "patient-derived organoid",
+            "in vitro", "supernatant", "culture medium",
+            "细胞系", "类器官", "体外",
+        ]
+
+        def _matches_keywords(text: str, kw_list: List[str]) -> bool:
+            return any(kw in text for kw in kw_list)
+
+        def _check_types(text: str, type_set) -> Optional[str]:
+            """Return first matching type from type_set, or None."""
+            for t in type_set:
+                if _matches_keywords(text, sample_type_keywords.get(t, [])):
+                    return t
+            return None
+
         filtered = []
         for ds in datasets:
+            acc = ds.get("accession", "?")
             title = (ds.get("title") or "").lower()
             summary = (ds.get("summary") or "").lower()
-            text = title + " " + summary
+            # Include sample_titles in layer1_text so that informative GSM titles
+            # (e.g. "genomic DNA from CRC patient") are checked alongside summary.
+            # This resolves cases where summary mentions cfDNA as a research topic
+            # but the actual samples are tissue gDNA.
+            sample_titles = ds.get("sample_titles") or []
+            sample_titles_text = " ".join(t.lower() for t in sample_titles)
+            layer1_text = title + " " + summary + " " + sample_titles_text
 
-            # Check if the dataset clearly matches an EXCLUDED sample type
-            excluded_match = None
-            for exc_type in excluded:
-                keywords = sample_type_keywords.get(exc_type, [])
-                for kw in keywords:
-                    if kw in text:
-                        excluded_match = exc_type
-                        break
-                if excluded_match:
-                    break
+            # ---- Layer 3: in-vitro exclusion (highest priority) ----
+            if _matches_keywords(layer1_text, IN_VITRO_KEYWORDS):
+                logger.info(
+                    f"Sample type filter [L3-vitro]: excluding {acc} "
+                    f"— in-vitro model detected, title: {title[:80]}"
+                )
+                continue
 
-            if excluded_match:
-                # Check if it ALSO matches a wanted type (e.g. "cfDNA from plasma vs tumor")
-                # If it matches both wanted and excluded, keep it (ambiguous)
-                wanted_match = False
-                for w_type in wanted:
-                    keywords = sample_type_keywords.get(w_type, [])
-                    for kw in keywords:
-                        if kw in text:
-                            wanted_match = True
-                            break
-                    if wanted_match:
-                        break
+            # ---- Layer 1: title + summary + sample_titles keyword matching ----
+            excluded_match = _check_types(layer1_text, excluded)
+            wanted_match = _check_types(layer1_text, wanted)
 
-                if not wanted_match:
-                    logger.info(
-                        f"Sample type filter: excluding {ds.get('accession', '?')} "
-                        f"— matches excluded type '{excluded_match}', "
-                        f"title: {title[:80]}"
+            if excluded_match and not wanted_match:
+                # Clearly excluded, no wanted signal
+                logger.info(
+                    f"Sample type filter [L1]: excluding {acc} "
+                    f"— matches excluded '{excluded_match}', title: {title[:80]}"
+                )
+                continue
+
+            if excluded_match and wanted_match:
+                # Ambiguous — escalate to Layer 2: sample titles
+                # (sample_titles_text already computed above)
+                if sample_titles_text:
+                    titles_excluded = _check_types(sample_titles_text, excluded)
+                    titles_wanted = _check_types(sample_titles_text, wanted)
+
+                    if titles_excluded and not titles_wanted:
+                        # Sample titles confirm excluded type — reject
+                        logger.info(
+                            f"Sample type filter [L2]: excluding {acc} "
+                            f"— summary ambiguous but sample titles match "
+                            f"excluded '{titles_excluded}': {sample_titles[:3]}"
+                        )
+                        continue
+                    elif titles_wanted:
+                        logger.debug(
+                            f"Sample type filter [L2]: keeping {acc} "
+                            f"— sample titles confirm wanted '{titles_wanted}'"
+                        )
+                    else:
+                        # Sample titles also ambiguous — keep (conservative)
+                        logger.debug(
+                            f"Sample type filter [L2]: keeping {acc} "
+                            f"— sample titles inconclusive: {sample_titles[:3]}"
+                        )
+                else:
+                    # No sample titles available — keep (conservative)
+                    logger.debug(
+                        f"Sample type filter [L1-ambiguous]: keeping {acc} "
+                        f"— no sample titles to resolve ambiguity"
                     )
-                    continue
 
-            # Tag the dataset with detected sample type for downstream use
+            # Tag the dataset with detected sample types for downstream use
             detected_types = []
             for st_type, keywords in sample_type_keywords.items():
-                for kw in keywords:
-                    if kw in text:
-                        detected_types.append(st_type)
-                        break
+                if _matches_keywords(layer1_text, keywords):
+                    detected_types.append(st_type)
             ds["detected_sample_types"] = detected_types
             if not ds.get("sample_type") and detected_types:
                 ds["sample_type"] = detected_types[0]
@@ -500,3 +573,184 @@ class DatabaseAgent:
             f"  Downloaded accessions: {downloaded}\n"
             f"  Failed accessions: {failed}"
         )
+
+    # ------------------------------------------------------------------ #
+    #  Paper-based sample type verification                                #
+    # ------------------------------------------------------------------ #
+
+    def _verify_candidates_via_papers(
+        self,
+        candidates: List[Dict[str, Any]],
+        primary_sample_type: Optional[str],
+        sample_types: Optional[List[str]],
+    ) -> List[Dict[str, Any]]:
+        """
+        For GEO datasets with no sample type signal (detected_sample_types is empty),
+        fetch the linked PubMed abstract and verify sample type from the abstract text.
+
+        This rescues false negatives where the GEO summary omits sample type info
+        but the paper abstract clearly mentions the sample material (e.g. GSE124600:
+        GEO summary is method-focused but abstract says "plasma samples").
+
+        Only runs for datasets that:
+          1. Are GEO datasets (source == "GEO")
+          2. Have detected_sample_types == [] (no signal from title/summary/titles)
+          3. Have pubmed_ids available in metadata
+
+        Datasets with existing sample type signal are returned unchanged.
+        """
+        result = []
+        for ds in candidates:
+            # Only verify GEO datasets with no sample type signal
+            if ds.get("source") != "GEO" or ds.get("detected_sample_types"):
+                result.append(ds)
+                continue
+
+            pubmed_ids = ds.get("pubmed_ids") or []
+            if not pubmed_ids:
+                # No PMID — keep conservatively
+                result.append(ds)
+                continue
+
+            acc = ds.get("accession", "?")
+            decision, reason = self._verify_dataset_via_paper(
+                acc, pubmed_ids, primary_sample_type, sample_types
+            )
+
+            if decision == "excluded":
+                logger.info(
+                    f"Sample type filter [paper-verify]: excluding {acc} "
+                    f"— paper abstract confirms excluded type: {reason}"
+                )
+                continue
+            elif decision == "wanted":
+                logger.info(
+                    f"Sample type filter [paper-verify]: keeping {acc} "
+                    f"— paper abstract confirms wanted type: {reason}"
+                )
+                ds["detected_sample_types"] = [reason]
+                if not ds.get("sample_type"):
+                    ds["sample_type"] = reason
+            else:
+                # Unknown — keep conservatively
+                logger.debug(
+                    f"Sample type filter [paper-verify]: keeping {acc} "
+                    f"— paper abstract inconclusive"
+                )
+
+            result.append(ds)
+
+        return result
+
+    def _verify_dataset_via_paper(
+        self,
+        accession: str,
+        pubmed_ids: List[str],
+        primary_sample_type: Optional[str],
+        sample_types: Optional[List[str]],
+    ) -> tuple:
+        """
+        Fetch the PubMed abstract for the first available PMID and check
+        whether it confirms a wanted or excluded sample type.
+
+        Uses the same keyword lists as _filter_by_sample_type for consistency.
+
+        Args:
+            accession: GEO accession (for logging).
+            pubmed_ids: List of PMIDs linked to this dataset.
+            primary_sample_type: Primary sample type from user intent.
+            sample_types: All sample types from user intent.
+
+        Returns:
+            Tuple of (decision, reason) where:
+              decision: "wanted" | "excluded" | "unknown"
+              reason: matched sample type string or "" for unknown
+        """
+        # Build wanted/excluded sets (same logic as _filter_by_sample_type)
+        wanted = set(sample_types or [])
+        if primary_sample_type:
+            wanted.add(primary_sample_type)
+            wanted.update(SAMPLE_TYPE_RELATED.get(primary_sample_type, set()))
+
+        all_types = {
+            "tumor", "adjacent", "normal", "non_cancer",
+            "wbc", "cfdna", "plasma", "serum", "whole_blood",
+        }
+        excluded = all_types - wanted
+
+        sample_type_keywords = {
+            "tumor": [
+                "tumor", "tumour", "cancer tissue", "primary tumor", "malignant",
+                "genomic dna", "gdna", "tissue dna", "formalin-fixed", "ffpe",
+                "fresh frozen tissue", "肿瘤组织", "癌组织", "基因组dna",
+            ],
+            "adjacent": ["adjacent normal", "paratumor", "peritumoral", "癌旁"],
+            "normal": ["normal tissue", "healthy tissue", "正常组织"],
+            "non_cancer": ["non-cancer", "benign", "noncancerous", "非癌", "良性"],
+            "wbc": ["wbc", "leukocyte", "buffy coat", "pbmc",
+                    "peripheral blood mononuclear", "白细胞"],
+            "cfdna": ["cfdna", "cell-free dna", "circulating dna", "ctdna",
+                      "游离dna", "循环dna"],
+            "plasma": ["plasma", "blood plasma", "血浆"],
+            "serum": ["serum", "blood serum", "血清"],
+            "whole_blood": ["whole blood", "全血"],
+        }
+
+        pmid = str(pubmed_ids[0])
+        try:
+            # Fetch PubMed abstract via efetch
+            time.sleep(0.35)  # NCBI rate limit (no API key)
+            resp = requests.get(
+                "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi",
+                params={
+                    "db": "pubmed",
+                    "id": pmid,
+                    "retmode": "xml",
+                    "rettype": "abstract",
+                },
+                timeout=20,
+            )
+            resp.raise_for_status()
+
+            root = ET.fromstring(resp.content)
+            abstract_parts = root.findall(".//AbstractText")
+            abstract = " ".join(
+                (p.text or "") for p in abstract_parts if p.text
+            ).lower()
+
+            if not abstract:
+                logger.debug(
+                    f"Paper verify {accession} PMID {pmid}: no abstract available"
+                )
+                return ("unknown", "")
+
+            # Check wanted types first (positive signal).
+            # Use a fixed priority order so the most specific type wins
+            # (e.g. "cfdna" before "plasma" before "non_cancer") regardless
+            # of Python set iteration order.
+            WANTED_PRIORITY = ["cfdna", "plasma", "serum", "wbc", "whole_blood",
+                               "tumor", "adjacent", "normal", "non_cancer"]
+            for st in WANTED_PRIORITY:
+                if st not in wanted:
+                    continue
+                for kw in sample_type_keywords.get(st, []):
+                    if kw in abstract:
+                        return ("wanted", st)
+
+            # Check excluded types
+            EXCLUDED_PRIORITY = ["tumor", "adjacent", "normal", "non_cancer",
+                                  "wbc", "whole_blood", "serum", "plasma", "cfdna"]
+            for st in EXCLUDED_PRIORITY:
+                if st not in excluded:
+                    continue
+                for kw in sample_type_keywords.get(st, []):
+                    if kw in abstract:
+                        return ("excluded", st)
+
+            return ("unknown", "")
+
+        except Exception as e:
+            logger.debug(
+                f"Paper verify {accession} PMID {pmid}: fetch failed ({e})"
+            )
+            return ("unknown", "")

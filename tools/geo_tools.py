@@ -214,8 +214,8 @@ class GEOClient:
         """
         Fetch metadata for a GSE series.
 
-        Returns dict with: title, summary, platform, sample_count,
-        data_type, year, supplementary_files.
+        Returns dict with: title, summary, sample_titles, pubmed_ids,
+        platform, sample_count, data_type, year, supplementary_files.
 
         Uses db='gds' throughout — the correct NCBI database for GEO Series.
         db='gse' is not a valid E-utilities database name.
@@ -279,6 +279,33 @@ class GEOClient:
         combined_text = (title + " " + summary).lower()
         data_type = _detect_data_type(combined_text, platforms)
 
+        # sample_titles — first N GSM titles from the 'samples' field.
+        # GDS esummary does NOT expose overall_design as a structured field
+        # (it only appears in the HTML page). However, the 'samples' list
+        # contains {accession, title} for every GSM, and sample titles are
+        # often the most reliable indicator of biological material type
+        # (e.g. "genomic DNA from CRC patient" vs "plasma cfDNA").
+        samples_list = data.get("samples", [])
+        sample_titles = []
+        for s in samples_list[:5]:  # inspect first 5 samples only
+            if isinstance(s, dict):
+                t = s.get("title", "")
+            elif isinstance(s, str):
+                t = s
+            else:
+                t = ""
+            if t:
+                sample_titles.append(t)
+
+        # pubmed_ids — GDS esummary exposes linked PMIDs as 'pubmedids'
+        raw_pmids = data.get("pubmedids", [])
+        if isinstance(raw_pmids, list):
+            pubmed_ids = [str(p) for p in raw_pmids if p]
+        elif raw_pmids:
+            pubmed_ids = [str(raw_pmids)]
+        else:
+            pubmed_ids = []
+
         # Parse year — gds uses 'pdat' or 'submissiondate'
         pub_date = (
             data.get("pdat", "")
@@ -301,6 +328,8 @@ class GEOClient:
             "accession": accession,
             "title": title,
             "summary": summary[:500] if summary else "",
+            "sample_titles": sample_titles,
+            "pubmed_ids": pubmed_ids,
             "platforms": platforms,
             "platform_canonical": _canonical_platform(platforms, combined_text),
             "sample_count": sample_count,
@@ -425,6 +454,26 @@ class GEOClient:
                 combined_text = (title + " " + summary).lower()
                 data_type = _detect_data_type(combined_text, platforms)
 
+                samples_list = data.get("samples", [])
+                sample_titles = []
+                for s in samples_list[:5]:
+                    if isinstance(s, dict):
+                        t = s.get("title", "")
+                    elif isinstance(s, str):
+                        t = s
+                    else:
+                        t = ""
+                    if t:
+                        sample_titles.append(t)
+
+                raw_pmids = data.get("pubmedids", [])
+                if isinstance(raw_pmids, list):
+                    pubmed_ids = [str(p) for p in raw_pmids if p]
+                elif raw_pmids:
+                    pubmed_ids = [str(raw_pmids)]
+                else:
+                    pubmed_ids = []
+
                 pub_date = (
                     data.get("pdat", "")
                     or data.get("pubdate", "")
@@ -444,6 +493,8 @@ class GEOClient:
                     "accession": acc_upper,
                     "title": title,
                     "summary": summary[:500] if summary else "",
+                    "sample_titles": sample_titles,
+                    "pubmed_ids": pubmed_ids,
                     "platforms": platforms,
                     "platform_canonical": _canonical_platform(platforms, combined_text),
                     "sample_count": sample_count,
@@ -459,6 +510,70 @@ class GEOClient:
     def get_accession_metadata(self, accession: str) -> Dict[str, Any]:
         """Alias for get_series_metadata — handles GSE accessions."""
         return self.get_series_metadata(accession)
+
+    # ------------------------------------------------------------------ #
+    #  Sample-level source verification                                    #
+    # ------------------------------------------------------------------ #
+
+    def get_sample_sources(
+        self, accession: str, max_samples: int = 5
+    ) -> List[Dict[str, Any]]:
+        """
+        Return the titles of the first N GSM samples for a GSE series.
+
+        GDS esummary includes a 'samples' list with {accession, title} for
+        every GSM. Sample titles are the most reliable indicator of biological
+        material type (e.g. "genomic DNA from CRC patient" vs "plasma cfDNA")
+        and are already returned by get_series_metadata via the same API call.
+
+        This method is a convenience wrapper that fetches the GSE esummary
+        and extracts sample titles — no additional API calls beyond the
+        standard get_series_metadata flow.
+
+        Args:
+            accession: GSE accession string (e.g. 'GSE220160').
+            max_samples: Maximum number of GSM samples to inspect (default 5).
+
+        Returns:
+            List of dicts with keys: gsm, title (sample title).
+            Returns [] on any error.
+        """
+        try:
+            params = {
+                "db": "gds",
+                "term": f"{accession}[Accession]",
+                "retmode": "json",
+            }
+            resp = self._get("esearch.fcgi", params)
+            uids = resp.json().get("esearchresult", {}).get("idlist", [])
+            # Prefer the GSE-level UID (starts with '200')
+            gse_uid = next((u for u in uids if u.startswith("200")), uids[0] if uids else None)
+            if not gse_uid:
+                return []
+
+            params = {"db": "gds", "id": gse_uid, "retmode": "json"}
+            resp = self._get("esummary.fcgi", params)
+            data = resp.json().get("result", {}).get(gse_uid, {})
+
+            samples_field = data.get("samples", [])
+            result = []
+            for s in samples_field[:max_samples]:
+                if isinstance(s, dict):
+                    gsm = s.get("accession", "")
+                    title = s.get("title", "")
+                else:
+                    gsm, title = "", str(s)
+                if gsm or title:
+                    result.append({"gsm": gsm.upper(), "title": title})
+
+            logger.debug(
+                f"get_sample_sources({accession}): {len(result)} sample titles"
+            )
+            return result
+
+        except Exception as e:
+            logger.warning(f"get_sample_sources({accession}) failed: {e}")
+            return []
 
     # ------------------------------------------------------------------ #
     #  Supplementary file discovery                                        #
