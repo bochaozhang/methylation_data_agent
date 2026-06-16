@@ -49,6 +49,33 @@ _ACCESSION_DB_MAP: Dict[str, str] = {
 }
 
 
+# Keywords for grouping GSM samples by biological material type.
+# Used by get_representative_gsm_details() to select representative GSMs
+# instead of blindly taking the first N from the esummary list.
+# Order matters: checked top-to-bottom, first match wins.
+SAMPLE_GROUP_KEYWORDS: Dict[str, List[str]] = {
+    "plasma_cfdna": [
+        "plasma", "cfdna", "cell-free", "cell free", "serum",
+        "liquid biopsy", "circulating", "ctdna",
+    ],
+    "tissue": [
+        "tumor", "tumour", "tissue", "biopsy", "ffpe", "frozen",
+        "gdna", "genomic dna", "primary", "cancer tissue", "solid tumor",
+    ],
+    "wbc_blood": [
+        "wbc", "pbmc", "buffy coat", "leukocyte", "whole blood",
+        "peripheral blood", "mononuclear",
+    ],
+    "normal": [
+        "normal", "healthy", "adjacent", "control", "benign",
+    ],
+    "cell_line": [
+        "cell line", "organoid", "in vitro", "culture",
+    ],
+}
+# Samples not matching any group above are assigned to "other"
+
+
 class GEOClient:
     """
     Client for NCBI GEO E-utilities API.
@@ -66,12 +93,29 @@ class GEOClient:
         self._rate_limit_delay = 0.11 if api_key else 0.34  # seconds between requests
 
     def _get(self, endpoint: str, params: Dict) -> requests.Response:
-        """Make a rate-limited GET request to E-utilities."""
+        """
+        Make a rate-limited GET request to E-utilities.
+
+        Raises:
+            requests.HTTPError: on 4xx/5xx responses.
+            RuntimeError: if NCBI redirects to the abuse/misuse page,
+                which means the API key is blocked or the request rate
+                exceeded NCBI's limit.
+        """
         if self.api_key:
             params["api_key"] = self.api_key
         url = f"{self.base_url}/{endpoint}"
         time.sleep(self._rate_limit_delay)
         resp = self.session.get(url, params=params, timeout=30)
+
+        # Detect NCBI abuse redirect — requests follows the 302 automatically,
+        # so we check the final URL rather than the status code.
+        if "misuse.ncbi.nlm.nih.gov" in resp.url or "abuse.shtml" in resp.url:
+            raise RuntimeError(
+                f"NCBI abuse redirect for {endpoint}: API key may be blocked or "
+                f"request rate exceeded. Final URL: {resp.url}"
+            )
+
         resp.raise_for_status()
         return resp
 
@@ -109,7 +153,7 @@ class GEOClient:
         logger.info(f"GEO search '{query[:60]}...' → {len(ids)} results")
         return ids
 
-    def search_gse(self, query: str, max_results: int = 100) -> List[str]:
+    def search_gse(self, query: str, max_results: int = 2000) -> List[str]:
         """
         Search GEO Series (GSE) directly.
         Returns list of GSE accession strings (e.g. ['GSE124600', ...]).
@@ -129,11 +173,18 @@ class GEOClient:
             data = resp.json()
             uids = data.get("esearchresult", {}).get("idlist", [])
             logger.info(f"GEO search (gds) '{query[:60]}' → {len(uids)} UIDs")
+        except RuntimeError as e:
+            # NCBI abuse redirect — retrying with the same key will not help.
+            logger.error(
+                f"GEO search blocked by NCBI (abuse redirect). "
+                f"Check NCBI_API_KEY validity and request rate. Detail: {e}"
+            )
+            return []
         except Exception as e:
             logger.warning(f"GEO search failed: {e}")
             uids = []
 
-        # Fallback: try without Entry Type filter
+        # Fallback: try without Entry Type filter (only for non-abuse failures)
         if not uids:
             try:
                 params2 = {
@@ -145,6 +196,12 @@ class GEOClient:
                 resp2 = self._get("esearch.fcgi", params2)
                 uids = resp2.json().get("esearchresult", {}).get("idlist", [])
                 logger.info(f"GEO search fallback (gds, no filter) → {len(uids)} UIDs")
+            except RuntimeError as e2:
+                logger.error(
+                    f"GEO search fallback also blocked by NCBI (abuse redirect). "
+                    f"Check NCBI_API_KEY validity and request rate. Detail: {e2}"
+                )
+                return []
             except Exception as e2:
                 logger.error(f"GEO search fallback also failed: {e2}")
                 return []
@@ -155,55 +212,75 @@ class GEOClient:
         # Convert GDS UIDs to GSE accessions via esummary
         return self._uids_to_accessions(uids, db="gds")
 
-    def _uids_to_accessions(self, uids: List[str], db: str = "gds") -> List[str]:
-        """Convert numeric UIDs to GSE accession strings."""
+    def _uids_to_accessions(
+        self,
+        uids: List[str],
+        db: str = "gds",
+        batch_size: int = 200,
+    ) -> List[str]:
+        """
+        Convert numeric UIDs to GSE accession strings.
+
+        Processes UIDs in batches of `batch_size` (default 200, NCBI esummary
+        hard limit per request).  Supports up to 2000 UIDs total.
+        """
         if not uids:
             return []
-        params = {
-            "db": db,
-            "id": ",".join(uids[:200]),  # API limit
-            "retmode": "json",
-        }
-        resp = self._get("esummary.fcgi", params)
-        data = resp.json()
-        result = data.get("result", {})
-        accessions = []
-        for uid in uids:
-            item = result.get(uid, {})
 
-            # Primary: 'accession' field — may be 'GSE309199' (full) or just '309199'
+        def _parse_item(item: dict) -> Optional[str]:
+            """Extract GSE accession from a single esummary result item."""
+            # Primary: 'accession' field
             acc = item.get("accession", "")
             if acc:
                 acc_upper = acc.upper()
                 if acc_upper.startswith("GSE"):
-                    accessions.append(acc_upper)
-                    continue
-                # Numeric-only: prepend GSE
+                    return acc_upper
                 if acc.isdigit():
-                    accessions.append(f"GSE{acc}")
-                    continue
-
-            # Fallback: 'gse' field — may be '309199' (no prefix) or 'GSE309199'
+                    return f"GSE{acc}"
+            # Fallback: 'gse' field
             gse_val = item.get("gse", "")
             if isinstance(gse_val, str) and gse_val:
                 gse_upper = gse_val.upper()
                 if gse_upper.startswith("GSE"):
-                    accessions.append(gse_upper)
-                elif gse_val.isdigit():
-                    accessions.append(f"GSE{gse_val}")
+                    return gse_upper
+                if gse_val.isdigit():
+                    return f"GSE{gse_val}"
             elif isinstance(gse_val, list):
                 for g in gse_val:
                     if isinstance(g, str) and g:
-                        accessions.append(f"GSE{g}" if g.isdigit() else g.upper())
+                        return f"GSE{g}" if g.isdigit() else g.upper()
+            return None
+
+        accessions = []
+        for i in range(0, len(uids), batch_size):
+            batch = uids[i : i + batch_size]
+            try:
+                params = {
+                    "db": db,
+                    "id": ",".join(batch),
+                    "retmode": "json",
+                }
+                resp = self._get("esummary.fcgi", params)
+                result = resp.json().get("result", {})
+                for uid in batch:
+                    item = result.get(uid, {})
+                    acc = _parse_item(item)
+                    if acc:
+                        accessions.append(acc)
+            except Exception as e:
+                logger.warning(f"_uids_to_accessions batch {i//batch_size + 1} failed: {e}")
 
         # Deduplicate while preserving order
-        seen = set()
+        seen: set = set()
         unique = []
         for a in accessions:
             if a not in seen:
                 seen.add(a)
                 unique.append(a)
-        logger.info(f"_uids_to_accessions: {len(uids)} UIDs → {len(unique)} GSE accessions")
+        logger.info(
+            f"_uids_to_accessions: {len(uids)} UIDs → {len(unique)} GSE accessions "
+            f"({(len(uids) + batch_size - 1) // batch_size} batches)"
+        )
         return unique
 
     # ------------------------------------------------------------------ #
@@ -663,6 +740,178 @@ class GEOClient:
             logger.warning(f"get_gsm_details({accession}) failed: {e}")
             return []
 
+    def get_representative_gsm_details(
+        self,
+        accession: str,
+        wanted_sample_type: str = "",
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch GSM-level annotation for a GSE series using representative sampling.
+
+        Unlike get_gsm_details() which blindly takes the first N GSMs, this method:
+
+        1. Reads ALL sample titles from esummary (zero extra API calls — already
+           returned in the 'samples' field).
+        2. Groups every GSM by biological material type using SAMPLE_GROUP_KEYWORDS
+           (plasma_cfdna / tissue / wbc_blood / normal / cell_line / other).
+        3. Selects representative GSMs per group based on dataset size:
+              ≤ 30 samples  → efetch ALL GSMs (small dataset, full coverage)
+              31–200        → 2 GSMs per group, total cap 10
+              > 200         → 1 GSM per group, total cap 5
+           The group matching `wanted_sample_type` always gets priority slots.
+        4. efetch MiniML XML only for the selected representatives.
+
+        This avoids the failure mode where the first N GSMs are all from one
+        sample type (e.g. all tissue) in a mixed-design dataset.
+
+        Args:
+            accession: GSE accession string (e.g. 'GSE220160').
+            wanted_sample_type: The sample type the caller is looking for
+                (e.g. 'cfdna', 'plasma', 'tumor'). Used to prioritise that
+                group when selecting representatives. Optional.
+
+        Returns:
+            List of dicts (same schema as get_gsm_details), each with an
+            additional 'group' key indicating the assigned sample group.
+        """
+        try:
+            # ---- Step 1: fetch all sample titles from esummary ----
+            params = {
+                "db": "gds",
+                "term": f"{accession}[Accession]",
+                "retmode": "json",
+            }
+            resp = self._get("esearch.fcgi", params)
+            uids = resp.json().get("esearchresult", {}).get("idlist", [])
+            gse_uid = next((u for u in uids if u.startswith("200")), uids[0] if uids else None)
+            if not gse_uid:
+                return []
+
+            sum_resp = self._get("esummary.fcgi", {"db": "gds", "id": gse_uid, "retmode": "json"})
+            data = sum_resp.json().get("result", {}).get(gse_uid, {})
+            samples_field = data.get("samples", [])
+
+            # Build full list of (gsm_accession, title) — ALL samples, no truncation
+            all_samples: List[Dict[str, str]] = []
+            for s in samples_field:
+                if isinstance(s, dict):
+                    gsm = s.get("accession", "").upper()
+                    title = s.get("title", "")
+                elif isinstance(s, str):
+                    gsm, title = s.upper(), ""
+                else:
+                    continue
+                if gsm:
+                    all_samples.append({"gsm": gsm, "title": title})
+
+            if not all_samples:
+                logger.debug(f"get_representative_gsm_details({accession}): no samples found")
+                return []
+
+            n = len(all_samples)
+            logger.debug(f"get_representative_gsm_details({accession}): {n} total samples")
+
+            # ---- Step 2: group by title keywords ----
+            groups: Dict[str, List[Dict[str, str]]] = {
+                g: [] for g in list(SAMPLE_GROUP_KEYWORDS.keys()) + ["other"]
+            }
+            for s in all_samples:
+                title_lower = s["title"].lower()
+                assigned = "other"
+                for group_name, keywords in SAMPLE_GROUP_KEYWORDS.items():
+                    if any(kw in title_lower for kw in keywords):
+                        assigned = group_name
+                        break
+                groups[assigned].append(s)
+
+            group_summary = {g: len(v) for g, v in groups.items() if v}
+            logger.debug(f"get_representative_gsm_details({accession}): groups={group_summary}")
+
+            # ---- Step 3: select representative GSMs ----
+            if n <= 30:
+                # Small dataset: efetch everything
+                selected = all_samples
+            else:
+                # Large dataset: 6 representatives per group, total cap 30
+                per_group, total_cap = 6, 30
+
+                # Map wanted_sample_type → group name for priority
+                wanted_group = None
+                if wanted_sample_type:
+                    wl = wanted_sample_type.lower()
+                    for group_name, keywords in SAMPLE_GROUP_KEYWORDS.items():
+                        if any(kw in wl or wl in kw for kw in keywords):
+                            wanted_group = group_name
+                            break
+                    # Direct name match fallback
+                    if not wanted_group and wanted_sample_type in groups:
+                        wanted_group = wanted_sample_type
+
+                # Build ordered group list: wanted group first, then others
+                group_order = []
+                if wanted_group and groups.get(wanted_group):
+                    group_order.append(wanted_group)
+                for g in groups:
+                    if g != wanted_group and groups[g]:
+                        group_order.append(g)
+
+                selected: List[Dict[str, str]] = []
+                seen_gsms: set = set()
+                for g in group_order:
+                    if len(selected) >= total_cap:
+                        break
+                    quota = min(per_group, total_cap - len(selected))
+                    for s in groups[g][:quota]:
+                        if s["gsm"] not in seen_gsms:
+                            selected.append(s)
+                            seen_gsms.add(s["gsm"])
+
+            logger.debug(
+                f"get_representative_gsm_details({accession}): "
+                f"selected {len(selected)}/{n} GSMs for efetch"
+            )
+
+            # ---- Step 4: efetch MiniML for selected GSMs ----
+            # Build a group lookup for tagging results
+            gsm_to_group: Dict[str, str] = {}
+            for group_name, members in groups.items():
+                for s in members:
+                    gsm_to_group[s["gsm"]] = group_name
+
+            results = []
+            for s in selected:
+                gsm = s["gsm"]
+                try:
+                    fetch_resp = self._get("efetch.fcgi", {
+                        "db": "gsm",
+                        "acc": gsm,
+                        "rettype": "miniml",
+                        "retmode": "xml",
+                    })
+                    details = self._parse_gsm_miniml(gsm, fetch_resp.text)
+                    details["group"] = gsm_to_group.get(gsm, "other")
+                    results.append(details)
+                except Exception as e:
+                    logger.debug(f"get_representative_gsm_details: efetch failed for {gsm}: {e}")
+                    results.append({
+                        "gsm": gsm,
+                        "source_name": "",
+                        "molecule": "",
+                        "characteristics": {},
+                        "group": gsm_to_group.get(gsm, "other"),
+                    })
+
+            logger.info(
+                f"get_representative_gsm_details({accession}): "
+                f"efetched {len(results)} representative GSMs "
+                f"(n={n}, groups={group_summary})"
+            )
+            return results
+
+        except Exception as e:
+            logger.warning(f"get_representative_gsm_details({accession}) failed: {e}")
+            return []
+
     @staticmethod
     def _parse_gsm_miniml(gsm: str, xml_text: str) -> Dict[str, Any]:
         """
@@ -814,6 +1063,36 @@ class GEOClient:
         logger.info(f"filter_methylation_datasets: {len(results)}/{len(accessions)} datasets passed")
         return results
     # ------------------------------------------------------------------ #
+    #  PubMed abstract fetch                                              #
+    # ------------------------------------------------------------------ #
+
+    def fetch_pubmed_abstract(self, pmid: str) -> str:
+        """
+        Fetch the abstract text for a PubMed article via NCBI efetch.
+
+        Args:
+            pmid: PubMed ID string (e.g. '35123456').
+
+        Returns:
+            Abstract as plain text, or empty string on any error.
+        """
+        if not pmid:
+            return ""
+        try:
+            resp = self._get("efetch.fcgi", {
+                "db": "pubmed",
+                "id": pmid,
+                "rettype": "abstract",
+                "retmode": "text",
+            })
+            text = resp.text.strip()
+            logger.debug(f"fetch_pubmed_abstract({pmid}): {len(text)} chars")
+            return text
+        except Exception as e:
+            logger.warning(f"fetch_pubmed_abstract({pmid}) failed: {e}")
+            return ""
+
+        # ------------------------------------------------------------------ #
     #  Accession verification (LLM hallucination filter)                  #
     # ------------------------------------------------------------------ #
 

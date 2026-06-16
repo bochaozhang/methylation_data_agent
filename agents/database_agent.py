@@ -7,13 +7,13 @@ matching the parsed user intent, then downloads them.
 Operates as a LangGraph node (function that takes/returns MethyAgentState).
 Uses a ReAct-style loop internally: search → filter → register → download.
 
-Sample type filtering:
-  When the user specifies a sample type (e.g. cfDNA, plasma, WBC),
-  DatabaseAgent applies a two-stage filter:
-    1. Search query: adds sample type terms to GEO/TCGA search string
-    2. Post-retrieval: filters metadata results by sample type keywords
-       in title/summary, removing datasets that clearly don't match
-       (e.g. tumor tissue datasets when user asked for cfDNA).
+GEO filtering pipeline (v4):
+  Every GSE returned by esearch goes through PubMed cross-verification:
+    1. Fetch the linked PubMed abstract (NCBI efetch)
+    2. LLM compares GEO summary/design vs abstract
+    3. Datasets where abstract contradicts GEO metadata are dropped (keep=False)
+    4. Datasets with no PMID are kept by default (conservative)
+  This replaces the previous GSM-level LLM judge.
 """
 import asyncio
 import re
@@ -59,8 +59,9 @@ Always prefer:
 Report your findings clearly, including how many datasets were found, filtered, and downloaded.
 """
 
-# LLM judge system prompt — also kept constant for Z.AI system cache.
-# Instructs the LLM to evaluate a single GEO dataset and return a JSON verdict.
+# LLM judge system prompt — kept constant for Z.AI system cache.
+# NOTE: This prompt is retained for reference but _llm_judge_datasets_concurrent
+# is no longer called in the main pipeline (replaced by PubMed verification).
 LLM_JUDGE_SYSTEM_PROMPT = """You are a biomedical data curator specializing in DNA methylation datasets.
 
 Given metadata for a GEO dataset (title, summary, sample source, molecule type, characteristics),
@@ -80,6 +81,51 @@ Rules:
               tissue gDNA when cfDNA requested)
 - keep=true  if evidence is ambiguous or insufficient (conservative — prefer false positives)
 - Cell lines / organoids / in-vitro models → always keep=false
+"""
+
+# PubMed verification system prompt — kept CONSTANT for Z.AI system cache.
+# This is the PRIMARY filter for GEO datasets: every GSE goes through this step.
+# The LLM cross-checks GEO summary/design against the paper abstract and decides
+# whether the dataset is consistent and usable.
+LLM_VERIFY_SYSTEM_PROMPT = """You are a biomedical data curator specializing in DNA methylation datasets.
+
+You will receive:
+1. GEO dataset metadata: accession, title, summary, overall design, platform, sample count, sample type, cancer type
+2. The abstract of the linked publication (fetched from PubMed)
+
+Your task: cross-check whether the GEO metadata is consistent with the paper abstract, and decide if the dataset is usable.
+
+Respond ONLY with a JSON object (no markdown, no explanation outside JSON):
+{
+  "keep": true or false,
+  "confirmed_sample_type": "plasma|tumor|adjacent|normal|wbc|cfdna|serum|whole_blood|cell_line|unknown",
+  "confirmed_cancer_type": "canonical English cancer name, e.g. colorectal cancer",
+  "sample_count_in_paper": null or integer,
+  "stage_treatment": "staging/treatment info from abstract, or null",
+  "accession_mentioned": true or false,
+  "consistency": "consistent|minor_discrepancy|major_discrepancy",
+  "recommended_action": "download" | "review" | "skip",
+  "reason": "one sentence summarising the verification result",
+  "notes": "any discrepancy between GEO metadata and abstract, or empty string"
+}
+
+Decision rules for `keep`:
+- keep=true  if the abstract confirms the dataset matches the GEO metadata (cancer type, sample type, methylation data)
+- keep=true  if the abstract is unavailable or uninformative — give benefit of the doubt
+- keep=false ONLY if the abstract clearly contradicts the GEO metadata, e.g.:
+    * GEO says plasma cfDNA but abstract describes tumor tissue only
+    * GEO says cancer X but abstract is about a completely different cancer
+    * Abstract confirms the dataset is cell lines / organoids / in-vitro only
+    * Abstract confirms the data is NOT methylation (e.g. RNA-seq, proteomics)
+- When in doubt, keep=true (conservative — prefer false positives over false negatives)
+
+Rules for other fields:
+- confirmed_sample_type: use the abstract's description of biological material
+- sample_count_in_paper: extract the n= number for the main patient cohort; null if not stated
+- accession_mentioned: true only if the GEO accession (e.g. GSE220160) appears explicitly in the abstract
+- consistency: consistent if GEO and abstract agree; minor_discrepancy if small differences; major_discrepancy if fundamental mismatch
+- recommended_action: skip only if keep=false with high confidence; review if minor discrepancy; download otherwise
+- notes: record any discrepancy (e.g. sample count mismatch, different cancer subtype)
 """
 
 
@@ -251,7 +297,20 @@ class DatabaseAgent:
     # ------------------------------------------------------------------ #
 
     def _search_geo(self, intent: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Search GEO using the parsed intent."""
+        """
+        Search GEO using the parsed intent.
+
+        Pipeline:
+          1. Build NCBI E-utilities query string (methylation platform filters included)
+          2. esearch → GSE UID list
+          3. filter_methylation_datasets() → platform/year filter + batch esummary
+          4. Inject cancer_type from intent (GEO metadata doesn't carry it)
+          5. _pubmed_verify_datasets_concurrent() — PRIMARY filter:
+               - Every GSE fetches its linked PubMed abstract (NCBI efetch)
+               - LLM cross-checks GEO summary/design vs abstract
+               - Returns keep=True/False + corrected fields
+               - Datasets with no PMID: kept by default (conservative)
+        """
         from tools.parser_tools import build_geo_search_string
 
         # Always use build_geo_search_string to ensure methylation platform filters
@@ -263,7 +322,7 @@ class DatabaseAgent:
             return []
 
         try:
-            accessions = self.geo_client.search_gse(search_query, max_results=100)
+            accessions = self.geo_client.search_gse(search_query, max_results=2000)
             if not accessions:
                 return []
 
@@ -287,18 +346,16 @@ class DatabaseAgent:
                     if not d.get("cancer_type"):
                         d["cancer_type"] = cancer_label
             elif intent.get("cancer_type_code") and intent["cancer_type_code"] in TCGA_CODE_TO_ENGLISH:
-                # Rule-based parser: use canonical English name
                 cancer_label = TCGA_CODE_TO_ENGLISH[intent["cancer_type_code"]]
                 for d in datasets:
                     if not d.get("cancer_type"):
                         d["cancer_type"] = cancer_label
 
-            # Apply LLM-based sample type judge (replaces keyword filter)
-            sample_type = intent.get("sample_type")
-            sample_types = intent.get("sample_types", [])
-            if sample_type or sample_types:
-                wanted_label = sample_type or (sample_types[0] if sample_types else "")
-                datasets = self._llm_judge_datasets_concurrent(datasets, wanted_label)
+            # PubMed cross-verification — PRIMARY filter.
+            # Every GSE fetches its linked PubMed abstract and the LLM checks
+            # whether the GEO summary/design is consistent with the paper.
+            # Datasets that pass (keep=True) are returned; others are logged and dropped.
+            datasets = self._pubmed_verify_datasets_concurrent(datasets)
 
             return datasets
         except Exception as e:
@@ -318,21 +375,29 @@ class DatabaseAgent:
         return results
 
     # ------------------------------------------------------------------ #
-    #  Sample type filtering                                               #
+    #  LLM-based dataset judge (retained, not used in main pipeline)      #
     # ------------------------------------------------------------------ #
 
-    # ------------------------------------------------------------------ #
-    #  LLM-based dataset judge (replaces keyword filter)                  #
-    # ------------------------------------------------------------------ #
-
-    def _enrich_dataset_for_llm(self, ds: Dict[str, Any]) -> Dict[str, Any]:
+    def _enrich_dataset_for_llm(
+        self,
+        ds: Dict[str, Any],
+        wanted_sample_type: str = "",
+    ) -> Dict[str, Any]:
         """
-        Enrich a GEO dataset dict with GSM-level details for LLM evaluation.
+        Enrich a GEO dataset dict with representative GSM-level details for LLM evaluation.
 
-        Calls get_gsm_details() to fetch Source-Name, Extracted-Molecule, and
-        Characteristics for the first 5 GSMs.  This gives the LLM concrete
-        sample-level evidence (e.g. "source: plasma", "tissue: CRC patient")
-        rather than relying solely on the dataset title/summary.
+        Calls get_representative_gsm_details() which:
+          - Reads ALL sample titles from esummary (zero extra API calls)
+          - Groups GSMs by biological material type (plasma_cfdna / tissue / wbc_blood / ...)
+          - Selects representative GSMs per group (not just the first N):
+              <= 30 samples  -> all GSMs
+              31-200         -> 2 per group, cap 10
+              > 200          -> 1 per group, cap 5
+          - efetch MiniML only for selected representatives
+
+        Args:
+            ds: Dataset metadata dict.
+            wanted_sample_type: The sample type the caller is looking for.
 
         Returns the dataset dict with an added 'gsm_details' key.
         """
@@ -340,7 +405,9 @@ class DatabaseAgent:
         if not acc:
             return ds
         try:
-            gsm_details = self.geo_client.get_gsm_details(acc, max_samples=5)
+            gsm_details = self.geo_client.get_representative_gsm_details(
+                acc, wanted_sample_type=wanted_sample_type
+            )
             ds = {**ds, "gsm_details": gsm_details}
         except Exception as e:
             logger.debug(f"_enrich_dataset_for_llm({acc}): {e}")
@@ -354,23 +421,15 @@ class DatabaseAgent:
     ) -> Tuple[bool, str, str]:
         """
         Ask the LLM to judge whether a single GEO dataset matches the wanted
-        sample type.
+        sample type. Uses LLM_JUDGE_SYSTEM_PROMPT (constant) for Z.AI system cache.
 
-        Uses LLM_JUDGE_SYSTEM_PROMPT (constant) for Z.AI system cache.
-        Dynamic content (dataset metadata) goes in the user message only.
-
-        Args:
-            ds: Dataset metadata dict (may include 'gsm_details').
-            wanted_sample_type: The sample type the user wants (e.g. 'cfdna').
-
-        Returns:
-            Tuple of (keep: bool, confidence: str, reason: str).
+        NOTE: Not used in the main pipeline (replaced by PubMed verification).
+        Retained for ad-hoc use or fallback.
         """
         import json as _json
 
         acc = ds.get("accession", "?")
 
-        # Build user message with all available evidence
         gsm_lines = []
         for g in ds.get("gsm_details", [])[:5]:
             ch_str = "; ".join(f"{k}={v}" for k, v in g.get("characteristics", {}).items())
@@ -392,14 +451,12 @@ class DatabaseAgent:
         )
 
         try:
-            from langchain_core.messages import HumanMessage, SystemMessage
             response = self.llm.invoke([
                 SystemMessage(content=LLM_JUDGE_SYSTEM_PROMPT),
                 HumanMessage(content=user_msg),
             ])
             raw = response.content.strip()
 
-            # Log cached tokens if available (Z.AI system cache telemetry)
             usage = getattr(response, "usage_metadata", None) or getattr(response, "response_metadata", {})
             cached = 0
             if isinstance(usage, dict):
@@ -411,8 +468,6 @@ class DatabaseAgent:
             if cached:
                 logger.debug(f"LLM judge {acc}: cached_tokens={cached}")
 
-            # Parse JSON response
-            # Strip markdown code fences if present
             if raw.startswith("```"):
                 raw = re.sub(r"^```[a-z]*\n?", "", raw)
                 raw = re.sub(r"\n?```$", "", raw)
@@ -429,7 +484,6 @@ class DatabaseAgent:
             return keep, confidence, reason
 
         except Exception as e:
-            # On any LLM/parse error: keep the dataset (conservative)
             logger.warning(f"LLM judge failed for {acc}: {e} — keeping dataset")
             return True, "low", f"LLM judge error: {e}"
 
@@ -442,35 +496,19 @@ class DatabaseAgent:
         """
         Run LLM judgment on all datasets with up to max_concurrent parallel calls.
 
-        Pipeline per dataset:
-          1. _enrich_dataset_for_llm()  — fetch GSM details (NCBI API)
-          2. _llm_judge_dataset()       — LLM verdict (Z.AI, system-cached)
-
-        Uses asyncio + asyncio.Semaphore to cap concurrent LLM calls at 5,
-        preventing rate-limit errors while maximising throughput.
-
-        Args:
-            datasets: List of GEO metadata dicts.
-            wanted_sample_type: The sample type the user wants.
-            max_concurrent: Max parallel LLM calls (default 5).
-
-        Returns:
-            Filtered list of datasets that passed the LLM judge,
-            each tagged with 'llm_keep', 'llm_confidence', 'llm_reason'.
+        NOTE: Not used in the main pipeline (replaced by PubMed verification).
+        Retained for ad-hoc use or fallback.
         """
         if not datasets or not wanted_sample_type:
             return datasets
-
-        import concurrent.futures
 
         sem = asyncio.Semaphore(max_concurrent)
 
         async def _judge_one_async(ds: Dict[str, Any]) -> Dict[str, Any]:
             async with sem:
                 loop = asyncio.get_event_loop()
-                # Run blocking I/O (NCBI + LLM) in thread pool
                 enriched = await loop.run_in_executor(
-                    None, self._enrich_dataset_for_llm, ds
+                    None, self._enrich_dataset_for_llm, ds, wanted_sample_type
                 )
                 keep, conf, reason = await loop.run_in_executor(
                     None, self._llm_judge_dataset, enriched, wanted_sample_type
@@ -486,11 +524,9 @@ class DatabaseAgent:
             tasks = [_judge_one_async(ds) for ds in datasets]
             return await asyncio.gather(*tasks)
 
-        # Run async pipeline — works whether or not there's an existing event loop
         try:
             loop = asyncio.get_event_loop()
             if loop.is_running():
-                # Inside Jupyter / existing loop — use thread executor
                 import concurrent.futures as _cf
                 with _cf.ThreadPoolExecutor() as pool:
                     future = pool.submit(asyncio.run, _run_all())
@@ -500,7 +536,6 @@ class DatabaseAgent:
         except RuntimeError:
             judged = asyncio.run(_run_all())
 
-        # Filter: keep datasets where LLM said keep=True
         kept = [d for d in judged if d.get("llm_keep", True)]
         rejected = [d for d in judged if not d.get("llm_keep", True)]
 
@@ -516,6 +551,252 @@ class DatabaseAgent:
             )
 
         return kept
+
+    # ------------------------------------------------------------------ #
+    #  PubMed cross-verification — PRIMARY GEO filter                     #
+    # ------------------------------------------------------------------ #
+
+    def _pubmed_verify_dataset(self, ds: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Cross-check a GEO dataset against its associated PubMed abstract.
+
+        This is the PRIMARY filter for GEO datasets. Every GSE goes through this
+        step regardless of sample type or other metadata.
+
+        Workflow:
+          1. Take the first PMID from ds["pubmed_ids"] (primary publication).
+          2. Fetch the abstract via GEOClient.fetch_pubmed_abstract() (NCBI efetch).
+          3. Send GEO metadata (title, summary, overall_design, platform, sample_count,
+             sample_type, cancer_type) + abstract to LLM with LLM_VERIFY_SYSTEM_PROMPT
+             (constant → Z.AI system cache).
+          4. LLM returns:
+               keep                 → whether the dataset is consistent with the abstract
+               confirmed_sample_type → corrected sample type from abstract
+               confirmed_cancer_type → corrected cancer type from abstract
+               sample_count_in_paper → n= from abstract (corrects GEO if >20% diff)
+               stage_treatment       → staging/treatment info from abstract
+               consistency           → consistent / minor_discrepancy / major_discrepancy
+               recommended_action    → download / review / skip
+               reason                → one-sentence summary
+               notes                 → discrepancy details
+
+        Fallback behaviour (conservative — prefer false positives):
+          - No PMID available     → keep=True, notes="no_pubmed_link"
+          - Abstract fetch fails  → keep=True, notes="abstract_unavailable"
+          - LLM/parse error       → keep=True, notes="verify_error: ..."
+
+        Returns updated ds dict with added fields:
+          pubmed_verified  (bool)
+          pubmed_keep      (bool)  — used by _pubmed_verify_datasets_concurrent to filter
+          paper_pmid       (str)
+        """
+        import json as _json
+
+        acc = ds.get("accession", "?")
+        pmids = ds.get("pubmed_ids", [])
+
+        # ---- No PMID: keep by default ----
+        if not pmids:
+            logger.debug(f"pubmed_verify {acc}: no PMID — keeping (conservative)")
+            existing_notes = ds.get("notes") or ""
+            return {
+                **ds,
+                "pubmed_verified": False,
+                "pubmed_keep": True,
+                "notes": (existing_notes + "; no_pubmed_link").lstrip("; "),
+            }
+
+        pmid = str(pmids[0])
+        abstract = self.geo_client.fetch_pubmed_abstract(pmid)
+
+        # ---- Abstract unavailable: keep by default ----
+        if not abstract:
+            logger.debug(f"pubmed_verify {acc}: abstract unavailable for PMID {pmid} — keeping")
+            existing_notes = ds.get("notes") or ""
+            return {
+                **ds,
+                "pubmed_verified": False,
+                "pubmed_keep": True,
+                "notes": (existing_notes + f"; abstract_unavailable(PMID={pmid})").lstrip("; "),
+            }
+
+        # ---- Build user message (dynamic content only) ----
+        user_msg = (
+            f"GEO Accession: {acc}\n"
+            f"Title: {ds.get('title', '')[:200]}\n"
+            f"Summary: {ds.get('summary', '')[:400]}\n"
+            f"Overall Design: {ds.get('overall_design', '')[:300]}\n"
+            f"Platform: {ds.get('platform_canonical') or ds.get('platforms', [])}\n"
+            f"Sample count (GEO): {ds.get('sample_count')}\n"
+            f"Sample type (GEO): {ds.get('sample_type')}\n"
+            f"Cancer type (GEO): {ds.get('cancer_type')}\n"
+            f"PMID: {pmid}\n\n"
+            f"Abstract:\n{abstract[:2500]}\n"
+        )
+
+        try:
+            response = self.llm.invoke([
+                SystemMessage(content=LLM_VERIFY_SYSTEM_PROMPT),
+                HumanMessage(content=user_msg),
+            ])
+            raw = response.content.strip()
+
+            # Log cached tokens (Z.AI system cache telemetry)
+            usage = getattr(response, "usage_metadata", None) or getattr(response, "response_metadata", {})
+            if isinstance(usage, dict):
+                cached = (
+                    usage.get("cached_tokens")
+                    or usage.get("prompt_tokens_details", {}).get("cached_tokens", 0)
+                    or 0
+                )
+                if cached:
+                    logger.debug(f"pubmed_verify {acc}: cached_tokens={cached}")
+
+            # Strip markdown fences if present
+            if raw.startswith("```"):
+                raw = re.sub(r"^```[a-z]*\n?", "", raw)
+                raw = re.sub(r"\n?```$", "", raw)
+            v = _json.loads(raw)
+
+            # ---- Apply verified fields ----
+            updated = dict(ds)
+            updated["pubmed_verified"] = True
+            updated["pubmed_keep"] = bool(v.get("keep", True))
+            updated["paper_pmid"] = pmid
+
+            if v.get("confirmed_sample_type") and v["confirmed_sample_type"] != "unknown":
+                updated["sample_type"] = v["confirmed_sample_type"]
+
+            if v.get("confirmed_cancer_type"):
+                updated["cancer_type"] = v["confirmed_cancer_type"]
+
+            if v.get("stage_treatment"):
+                updated["stage_treatment"] = v["stage_treatment"]
+
+            # Correct sample_count if paper value differs by >20% from GEO value
+            paper_n = v.get("sample_count_in_paper")
+            geo_n = ds.get("sample_count")
+            if paper_n and geo_n and geo_n > 0:
+                if abs(paper_n - geo_n) / geo_n > 0.20:
+                    updated["sample_count"] = paper_n
+                    discrepancy_note = f"sample_count GEO={geo_n} paper={paper_n}"
+                    existing_notes = updated.get("notes") or ""
+                    updated["notes"] = (existing_notes + "; " + discrepancy_note).lstrip("; ")
+            elif paper_n and not geo_n:
+                updated["sample_count"] = paper_n
+
+            # usable / recommended_action / reason — paper verification takes priority
+            updated["usable"] = int(bool(v.get("keep", True)))
+            if v.get("recommended_action"):
+                updated["recommended_action"] = v["recommended_action"]
+            if v.get("reason"):
+                updated["reason"] = v["reason"]
+            if v.get("consistency"):
+                updated["consistency"] = v["consistency"]
+
+            # Append notes (never overwrite existing notes)
+            if v.get("notes"):
+                existing_notes = updated.get("notes") or ""
+                updated["notes"] = (existing_notes + "; " + v["notes"]).lstrip("; ")
+
+            logger.info(
+                f"pubmed_verify {acc} (PMID={pmid}): "
+                f"keep={updated['pubmed_keep']} "
+                f"consistency={v.get('consistency','?')} "
+                f"sample_type={updated.get('sample_type')} "
+                f"action={updated.get('recommended_action')} "
+                f"reason={v.get('reason','')[:80]}"
+            )
+            return updated
+
+        except Exception as e:
+            # On any error: keep the dataset (conservative)
+            logger.warning(f"pubmed_verify {acc}: LLM/parse error — {e} — keeping dataset")
+            existing_notes = ds.get("notes") or ""
+            return {
+                **ds,
+                "pubmed_verified": False,
+                "pubmed_keep": True,
+                "notes": (existing_notes + f"; verify_error: {e}").lstrip("; "),
+            }
+
+    def _pubmed_verify_datasets_concurrent(
+        self,
+        datasets: List[Dict[str, Any]],
+        max_concurrent: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """
+        Run PubMed cross-verification on ALL datasets with up to max_concurrent
+        parallel calls (asyncio + Semaphore), then filter on keep=True.
+
+        Every dataset goes through this step:
+          - Has a PMID → fetch abstract (NCBI efetch) + LLM verify
+          - No PMID    → kept by default (conservative), notes="no_pubmed_link"
+          - Abstract unavailable → kept by default
+          - LLM/parse error → kept by default
+
+        After verification, datasets where pubmed_keep=False are dropped and logged.
+
+        Args:
+            datasets: List of GEO metadata dicts from filter_methylation_datasets().
+            max_concurrent: Max parallel efetch + LLM calls (default 5).
+
+        Returns:
+            Filtered list of datasets where pubmed_keep=True, each enriched with
+            verified/corrected fields (sample_type, cancer_type, sample_count,
+            stage_treatment, recommended_action, reason, notes).
+        """
+        if not datasets:
+            return datasets
+
+        sem = asyncio.Semaphore(max_concurrent)
+
+        async def _verify_one_async(ds: Dict[str, Any]) -> Dict[str, Any]:
+            async with sem:
+                loop = asyncio.get_event_loop()
+                return await loop.run_in_executor(None, self._pubmed_verify_dataset, ds)
+
+        async def _run_all() -> List[Dict[str, Any]]:
+            tasks = [_verify_one_async(ds) for ds in datasets]
+            return await asyncio.gather(*tasks)
+
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures as _cf
+                with _cf.ThreadPoolExecutor() as pool:
+                    future = pool.submit(asyncio.run, _run_all())
+                    verified = future.result()
+            else:
+                verified = loop.run_until_complete(_run_all())
+        except RuntimeError:
+            verified = asyncio.run(_run_all())
+
+        # Filter: keep only datasets where pubmed_keep=True
+        kept = [d for d in verified if d.get("pubmed_keep", True)]
+        rejected = [d for d in verified if not d.get("pubmed_keep", True)]
+
+        n_with_pmid = sum(1 for d in verified if d.get("pubmed_verified"))
+        n_no_pmid = sum(1 for d in verified if "no_pubmed_link" in (d.get("notes") or ""))
+        n_error = sum(1 for d in verified if "verify_error" in (d.get("notes") or ""))
+
+        logger.info(
+            f"pubmed_verify: {len(datasets)} total → "
+            f"{n_with_pmid} verified, {n_no_pmid} no-PMID, {n_error} errors | "
+            f"{len(kept)} kept, {len(rejected)} rejected"
+        )
+        for d in rejected:
+            logger.info(
+                f"  Rejected {d.get('accession','?')} "
+                f"(PMID={d.get('paper_pmid','?')}): "
+                f"reason={d.get('reason','')[:100]}"
+            )
+
+        return kept
+
+    # ------------------------------------------------------------------ #
+    #  TCGA search methods                                                 #
+    # ------------------------------------------------------------------ #
 
     def _search_tcga(self, intent: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Search TCGA/GDC using the parsed intent."""
