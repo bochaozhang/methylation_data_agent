@@ -2,159 +2,106 @@ cancer_synonyms:
   COAD:
   - CRC
   - colorectal cancer
-  - colorectal carcinoma
   - colon cancer
   - rectal cancer
   - COAD
   - READ
-  - adenoma
-  - advanced adenoma
   - colorectal adenoma
-  - colon adenocarcinoma
-  - rectal adenocarcinoma
   LUAD:
   - lung cancer
-  - lung carcinoma
   - lung adenocarcinoma
-  - lung squamous cell carcinoma
   - NSCLC
-  - SCLC
   - LUAD
   - LUSC
-  - pulmonary nodule
-  - early-stage lung cancer
   - non-small cell lung cancer
-  - small cell lung cancer
   LIHC:
   - liver cancer
   - hepatocellular carcinoma
   - HCC
   - LIHC
-  - hepatocellular cancer
-  - primary liver cancer
   STAD:
   - gastric cancer
   - stomach cancer
   - gastric carcinoma
-  - gastric adenocarcinoma
-  - GC
   - STAD
   BLCA:
   - bladder cancer
-  - bladder carcinoma
   - urothelial carcinoma
   - BLCA
-  - transitional cell carcinoma
   OV:
   - ovarian cancer
   - ovarian carcinoma
   - OV
-  - HGSC
-  - serous ovarian cancer
   - high-grade serous ovarian cancer
-  - endometrioid ovarian cancer
-  - clear cell ovarian cancer
-  - mucinous ovarian cancer
   BRCA:
   - breast cancer
   - breast carcinoma
-  - breast adenocarcinoma
   - BRCA
-  - invasive breast cancer
   - ductal carcinoma
-  - lobular carcinoma
   PAAD:
   - pancreatic cancer
-  - pancreatic carcinoma
   - pancreatic ductal adenocarcinoma
   - PAAD
   - PDAC
   ESCA:
   - esophageal cancer
-  - oesophageal cancer
   - esophageal carcinoma
   - ESCC
-  - EAC
   - esophageal squamous cell carcinoma
-  - esophageal adenocarcinoma
-  - Barrett's esophagus
   PRAD:
   - prostate cancer
   - prostate carcinoma
-  - prostate adenocarcinoma
   - PRAD
   KIRC:
-  - kidney cancer
-  - renal cancer
   - renal cell carcinoma
-  - clear cell renal cell carcinoma
   - KIRC
   - RCC
   THCA:
   - thyroid cancer
   - thyroid carcinoma
-  - papillary thyroid carcinoma
-  - follicular thyroid carcinoma
   - THCA
   SKCM:
   - melanoma
-  - cutaneous melanoma
   - malignant melanoma
   - SKCM
   GBM:
   - glioblastoma
-  - glioblastoma multiforme
   - GBM
   - glioma
-  - high-grade glioma
   LAML:
   - leukemia
   - acute myeloid leukemia
   - AML
   - LAML
-  - chronic lymphocytic leukemia
-  - CLL
-  - acute lymphoblastic leukemia
-  - ALL
   CESC:
   - cervical cancer
   - cervical carcinoma
-  - cervical squamous cell carcinoma
   - CESC
+
+# Methylation technology terms — used when no platform is specified.
+# Keep this list SHORT: NCBI GDS full-text search is fast on specific terms.
+# Avoid generic terms like "CpG methylation" that match thousands of non-array studies.
 methylation_tech_terms:
 - DNA methylation
-- methylome
-- methylation profiling
 - 450K
-- 850K
 - EPIC
 - RRBS
 - WGBS
 - bisulfite sequencing
-- MCTA
-- MeDIP
 - methylation array
-- whole genome bisulfite
-- reduced representation bisulfite
-- methylated CpG
-- CpG methylation
-- bisulfite-seq
-- methyl-seq
+- methylome
+
+# Liquid biopsy terms — used when sample_type is cfDNA/plasma/serum.
+# CRITICAL: keep only high-specificity terms.
+# Removed: blood, non-invasive, screening, diagnosis, early detection, blood-based
+# (these are far too broad and cause NCBI to return thousands of unrelated results,
+#  triggering abuse detection on long queries)
 liquid_biopsy_terms:
 - cfDNA
 - cell-free DNA
 - ctDNA
 - circulating tumor DNA
-- circulating cell-free DNA
 - plasma
 - serum
-- blood
 - liquid biopsy
-- non-invasive
-- early detection
-- screening
-- diagnosis
-- blood-based
 - circulating DNA
-- plasma DNA
-- serum DNA
