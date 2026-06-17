@@ -17,6 +17,9 @@ from typing import Any, Dict, List, Optional
 import yaml
 
 from langchain_core.language_models import BaseChatModel
+from utils.logger import get_logger
+
+logger = get_logger(__name__)
 from langchain_core.messages import HumanMessage, SystemMessage
 
 # ------------------------------------------------------------------ #
@@ -692,5 +695,38 @@ def build_geo_search_string(intent: Dict[str, Any]) -> str:
     # Always restrict to GSE entry type
     parts.append("GSE[Entry Type]")
 
-    return " AND ".join(parts) if parts else \
+    query = " AND ".join(parts) if parts else \
         "(GPL13534 OR GPL21145 OR GPL23976) AND GSE[Entry Type]"
+
+    # ---- Safety: cap query length to avoid NCBI abuse detection ----
+    # NCBI redirects to abuse.shtml for very long queries.
+    # 400 chars is a safe upper bound; most well-formed queries are 200-350 chars.
+    MAX_QUERY_LENGTH = 400
+    if len(query) > MAX_QUERY_LENGTH:
+        logger.warning(
+            f"GEO query too long ({len(query)} chars, max {MAX_QUERY_LENGTH}) — "
+            f"trimming cancer synonyms"
+        )
+        # Strategy: rebuild with progressively fewer cancer synonyms
+        # until the query fits. Other parts (tech, sample type, species) are kept intact.
+        if tcga_code and tcga_code in synonyms_data["cancer_synonyms"]:
+            synonyms = synonyms_data["cancer_synonyms"][tcga_code]
+            # Try with fewer synonyms: keep first N, reduce until fits
+            for n in range(len(synonyms), 0, -1):
+                subset = synonyms[:n]
+                quoted = []
+                for s in subset:
+                    s = str(s)
+                    quoted.append(f'"{s}"' if " " in s else s)
+                trimmed_parts = ["(" + " OR ".join(quoted) + ")"] + parts[1:]
+                query = " AND ".join(trimmed_parts)
+                if len(query) <= MAX_QUERY_LENGTH:
+                    logger.info(f"Trimmed cancer synonyms to {n}/{len(synonyms)} terms, query={len(query)} chars")
+                    break
+            else:
+                # Even 1 synonym is too long — use just the TCGA code
+                trimmed_parts = [tcga_code] + parts[1:]
+                query = " AND ".join(trimmed_parts)
+                logger.warning(f"Query still long with 1 synonym, using TCGA code only: {len(query)} chars")
+
+    return query
