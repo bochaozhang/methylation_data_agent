@@ -38,7 +38,7 @@ GEO 检索采用 4 层漏斗式过滤，从宽到窄逐步筛选：
 parse_query → intent dict
   │
   ▼
-build_geo_search_string(intent)  ← cancer_synonyms.yaml（16 癌种同义词 + 18 技术词 + 17 液体活检词）
+build_geo_search_string(intent)  ← cancer_synonyms.yaml（16 癌种同义词 + 8 技术词 + 8 液体活检词）
   │
   ▼
 NCBI esearch → GSE UID list
@@ -60,13 +60,13 @@ geo_candidates_<ts>.json + report_<ts>.json
 
 ### 第 1 层：检索式构建
 
-`build_geo_search_string(intent)` 将用户意图拼成 NCBI E-utilities 查询字符串，各子句用 `AND` 连接：
+`build_geo_search_string(intent)` 将用户意图拼成 NCBI E-utilities 查询字符串，各子句用 `AND` 连接。查询字符串上限 400 字符，超长时自动裁剪癌种同义词（`MAX_QUERY_LENGTH` 机制）。
 
 | 子句 | 逻辑 | 示例 |
 |------|------|------|
-| **癌种** | 从 `cancer_synonyms.yaml` 查 TCGA code 对应同义词，拼成 OR 组 | COAD → `(CRC OR "colorectal cancer" OR "colon cancer" OR adenoma OR ...)` |
-| **样本类型** | 液体活检（cfdna/plasma/serum）用 YAML 中 17 个词做 OR；否则走 `SAMPLE_TYPE_GEO_TERMS` 映射 | cfdna → `(cfDNA OR "cell-free DNA" OR ctDNA OR plasma OR "liquid biopsy" OR ...)` |
-| **甲基化技术** | 指定平台时用 GPL 号 + 俗名；未指定时用 YAML 中 18 个技术词做 OR | 无平台 → `("DNA methylation" OR methylome OR 450K OR EPIC OR MCTA OR WGBS OR ...)` |
+| **癌种** | 从 `cancer_synonyms.yaml` 查 TCGA code 对应同义词，拼成 OR 组 | COAD → `(CRC OR "colorectal cancer" OR "colon cancer" OR ...)` |
+| **样本类型** | 液体活检（cfdna/plasma/serum）用 YAML 中 8 个高区分度词做 OR；否则走 `SAMPLE_TYPE_GEO_TERMS` 映射 | cfdna → `(cfDNA OR "cell-free DNA" OR ctDNA OR plasma OR serum OR "liquid biopsy" OR "circulating DNA")` |
+| **甲基化技术** | 指定平台时用 GPL 号 + 俗名；未指定时用 YAML 中 8 个技术词做 OR | 无平台 → `("DNA methylation" OR 450K OR EPIC OR RRBS OR WGBS OR "bisulfite sequencing" OR "methylation array" OR methylome)` |
 | **物种** | 固定加 `(human OR "Homo sapiens")` | — |
 | **年份** | 可选的 PDAT 范围过滤 | `("2020/01/01"[PDAT] : "2024/12/31"[PDAT])` |
 | **Entry Type** | 固定 `GSE[Entry Type]` | — |
@@ -83,6 +83,33 @@ geo_candidates_<ts>.json + report_<ts>.json
 1. **esearch** 拿到 GSE UID 列表（max_results=2000）
 2. **batch esummary** 批量获取元数据（title, summary, overall_design, platforms, sample_count, year, pubmed_ids）
 3. **过滤**：data_type 检测（array vs sequencing）、platform_canonical 匹配、year 范围；platform_unknown 的保留（不过度过滤）
+
+### GSM 分组选取策略
+
+`get_representative_gsm_details(accession, wanted_sample_type)` 用于从 GSE 的全部 GSM 中选取代表性样本做 efetch MiniML，避免只取前 N 个导致混合设计数据集的偏差。
+
+**分组规则**：根据 GSM title 中的关键词，将每个样本归入以下 5 组 + 1 个兜底组（按优先级从上到下匹配，首次命中即归入）：
+
+| 分组 | 匹配关键词 |
+|------|-----------|
+| `plasma_cfdna` | plasma, cfdna, cell-free, cell free, serum, liquid biopsy, circulating, ctdna |
+| `tissue` | tumor, tumour, tissue, biopsy, ffpe, frozen, gdna, genomic dna, primary, cancer tissue, solid tumor |
+| `wbc_blood` | wbc, pbmc, buffy coat, leukocyte, whole blood, peripheral blood, mononuclear |
+| `normal` | normal, healthy, adjacent, control, benign |
+| `cell_line` | cell line, organoid, in vitro, culture |
+| `other` | 不匹配以上任何关键词的样本 |
+
+**选取规则**：
+
+| 数据集样本数 | 选取策略 |
+|-------------|---------|
+| n ≤ 30 | 全取（小数据集，完整覆盖） |
+| n > 30 | 每组最多 6 个代表，总上限 30 个 |
+
+大样本数据集的选取细节：
+- 用户查询的 `wanted_sample_type` 对应的分组优先选满（如查 cfDNA → `plasma_cfdna` 组先选）
+- 其余分组按顺序填充，直到总上限 30
+- 只对选中的 GSM 做 efetch MiniML（节省 API 调用）
 
 ### 第 3 层：PubMed 文献核验（主过滤器）
 
@@ -239,13 +266,13 @@ python main.py --query "..." --output-dir /data/my_methylation
 methyagent/
 ├── config/
 │   ├── settings.yaml          # 配置文件
-│   └── cancer_synonyms.yaml   # 癌种同义词 + 技术词 + 液体活检词（v3 新增）
+│   └── cancer_synonyms.yaml   # 癌种同义词 + 技术词 + 液体活检词
 ├── agents/
 │   ├── database_agent.py      # Agent 1：GEO + TCGA 搜索下载（PubMed 核验主过滤器 + 5 并发）
 │   ├── literature_agent.py    # Agent 2：文献挖掘 + 补充下载
 │   └── orchestrator.py        # LangGraph 图定义与编排
 ├── tools/
-│   ├── geo_tools.py           # GEO NCBI E-utilities API（含 get_gsm_details + fetch_pubmed_abstract）
+│   ├── geo_tools.py           # GEO NCBI E-utilities API（含 get_representative_gsm_details + fetch_pubmed_abstract）
 │   ├── tcga_tools.py          # GDC REST API
 │   ├── pubmed_tools.py        # PubMed / PMC / bioRxiv
 │   ├── download_tools.py      # 异步断点续传下载器
@@ -370,10 +397,12 @@ Agent 2 下载前检查流程：
 - TCGA 公开数据（Level 3 beta 值）无需 token
 - TCGA 受控数据（Level 1/2 原始数据）需要 dbGaP 授权，在 `settings.yaml` 中配置 `GDC_TOKEN`
 - NCBI API Key 可选，但建议设置（提高速率限制从 3 req/s 到 10 req/s）
+- 云服务器 IP 可能被 NCBI 标记为 abuse，可通过 `settings.yaml` 的 `geo.proxy` 或环境变量 `NCBI_PROXY` 配置 SOCKS5/HTTP 代理
 - 补充材料解析仅支持 PMC 开放获取文章
 - PubMed 核验使用 Z.AI GLM，`LLM_VERIFY_SYSTEM_PROMPT` 固定不变以触发隐式缓存（cached_tokens 降费加速）
 - PubMed 核验对**每一个** esummary 返回的 GSE 执行，每个数据集消耗 1 次 NCBI efetch + 1 次 LLM 调用
 - 无 PMID / 摘要获取失败 / LLM 出错时，数据集默认保留（保守策略）
 - `keep=False` 的数据集直接丢弃，不写入注册表；`recommended_action=review` 的数据集写入注册表供人工复查
 - `cancer_synonyms.yaml` 可独立更新，无需改代码即可添加新癌种同义词
+- 查询字符串上限 400 字符（`MAX_QUERY_LENGTH`），超长时自动裁剪癌种同义词，避免触发 NCBI abuse 检测
 - v4 移除了 GSM 级 LLM judge（`_llm_judge_datasets_concurrent`），该方法保留在代码中但不在主流程中调用
