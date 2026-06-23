@@ -204,6 +204,55 @@
 
     /* ---- Truncate long text ---- */
     .truncate { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+    /* ---- Stop all button ---- */
+    .btn-stop {
+      background: #d63031;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      padding: 7px 16px;
+      font-size: .85rem;
+      font-weight: 600;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      transition: background .15s, opacity .15s;
+    }
+    .btn-stop:hover { background: #b71c1c; }
+    .btn-stop:disabled { opacity: .5; cursor: not-allowed; }
+
+    /* ---- Stop confirmation modal ---- */
+    .modal-overlay {
+      display: none;
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,.45);
+      z-index: 1000;
+      align-items: center;
+      justify-content: center;
+    }
+    .modal-overlay.open { display: flex; }
+    .modal {
+      background: #fff;
+      border-radius: 10px;
+      padding: 28px 32px;
+      max-width: 420px;
+      width: 90%;
+      box-shadow: 0 8px 32px rgba(0,0,0,.18);
+    }
+    .modal h3 { font-size: 1.05rem; font-weight: 700; margin-bottom: 10px; color: #d63031; }
+    .modal p  { font-size: .88rem; color: #636e72; margin-bottom: 20px; line-height: 1.5; }
+    .modal-actions { display: flex; gap: 10px; justify-content: flex-end; }
+    .modal-result {
+      margin-top: 14px;
+      padding: 10px 14px;
+      border-radius: 6px;
+      font-size: .85rem;
+      display: none;
+    }
+    .modal-result.ok    { background: #d4edda; color: #155724; }
+    .modal-result.error { background: #f8d7da; color: #721c24; }
   </style>
 </head>
 <body>
@@ -218,7 +267,27 @@
     <span><span class="dot unknown" id="dot2"></span>agent2</span>
     <span id="healthStatus" style="color:#b2bec3">checking...</span>
   </div>
+  <button class="btn-stop" id="stopAllBtn" onclick="openStopModal()" title="Cancel all pending tasks and downloads">
+    &#9632; 停止所有任务
+  </button>
 </header>
+
+<!-- ===== STOP ALL MODAL ===== -->
+<div class="modal-overlay" id="stopModal">
+  <div class="modal">
+    <h3>&#9888; 确认停止所有任务</h3>
+    <p>
+      此操作将取消所有 <strong>pending / running</strong> 任务，
+      并将所有 <strong>pending</strong> 下载标记为 skipped。<br><br>
+      已完成的下载不受影响。此操作不可撤销。
+    </p>
+    <div class="modal-actions">
+      <button class="btn" style="background:#636e72" onclick="closeStopModal()">取消</button>
+      <button class="btn danger" id="confirmStopBtn" onclick="confirmStopAll()">确认停止</button>
+    </div>
+    <div class="modal-result" id="stopResult"></div>
+  </div>
+</div>
 
 <nav>
   <button class="active" onclick="showTab('query')">&#128269; Submit Query</button>
@@ -641,6 +710,59 @@ setInterval(autoRefresh, 15000);
 document.getElementById('queryInput').addEventListener('keydown', e => {
   if (e.key === 'Enter') submitQuery();
 });
+
+// ============================================================
+// Stop all tasks
+// ============================================================
+function openStopModal() {
+  document.getElementById('stopModal').classList.add('open');
+  document.getElementById('stopResult').style.display = 'none';
+  document.getElementById('confirmStopBtn').disabled = false;
+}
+
+function closeStopModal() {
+  document.getElementById('stopModal').classList.remove('open');
+}
+
+// Close modal when clicking outside
+document.getElementById('stopModal').addEventListener('click', function(e) {
+  if (e.target === this) closeStopModal();
+});
+
+async function confirmStopAll() {
+  const btn = document.getElementById('confirmStopBtn');
+  const result = document.getElementById('stopResult');
+  btn.disabled = true;
+  btn.textContent = '停止中...';
+  try {
+    const r = await fetch('/tasks/cancel-all', { method: 'POST' });
+    const d = await r.json();
+    result.style.display = 'block';
+    if (r.ok) {
+      result.className = 'modal-result ok';
+      result.textContent = d.message;
+      // Refresh task and dataset lists after short delay
+      setTimeout(() => {
+        loadRecentTasks();
+        const active = document.querySelector('.section.active');
+        if (active && active.id === 'tab-tasks')    loadTasks();
+        if (active && active.id === 'tab-datasets') loadDatasets();
+        closeStopModal();
+      }, 1500);
+    } else {
+      result.className = 'modal-result error';
+      result.textContent = d.detail || '请求失败';
+      btn.disabled = false;
+      btn.textContent = '确认停止';
+    }
+  } catch(e) {
+    result.style.display = 'block';
+    result.className = 'modal-result error';
+    result.textContent = '网络错误: ' + e.message;
+    btn.disabled = false;
+    btn.textContent = '确认停止';
+  }
+}
 </script>
 </body>
 </html>

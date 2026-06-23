@@ -75,6 +75,7 @@ class DatasetResponse(BaseModel):
     file_size_bytes: Optional[int] = None
     needs_review: bool = False
     llm_evidence: Optional[str] = None
+    sample_type: Optional[str] = None
     created_at: str
     updated_at: str
 
@@ -123,3 +124,17 @@ class HealthResponse(BaseModel):
 class ErrorResponse(BaseModel):
     """Standard error response body."""
     detail: str
+
+
+class CancelTaskResponse(BaseModel):
+    """POST /tasks/{task_id}/cancel — cancel a single task."""
+    task_id: str
+    cancelled: bool
+    message: str
+
+
+class CancelAllResponse(BaseModel):
+    """POST /tasks/cancel-all — cancel all pending tasks and downloads."""
+    tasks_cancelled: int
+    datasets_skipped: int
+    message: str

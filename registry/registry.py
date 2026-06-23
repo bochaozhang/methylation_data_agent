@@ -636,6 +636,26 @@ class Registry:
                 )
                 return cur.rowcount > 0
 
+    def cancel_all_tasks(self) -> Dict[str, int]:
+        """
+        Cancel all pending tasks and skip all pending dataset downloads.
+
+        Returns:
+            dict with keys "tasks_cancelled" and "datasets_skipped".
+        """
+        with self._lock:
+            with self._get_conn() as conn:
+                cur_tasks = conn.execute(
+                    "UPDATE task_queue SET status = 'cancelled' WHERE status IN ('pending', 'running')"
+                )
+                cur_datasets = conn.execute(
+                    "UPDATE datasets SET download_status = 'skipped' WHERE download_status = 'pending'"
+                )
+                return {
+                    "tasks_cancelled": cur_tasks.rowcount,
+                    "datasets_skipped": cur_datasets.rowcount,
+                }
+
     def get_task(self, task_id: str) -> Optional[Dict]:
         """Return a single task record as a dict, or None."""
         with self._get_conn() as conn:

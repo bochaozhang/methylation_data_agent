@@ -46,6 +46,8 @@ from api.models import (  # noqa: E402
     ReviewListResponse,
     ReviewActionResponse,
     HealthResponse,
+    CancelTaskResponse,
+    CancelAllResponse,
 )
 
 # ---------------------------------------------------------------------------
@@ -131,6 +133,7 @@ def _dataset_to_response(d: dict) -> DatasetResponse:
         file_size_bytes=d.get("file_size_bytes"),
         needs_review=bool(d.get("needs_review", 0)),
         llm_evidence=d.get("llm_evidence"),
+        sample_type=d.get("sample_type"),
         created_at=d["created_at"],
         updated_at=d["updated_at"],
     )
@@ -295,6 +298,58 @@ async def reject_dataset(accession: str, body: ReviewDecision = ReviewDecision()
         accession=accession,
         action="rejected",
         message=f"Dataset '{accession}' rejected and marked as skipped.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Task cancellation
+# ---------------------------------------------------------------------------
+
+@app.post("/tasks/cancel-all", response_model=CancelAllResponse)
+async def cancel_all_tasks():
+    """
+    Cancel all pending/running tasks and skip all pending dataset downloads.
+
+    Useful for stopping a runaway search without touching the database manually.
+    Note: tasks already in progress (status=running) are marked cancelled in the
+    registry; the agent daemon will stop picking up new work immediately, but any
+    in-flight HTTP request may still complete before the agent checks the flag.
+    """
+    registry = get_registry()
+    result = registry.cancel_all_tasks()
+    return CancelAllResponse(
+        tasks_cancelled=result["tasks_cancelled"],
+        datasets_skipped=result["datasets_skipped"],
+        message=(
+            f"Cancelled {result['tasks_cancelled']} task(s) and "
+            f"skipped {result['datasets_skipped']} pending download(s)."
+        ),
+    )
+
+
+@app.post("/tasks/{task_id}/cancel", response_model=CancelTaskResponse)
+async def cancel_task(task_id: str):
+    """
+    Cancel a single pending task by ID.
+
+    Only tasks with status='pending' can be cancelled this way.
+    Running tasks are not interrupted mid-execution.
+    """
+    registry = get_registry()
+    task = registry.get_task(task_id)
+    if task is None:
+        raise HTTPException(status_code=404, detail=f"Task '{task_id}' not found.")
+    if task["status"] not in ("pending", "running"):
+        return CancelTaskResponse(
+            task_id=task_id,
+            cancelled=False,
+            message=f"Task is already in status '{task['status']}', cannot cancel.",
+        )
+    cancelled = registry.cancel_task(task_id)
+    return CancelTaskResponse(
+        task_id=task_id,
+        cancelled=cancelled,
+        message="Task cancelled." if cancelled else "Task could not be cancelled (may have just started running).",
     )
 
 
