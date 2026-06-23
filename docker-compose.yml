@@ -37,6 +37,10 @@ services:
       POLL_INTERVAL: "5"
       HEARTBEAT_INTERVAL: "30"
       LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+      # NCBI proxy: routes GEO/PubMed requests through SSH SOCKS5 tunnel
+      # SSH tunnel must be started on host: ssh -D 0.0.0.0:1080 -N -f zhangbochao1222@35.237.123.242
+      # 172.17.0.1 is the default Docker bridge gateway (host machine from inside container)
+      NCBI_PROXY: "socks5h://172.17.0.1:1080"
     volumes:
       - ./registry:/app/registry
       - ./data:/app/data

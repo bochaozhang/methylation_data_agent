@@ -83,14 +83,20 @@ class GEOClient:
     Args:
         api_key: Optional NCBI API key (raises rate limit from 3 to 10 req/s).
         base_url: E-utilities base URL.
+        proxy: Optional proxy URL, e.g. "socks5h://127.0.0.1:1080".
+               Useful when the host IP is blocked by NCBI.
     """
 
-    def __init__(self, api_key: Optional[str] = None, base_url: str = EUTILS_BASE):
+    def __init__(self, api_key: Optional[str] = None, base_url: str = EUTILS_BASE,
+                 proxy: Optional[str] = None):
         self.api_key = api_key
         self.base_url = base_url
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "MethyAgent/1.0 (methylation data collector)"})
         self._rate_limit_delay = 0.11 if api_key else 0.34  # seconds between requests
+        if proxy:
+            self.session.proxies = {"http": proxy, "https": proxy}
+            logger.info(f"GEOClient using proxy: {proxy}")
 
     def _get(self, endpoint: str, params: Dict) -> requests.Response:
         """

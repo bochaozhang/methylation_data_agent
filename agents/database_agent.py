@@ -145,7 +145,9 @@ class DatabaseAgent:
 
         # Initialize API clients
         ncbi_key = os.environ.get(config["geo"].get("api_key_env", ""), "")
-        self.geo_client = GEOClient(api_key=ncbi_key or None)
+        # Proxy: env var NCBI_PROXY takes priority, then settings.yaml geo.proxy
+        ncbi_proxy = os.environ.get("NCBI_PROXY", "") or config.get("geo", {}).get("proxy", "")
+        self.geo_client = GEOClient(api_key=ncbi_key or None, proxy=ncbi_proxy or None)
 
         gdc_token = os.environ.get(config["tcga"].get("gdc_token_env", ""), "")
         self.gdc_client = GDCClient(token=gdc_token or None)
