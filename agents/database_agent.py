@@ -110,13 +110,20 @@ Respond ONLY with a JSON object (no markdown, no explanation outside JSON):
 }
 
 Decision rules for `keep`:
-- keep=true  if the abstract confirms the dataset matches the GEO metadata (cancer type, sample type, methylation data)
+- keep=true  if the dataset matches BOTH the requested cancer type AND the requested sample type
 - keep=true  if the abstract is unavailable or uninformative — give benefit of the doubt
-- keep=false ONLY if the abstract clearly contradicts the GEO metadata, e.g.:
-    * GEO says plasma cfDNA but abstract describes tumor tissue only
-    * GEO says cancer X but abstract is about a completely different cancer
+- keep=false if the dataset cancer type clearly does NOT match the requested cancer type
+    * e.g. requested colorectal cancer but dataset is lung cancer / breast cancer / etc.
+    * Minor subtype differences are acceptable (e.g. requested "colorectal cancer", dataset is "colon adenocarcinoma")
+    * keep=true if requested cancer type is null/unknown
+- keep=false if the dataset sample type clearly does NOT match the requested sample type
+    * e.g. requested cfDNA/plasma but dataset is tumor tissue only (no liquid biopsy component)
+    * e.g. requested tumor tissue but dataset is cell lines only
+    * keep=true if requested sample type is null/unknown
+- keep=false if the abstract clearly contradicts the GEO metadata in a fundamental way:
     * Abstract confirms the dataset is cell lines / organoids / in-vitro only
     * Abstract confirms the data is NOT methylation (e.g. RNA-seq, proteomics)
+    * GEO metadata and abstract describe completely different experiments
 - When in doubt, keep=true (conservative — prefer false positives over false negatives)
 
 Rules for other fields:
@@ -125,7 +132,7 @@ Rules for other fields:
 - accession_mentioned: true only if the GEO accession (e.g. GSE220160) appears explicitly in the abstract
 - consistency: consistent if GEO and abstract agree; minor_discrepancy if small differences; major_discrepancy if fundamental mismatch
 - recommended_action: skip only if keep=false with high confidence; review if minor discrepancy; download otherwise
-- notes: record any discrepancy (e.g. sample count mismatch, different cancer subtype)
+- notes: record any discrepancy (e.g. sample count mismatch, different cancer subtype, cancer type mismatch with request)
 """
 
 
@@ -357,7 +364,7 @@ class DatabaseAgent:
             # Every GSE fetches its linked PubMed abstract and the LLM checks
             # whether the GEO summary/design is consistent with the paper.
             # Datasets that pass (keep=True) are returned; others are logged and dropped.
-            datasets = self._pubmed_verify_datasets_concurrent(datasets)
+            datasets = self._pubmed_verify_datasets_concurrent(datasets, intent=intent)
 
             return datasets
         except Exception as e:
@@ -558,7 +565,7 @@ class DatabaseAgent:
     #  PubMed cross-verification — PRIMARY GEO filter                     #
     # ------------------------------------------------------------------ #
 
-    def _pubmed_verify_dataset(self, ds: Dict[str, Any]) -> Dict[str, Any]:
+    def _pubmed_verify_dataset(self, ds: Dict[str, Any], intent: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         Cross-check a GEO dataset against its associated PubMed abstract.
 
@@ -622,8 +629,49 @@ class DatabaseAgent:
                 "notes": (existing_notes + f"; abstract_unavailable(PMID={pmid})").lstrip("; "),
             }
 
+        # ---- Build intent summary for LLM (what the user actually wants) ----
+        intent_lines = []
+        if intent:
+            # Cancer type
+            ct = intent.get("cancer_type")
+            if ct:
+                ct_label = ct.get("display") if isinstance(ct, dict) else str(ct)
+            else:
+                ct_label = intent.get("cancer_type_display") or "not specified"
+            intent_lines.append(f"Requested cancer type: {ct_label}")
+
+            # Sample types
+            sample_types = intent.get("sample_types") or []
+            primary_st = intent.get("sample_type") or ""
+            if sample_types:
+                intent_lines.append(f"Requested sample type(s): {primary_st} (all: {sample_types})")
+            elif primary_st:
+                intent_lines.append(f"Requested sample type: {primary_st}")
+            else:
+                intent_lines.append("Requested sample type: not specified")
+
+            # Platform
+            platform_req = intent.get("platform") or "not specified"
+            intent_lines.append(f"Requested platform: {platform_req}")
+
+            # Year range
+            yr_start = intent.get("year_start")
+            yr_end = intent.get("year_end")
+            if yr_start or yr_end:
+                intent_lines.append(f"Requested year range: {yr_start or 'any'} – {yr_end or 'any'}")
+
+            # Free-text detail if available
+            detail = intent.get("sample_type_detail") or ""
+            if detail:
+                intent_lines.append(f"Sample type detail: {detail}")
+
+        intent_block = "\n".join(intent_lines) if intent_lines else "not specified"
+
         # ---- Build user message (dynamic content only) ----
         user_msg = (
+            f"=== USER REQUEST ===\n"
+            f"{intent_block}\n\n"
+            f"=== GEO DATASET METADATA ===\n"
             f"GEO Accession: {acc}\n"
             f"Title: {ds.get('title', '')[:200]}\n"
             f"Summary: {ds.get('summary', '')[:400]}\n"
@@ -633,7 +681,8 @@ class DatabaseAgent:
             f"Sample type (GEO): {ds.get('sample_type')}\n"
             f"Cancer type (GEO): {ds.get('cancer_type')}\n"
             f"PMID: {pmid}\n\n"
-            f"Abstract:\n{abstract[:2500]}\n"
+            f"=== PUBMED ABSTRACT ===\n"
+            f"{abstract[:2500]}\n"
         )
 
         try:
@@ -726,6 +775,7 @@ class DatabaseAgent:
         self,
         datasets: List[Dict[str, Any]],
         max_concurrent: int = 5,
+        intent: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Run PubMed cross-verification on ALL datasets with up to max_concurrent
@@ -756,7 +806,9 @@ class DatabaseAgent:
         async def _verify_one_async(ds: Dict[str, Any]) -> Dict[str, Any]:
             async with sem:
                 loop = asyncio.get_event_loop()
-                return await loop.run_in_executor(None, self._pubmed_verify_dataset, ds)
+                return await loop.run_in_executor(
+                    None, self._pubmed_verify_dataset, ds, intent
+                )
 
         async def _run_all() -> List[Dict[str, Any]]:
             tasks = [_verify_one_async(ds) for ds in datasets]
