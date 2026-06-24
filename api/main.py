@@ -48,6 +48,7 @@ from api.models import (  # noqa: E402
     HealthResponse,
     CancelTaskResponse,
     CancelAllResponse,
+    RetryFailedResponse,
 )
 
 # ---------------------------------------------------------------------------
@@ -351,6 +352,22 @@ async def cancel_task(task_id: str):
         task_id=task_id,
         cancelled=cancelled,
         message="Task cancelled." if cancelled else "Task could not be cancelled (may have just started running).",
+    )
+
+
+@app.post("/datasets/retry-failed", response_model=RetryFailedResponse)
+async def retry_failed_datasets():
+    """
+    Reset all failed dataset downloads back to pending.
+
+    The agent daemon will pick them up on the next poll cycle
+    (default every 5 seconds) and attempt to re-download.
+    """
+    registry = get_registry()
+    n = registry.retry_failed_datasets()
+    return RetryFailedResponse(
+        datasets_reset=n,
+        message=f"Reset {n} failed dataset(s) to pending. Agent will retry on next poll.",
     )
 
 

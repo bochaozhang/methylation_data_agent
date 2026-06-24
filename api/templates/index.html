@@ -396,8 +396,11 @@
             <option value="skipped">Skipped</option>
           </select>
         </div>
-        <div class="form-group" style="justify-content:flex-end">
+        <div class="form-group" style="justify-content:flex-end;gap:8px;flex-direction:row">
           <button class="btn" onclick="loadDatasets()">&#8635; Refresh</button>
+          <button class="btn danger" id="retryFailedBtn" onclick="retryFailed()" title="Reset all failed downloads to pending">
+            &#8635; 重新下载失败项
+          </button>
         </div>
       </div>
       <div class="refresh-info" id="datasetsRefreshInfo"></div>
@@ -730,6 +733,34 @@ function closeStopModal() {
 document.getElementById('stopModal').addEventListener('click', function(e) {
   if (e.target === this) closeStopModal();
 });
+
+// ============================================================
+// Retry failed downloads
+// ============================================================
+async function retryFailed() {
+  const btn = document.getElementById('retryFailedBtn');
+  btn.disabled = true;
+  btn.textContent = '处理中...';
+  try {
+    const r = await fetch('/datasets/retry-failed', { method: 'POST' });
+    const d = await r.json();
+    if (r.ok) {
+      if (d.datasets_reset === 0) {
+        alert('没有失败的下载任务。');
+      } else {
+        alert(d.message);
+        loadDatasets();
+      }
+    } else {
+      alert(d.detail || '请求失败');
+    }
+  } catch(e) {
+    alert('网络错误: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '&#8635; 重新下载失败项';
+  }
+}
 
 async function confirmStopAll() {
   const btn = document.getElementById('confirmStopBtn');

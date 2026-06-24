@@ -139,3 +139,9 @@ class CancelAllResponse(BaseModel):
     tasks_cancelled: int
     datasets_skipped: int
     message: str
+
+
+class RetryFailedResponse(BaseModel):
+    """POST /datasets/retry-failed — reset failed downloads to pending."""
+    datasets_reset: int
+    message: str
