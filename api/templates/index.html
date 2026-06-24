@@ -159,6 +159,7 @@
     .badge.downloading { background: #a29bfe; color: #2d0080; }
     .badge.skipped     { background: #dfe6e9; color: #636e72; }
     .badge.review      { background: #ffeaa7; color: #6c5a00; }
+    .badge.no-pubmed   { background: #fff3cd; color: #856404; }
 
     /* ---- Review cards ---- */
     .review-card {
@@ -405,7 +406,7 @@
           <thead>
             <tr>
               <th>Accession</th><th>Source</th><th>Title</th><th>Cancer Type</th>
-              <th>Platform</th><th>Samples</th><th>Status</th><th>Discovered By</th>
+              <th>Platform</th><th>Samples</th><th>Status</th><th>Paper</th><th>Discovered By</th>
             </tr>
           </thead>
           <tbody id="datasetsBody">
@@ -625,6 +626,7 @@ async function loadDatasets() {
         <td>${ds.platform || '—'}</td>
         <td>${ds.sample_count ?? '—'}</td>
         <td>${badge(ds.needs_review ? 'pending_review' : ds.download_status)}</td>
+        <td>${ds.no_pubmed_link ? '<span class="badge no-pubmed" title="No linked publication found">No Paper</span>' : '<span style="color:#00b894">✓</span>'}</td>
         <td>${ds.discovered_by}</td>
       </tr>`).join('');
   } catch(e) { console.error(e); }

@@ -134,6 +134,7 @@ def _dataset_to_response(d: dict) -> DatasetResponse:
         needs_review=bool(d.get("needs_review", 0)),
         llm_evidence=d.get("llm_evidence"),
         sample_type=d.get("sample_type"),
+        no_pubmed_link=bool(d.get("no_pubmed_link", 0)),
         created_at=d["created_at"],
         updated_at=d["updated_at"],
     )

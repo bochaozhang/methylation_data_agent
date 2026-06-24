@@ -76,6 +76,7 @@ class DatasetResponse(BaseModel):
     needs_review: bool = False
     llm_evidence: Optional[str] = None
     sample_type: Optional[str] = None
+    no_pubmed_link: bool = False
     created_at: str
     updated_at: str
 

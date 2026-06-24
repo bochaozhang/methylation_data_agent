@@ -294,6 +294,9 @@ class DatabaseAgent:
         for c in new_candidates:
             acc = c["accession"]
             # Register with pending status
+            # Determine no_pubmed_link flag from verification result
+            _notes = c.get("notes") or ""
+            _no_pubmed = "no_pubmed_link" in _notes
             self.registry.upsert_dataset(
                 accession=acc,
                 source=c.get("source", "GEO"),
@@ -305,6 +308,9 @@ class DatabaseAgent:
                 year=c.get("year"),
                 title=c.get("title"),
                 sample_type=c.get("sample_type"),
+                paper_pmid=c.get("paper_pmid"),
+                notes=c.get("notes"),
+                no_pubmed_link=_no_pubmed,
                 download_status="pending",
             )
             self.registry.log_event(acc, "start", f"Registered by DatabaseAgent")

@@ -112,6 +112,7 @@ class Registry:
                     recommended_action      TEXT,
                     reason                  TEXT,
                     notes                   TEXT,
+                    no_pubmed_link          INTEGER DEFAULT 0,
                     created_at      TEXT NOT NULL,
                     updated_at      TEXT NOT NULL
                 );
@@ -182,6 +183,8 @@ class Registry:
             "ALTER TABLE datasets ADD COLUMN recommended_action TEXT",
             "ALTER TABLE datasets ADD COLUMN reason TEXT",
             "ALTER TABLE datasets ADD COLUMN notes TEXT",
+            # v5 columns
+            "ALTER TABLE datasets ADD COLUMN no_pubmed_link INTEGER DEFAULT 0",
         ]
         with self._get_conn() as conn:
             for sql in migrations:
@@ -236,6 +239,7 @@ class Registry:
         recommended_action: Optional[str] = None,
         reason: Optional[str] = None,
         notes: Optional[str] = None,
+        no_pubmed_link: bool = False,
     ) -> bool:
         """
         Insert a new dataset or update metadata if it already exists.
@@ -274,6 +278,7 @@ class Registry:
                             recommended_action      = COALESCE(?, recommended_action),
                             reason                  = COALESCE(?, reason),
                             notes                   = COALESCE(?, notes),
+                            no_pubmed_link          = COALESCE(?, no_pubmed_link),
                             updated_at              = ?
                         WHERE accession = ?
                         """,
@@ -284,6 +289,7 @@ class Registry:
                             disease_groups, stage_treatment, available_file_type,
                             sample_level_annotation, usable, recommended_action,
                             reason, notes,
+                            int(no_pubmed_link),
                             now, accession,
                         ),
                     )
@@ -298,10 +304,10 @@ class Registry:
                             needs_review, llm_evidence, sample_type,
                             disease_groups, stage_treatment, available_file_type,
                             sample_level_annotation, usable, recommended_action,
-                            reason, notes,
+                            reason, notes, no_pubmed_link,
                             created_at, updated_at
                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                                  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             accession, source, data_type, cancer_type, platform,
@@ -311,6 +317,7 @@ class Registry:
                             disease_groups, stage_treatment, available_file_type,
                             sample_level_annotation, usable, recommended_action,
                             reason, notes,
+                            int(no_pubmed_link),
                             now, now,
                         ),
                     )
