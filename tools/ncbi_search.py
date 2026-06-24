@@ -50,18 +50,55 @@ _FETCH_BATCH_SIZE    = 100   # efetch supports up to 500 per call
 # ------------------------------------------------------------------ #
 
 def _build_session() -> requests.Session:
-    """
-    Build a requests.Session configured with NCBI_PROXY if set.
-    Mirrors the proxy setup in GEOClient (tools/geo_tools.py).
-    """
     session = requests.Session()
     session.headers.update({"User-Agent": "MethyAgent/1.0 (methylation data collector)"})
-    proxy = os.environ.get("NCBI_PROXY", "")
-    if proxy:
-        session.proxies = {"http": proxy, "https": proxy}
     return session
 
 _SESSION: requests.Session = _build_session()
+
+
+def _resolve_proxy() -> str:
+    """
+    Resolve the NCBI proxy URL using the same priority as database_agent.py:
+      1. NCBI_PROXY env var
+      2. geo.proxy in config/settings.yaml
+      3. Standard HTTP_PROXY / HTTPS_PROXY env vars
+    Result is cached after the first call.
+    """
+    if hasattr(_resolve_proxy, "_cache"):
+        return _resolve_proxy._cache  # type: ignore[attr-defined]
+
+    proxy = os.environ.get("NCBI_PROXY", "")
+
+    if not proxy:
+        try:
+            import yaml
+            from pathlib import Path
+            cfg_path = Path(__file__).parent.parent / "config" / "settings.yaml"
+            with open(cfg_path) as f:
+                cfg = yaml.safe_load(f)
+            proxy = cfg.get("geo", {}).get("proxy", "")
+        except Exception:
+            pass
+
+    if not proxy:
+        proxy = (
+            os.environ.get("HTTPS_PROXY", "")
+            or os.environ.get("HTTP_PROXY", "")
+            or os.environ.get("ALL_PROXY", "")
+        )
+
+    _resolve_proxy._cache = proxy  # type: ignore[attr-defined]
+    return proxy
+
+
+def _apply_proxy(session: requests.Session) -> None:
+    """Apply proxy to session. Mirrors database_agent.py GEOClient setup."""
+    proxy = _resolve_proxy()
+    if proxy:
+        session.proxies = {"http": proxy, "https": proxy}
+    else:
+        session.proxies = {}
 
 # ------------------------------------------------------------------ #
 #  Stage-1 filter keyword sets                                        #
@@ -92,8 +129,15 @@ _TISSUE_EXCLUDE = {
 # ------------------------------------------------------------------ #
 
 def _ncbi_params() -> Dict[str, str]:
-    """Return common NCBI params, including API key if available."""
-    params: Dict[str, str] = {}
+    """
+    Return common NCBI E-utilities params.
+    tool + email are required to avoid IP bans (misuse.ncbi.nlm.nih.gov redirect).
+    See: https://www.ncbi.nlm.nih.gov/books/NBK25497/#chapter2.Usage_Guidelines_and_Requiremen
+    """
+    params: Dict[str, str] = {
+        "tool":  "MethyAgent",
+        "email": os.environ.get("GEO_EMAIL", "methyagent@research.local"),
+    }
     key = os.environ.get("NCBI_API_KEY", "")
     if key:
         params["api_key"] = key
@@ -102,11 +146,32 @@ def _ncbi_params() -> Dict[str, str]:
 
 def _get(url: str, params: Dict[str, Any], timeout: int = 30) -> requests.Response:
     """GET with retry (2 attempts, 1-second back-off) through shared proxy session."""
+    _apply_proxy(_SESSION)
     for attempt in range(2):
         try:
             resp = _SESSION.get(url, params=params, timeout=timeout)
             resp.raise_for_status()
+
+            # Detect NCBI abuse/block redirect (same check as GEOClient)
+            if "misuse.ncbi.nlm.nih.gov" in resp.url or "abuse.shtml" in resp.url:
+                raise RuntimeError(
+                    "NCBI blocked this request (abuse redirect). "
+                    "Check that the proxy tunnel is running: "
+                    "bash /home/ubuntu/bochaozhang/proxy.sh"
+                )
+
+            # Detect empty body — proxy not routing or server IP blocked
+            if not resp.text.strip():
+                proxy = os.environ.get("NCBI_PROXY", "(not set)")
+                raise RuntimeError(
+                    f"NCBI returned an empty response. "
+                    f"NCBI_PROXY={proxy}. "
+                    f"Ensure the proxy tunnel is running and NCBI_PROXY is set in .env."
+                )
+
             return resp
+        except RuntimeError:
+            raise
         except requests.RequestException as exc:
             if attempt == 0:
                 time.sleep(1)
@@ -139,7 +204,13 @@ def esearch_pmids(query: str, max_results: int = _DEFAULT_MAX_RESULTS) -> List[s
     }
     time.sleep(_REQUEST_DELAY)
     resp = _get(_ESEARCH_URL, params)
-    data = resp.json()
+    try:
+        data = resp.json()
+    except Exception:
+        raise RuntimeError(
+            f"NCBI esearch returned non-JSON (status={resp.status_code}). "
+            f"First 200 chars: {resp.text[:200]!r}"
+        )
     return data.get("esearchresult", {}).get("idlist", [])
 
 
@@ -275,30 +346,34 @@ def stage1_filter(records: List[Dict[str, str]]) -> List[Dict[str, str]]:
 #  Stage 2 — LLM structured extraction                              #
 # ------------------------------------------------------------------ #
 
+_STAGE2_MAX = 10  # cap LLM calls per search_and_extract invocation
+
+
 def stage2_extract(
     records: List[Dict[str, str]],
     llm: BaseChatModel,
+    max_records: int = _STAGE2_MAX,
 ) -> List[Dict[str, Any]]:
     """
     Run extract_paper_structured() on each record passing Stage 1.
-
-    Args:
-        records: Filtered {pmid, title, abstract} dicts.
-        llm:     LangChain chat model.
-
-    Returns:
-        List of structured dicts, each merged with pmid and title.
+    Capped at max_records to limit LLM calls (each call ~3-8s).
+    Prints progress so callers can see it's working.
     """
+    capped = records[:max_records]
+    if len(records) > max_records:
+        print(f"  [stage2] {len(records)} records passed Stage 1, capping at {max_records}")
+
     structured: List[Dict[str, Any]] = []
-    for rec in records:
+    for i, rec in enumerate(capped, 1):
+        pmid = rec.get("pmid", "")
+        print(f"  [stage2] {i}/{len(capped)} LLM extract — PMID={pmid} ...", flush=True)
         result = extract_paper_structured(
             abstract=rec.get("abstract", ""),
             llm=llm,
-            pmid=rec.get("pmid", ""),
+            pmid=pmid,
             title=rec.get("title", ""),
         )
-        # Always carry pmid and title forward even if LLM omits them
-        result.setdefault("pmid", rec.get("pmid", ""))
+        result.setdefault("pmid", pmid)
         result.setdefault("title", rec.get("title", ""))
         structured.append(result)
 

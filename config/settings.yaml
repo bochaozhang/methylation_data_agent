@@ -28,9 +28,10 @@ registry:
   db_path: ./registry/methyagent.db
 
 geo:
-  api_key_env: NCBI_API_KEY   # optional, raises rate limit from 3 to 10 req/s
+  api_key_env: NCBI_API_KEY
   base_url: https://eutils.ncbi.nlm.nih.gov/entrez/eutils
   ftp_base: ftp://ftp.ncbi.nlm.nih.gov/geo/series
+  proxy: socks5h://127.0.0.1:1080
 
 tcga:
   gdc_api_base: https://api.gdc.cancer.gov
