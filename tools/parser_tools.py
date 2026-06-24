@@ -463,11 +463,11 @@ Output ONLY valid JSON with these fields (use null for missing values):
   "data_type": "array" | "sequencing" | "both" | null,
   "sample_type": "cfdna" | "plasma" | "serum" | "wbc" | "whole_blood" | "tumor" | "adjacent" | "normal" | "non_cancer" | null,
   "sample_types": ["cfdna", "non_cancer"],
-  "year_start": 2024,
-  "year_end": 2024,
+  "year_start": null,
+  "year_end": null,
   "sample_type_detail": "Brief description of what sample types the user wants",
   "geo_search_query": "colorectal cancer cfDNA methylation[GEO]",
-  "pubmed_search_query": "colorectal cancer DNA methylation cfDNA cell-free DNA 2024",
+  "pubmed_search_query": "colorectal cancer DNA methylation cfDNA cell-free DNA",
   "notes": "any special instructions"
 }
 
@@ -475,6 +475,8 @@ Rules:
 - If the query contains explicit accession numbers (GSE..., TCGA-...), set mode="accession"
 - For Chinese cancer names: 乳腺癌=BRCA, 肺癌=LUAD, 肝癌=LIHC, 胃癌=STAD, 结直肠癌=COAD
 - For platform: EPIC/850K → "EPIC", 450K/HM450 → "450K", WGBS/全基因组亚硫酸盐 → "WGBS"
+- year_start / year_end: ONLY set these if the user explicitly mentions a year or year range.
+  If no year is mentioned in the query, both must be null. Do NOT infer or default to the current year.
 
 SAMPLE TYPE PARSING (CRITICAL for cfDNA/liquid biopsy queries):
 - cfDNA / cell-free DNA / circulating DNA / ctDNA / 游离DNA / 循环DNA → "cfdna"

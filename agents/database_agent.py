@@ -83,6 +83,61 @@ Rules:
 - Cell lines / organoids / in-vitro models → always keep=false
 """
 
+# GEO metadata screening prompt — Step 1 of the two-step filter.
+# Screens datasets using ONLY GEO metadata (title, summary, overall_design).
+# No PubMed abstract needed. Runs before PubMed verification to eliminate
+# obvious mismatches cheaply (cell lines, wrong cancer type, wrong sample type).
+# Kept CONSTANT for Z.AI system cache.
+LLM_SCREEN_SYSTEM_PROMPT = """You are a biomedical data curator specializing in DNA methylation datasets.
+
+You will receive:
+1. The user's search intent (requested cancer type, sample type, platform)
+2. GEO dataset metadata: accession, title, summary, overall design, platform, sample count
+
+Your task: decide whether this dataset is a plausible match for the user's request,
+based ONLY on the GEO metadata (no paper abstract available yet).
+
+Respond ONLY with a JSON object (no markdown, no explanation outside JSON):
+{
+  "keep": true or false,
+  "detected_cancer_type": "canonical English cancer name, or null if unclear",
+  "detected_sample_type": "plasma|tumor|adjacent|normal|wbc|cfdna|serum|whole_blood|cell_line|unknown",
+  "reason": "one sentence explaining the decision"
+}
+
+Decision rules — evaluate in ORDER, stop at the first matching rule:
+
+RULE 1 (HARD REJECT — cell lines / in-vitro, no exceptions):
+- keep=false if the dataset is clearly cell lines / organoids / in-vitro models
+  * Triggered by: "cell line", "cell culture", "organoid", "in vitro", "in-vitro",
+    "cultured cells", specific cell line names (HCT116, SW480, MCF7, A549, etc.)
+  * Applies regardless of cancer type or any other factor
+
+RULE 2 (HARD REJECT — data type mismatch):
+- keep=false if the data is clearly NOT DNA methylation
+  * e.g. title/summary mentions RNA-seq, transcriptome, proteomics, ChIP-seq, ATAC-seq
+
+RULE 3 (HARD REJECT — cancer type mismatch):
+- keep=false if the dataset cancer type clearly does NOT match the requested cancer type
+  * e.g. requested colorectal cancer but title/summary clearly describes lung / breast / leukemia
+  * Minor subtype differences are acceptable (e.g. "colon adenocarcinoma" ≈ "colorectal cancer")
+  * Skip this rule if requested cancer type is null/unknown
+  * When uncertain (cancer type not mentioned in metadata), keep=true
+
+RULE 4 (HARD REJECT — sample type mismatch):
+- keep=false if the dataset sample type clearly does NOT match the requested sample type
+  * e.g. requested cfDNA/plasma but title/summary clearly describes tumor tissue only
+  * e.g. requested cfDNA/plasma but summary clearly describes WBC / whole blood only
+  * Skip this rule if requested sample type is null/unknown
+  * When uncertain (sample type not mentioned in metadata), keep=true
+
+RULE 5 (DEFAULT):
+- keep=true if none of rules 1-4 triggered
+- Be LIBERAL at this stage — false positives are acceptable here because
+  PubMed abstract verification (Step 2) will do a more rigorous check.
+  Only reject when the mismatch is OBVIOUS from the GEO metadata alone.
+"""
+
 # PubMed verification system prompt — kept CONSTANT for Z.AI system cache.
 # This is the PRIMARY filter for GEO datasets: every GSE goes through this step.
 # The LLM cross-checks GEO summary/design against the paper abstract and decides
@@ -109,22 +164,36 @@ Respond ONLY with a JSON object (no markdown, no explanation outside JSON):
   "notes": "any discrepancy between GEO metadata and abstract, or empty string"
 }
 
-Decision rules for `keep`:
-- keep=true  if the dataset matches BOTH the requested cancer type AND the requested sample type
-- keep=true  if the abstract is unavailable or uninformative — give benefit of the doubt
+Decision rules for `keep` — evaluate in ORDER, stop at the first matching rule:
+
+RULE 1 (HARD REJECT — highest priority, no exceptions):
+- keep=false if the dataset is cell lines / organoids / in-vitro models
+    * This applies regardless of cancer type match or any other factor
+    * Triggered when: GEO sample type is "cell_line", OR abstract mentions "cell line", "cell culture",
+      "organoid", "in vitro", "in-vitro", "cultured cells" as the primary biological material
+    * Example: "colon cancer cell lines HCT116 and SW480" → keep=false even if cancer type matches
+
+RULE 2 (HARD REJECT — data type mismatch):
+- keep=false if the data is NOT DNA methylation
+    * e.g. abstract confirms RNA-seq, proteomics, ChIP-seq, ATAC-seq, WGS (non-bisulfite)
+
+RULE 3 (HARD REJECT — cancer type mismatch):
 - keep=false if the dataset cancer type clearly does NOT match the requested cancer type
-    * e.g. requested colorectal cancer but dataset is lung cancer / breast cancer / etc.
-    * Minor subtype differences are acceptable (e.g. requested "colorectal cancer", dataset is "colon adenocarcinoma")
-    * keep=true if requested cancer type is null/unknown
+    * e.g. requested colorectal cancer but dataset is lung cancer / breast cancer / leukemia
+    * Minor subtype differences are acceptable (e.g. "colon adenocarcinoma" ≈ "colorectal cancer")
+    * Skip this rule if requested cancer type is null/unknown
+
+RULE 4 (HARD REJECT — sample type mismatch):
 - keep=false if the dataset sample type clearly does NOT match the requested sample type
-    * e.g. requested cfDNA/plasma but dataset is tumor tissue only (no liquid biopsy component)
-    * e.g. requested tumor tissue but dataset is cell lines only
-    * keep=true if requested sample type is null/unknown
-- keep=false if the abstract clearly contradicts the GEO metadata in a fundamental way:
-    * Abstract confirms the dataset is cell lines / organoids / in-vitro only
-    * Abstract confirms the data is NOT methylation (e.g. RNA-seq, proteomics)
-    * GEO metadata and abstract describe completely different experiments
-- When in doubt, keep=true (conservative — prefer false positives over false negatives)
+    * e.g. requested cfDNA/plasma but dataset is tumor tissue only (abstract confirms no liquid biopsy)
+    * e.g. requested cfDNA/plasma but dataset is WBC / whole blood only
+    * Skip this rule if requested sample type is null/unknown
+
+RULE 5 (DEFAULT — only if none of the above triggered):
+- keep=true if none of rules 1-4 triggered
+- keep=true if the abstract is unavailable or uninformative (benefit of the doubt)
+- When genuinely uncertain about rules 3 or 4, keep=true is acceptable
+- Rules 1 and 2 are never uncertain — cell lines and non-methylation data are always keep=false
 
 Rules for other fields:
 - confirmed_sample_type: use the abstract's description of biological material
@@ -309,23 +378,21 @@ class DatabaseAgent:
         """
         Search GEO using the parsed intent.
 
-        Pipeline:
-          1. Build NCBI E-utilities query string (methylation platform filters included)
-          2. esearch → GSE UID list
-          3. filter_methylation_datasets() → platform/year filter + batch esummary
-          4. Inject cancer_type from intent (GEO metadata doesn't carry it)
-          5. _pubmed_verify_datasets_concurrent() — PRIMARY filter:
-               - Every GSE fetches its linked PubMed abstract (NCBI efetch)
-               - LLM cross-checks GEO summary/design vs abstract
-               - Returns keep=True/False + corrected fields
-               - Datasets with no PMID: kept by default (conservative)
+        Two-step filtering pipeline:
+          1. esearch → GSE UID list (NCBI E-utilities keyword search)
+          2. filter_methylation_datasets() → platform/year filter + batch esummary
+          3. Inject cancer_type from intent
+          4. Step 1 — GEO metadata screening (_geo_screen_datasets_concurrent):
+               - LLM reads title/summary/overall_design vs intent
+               - Drops obvious mismatches (cell lines, wrong cancer, wrong sample type)
+               - No NCBI API calls needed; cheap and fast
+          5. Step 2 — PubMed cross-verification (_pubmed_verify_datasets_concurrent):
+               - Has PMID  → fetch abstract + LLM verify; paper takes priority over GEO metadata
+               - No PMID   → adopt Step 1 screen_keep decision; mark no_pubmed_link
+               - No abstract → adopt Step 1 screen_keep decision; mark abstract_unavailable
         """
         from tools.parser_tools import build_geo_search_string
 
-        # Always use build_geo_search_string to ensure methylation platform filters
-        # (GPL13534/GPL21145/etc.) are included. LLM-provided geo_search_query is
-        # intentionally ignored here because it typically omits GPL filters, causing
-        # the search to return RNA-seq and other non-methylation datasets.
         search_query = build_geo_search_string(intent)
         if not search_query:
             return []
@@ -347,7 +414,6 @@ class DatabaseAgent:
             )
 
             # Inject cancer_type from intent into each GEO record
-            # (GEO metadata doesn't carry cancer type; we infer it from the search intent)
             ct = intent.get("cancer_type")
             if ct:
                 cancer_label = ct.get("display") if isinstance(ct, dict) else str(ct)
@@ -360,11 +426,17 @@ class DatabaseAgent:
                     if not d.get("cancer_type"):
                         d["cancer_type"] = cancer_label
 
-            # PubMed cross-verification — PRIMARY filter.
-            # Every GSE fetches its linked PubMed abstract and the LLM checks
-            # whether the GEO summary/design is consistent with the paper.
-            # Datasets that pass (keep=True) are returned; others are logged and dropped.
+            logger.info(f"GEO: {len(datasets)} datasets after platform/year filter")
+
+            # ---- Step 1: GEO metadata screening (no NCBI calls, LLM only) ----
+            datasets = self._geo_screen_datasets_concurrent(datasets, intent=intent)
+            logger.info(f"GEO: {len(datasets)} datasets after Step 1 metadata screen")
+
+            # ---- Step 2: PubMed cross-verification ----
+            # Has PMID  → fetch abstract + LLM verify (paper takes priority)
+            # No PMID   → adopt Step 1 screen_keep; mark no_pubmed_link
             datasets = self._pubmed_verify_datasets_concurrent(datasets, intent=intent)
+            logger.info(f"GEO: {len(datasets)} datasets after Step 2 PubMed verify")
 
             return datasets
         except Exception as e:
@@ -562,7 +634,148 @@ class DatabaseAgent:
         return kept
 
     # ------------------------------------------------------------------ #
-    #  PubMed cross-verification — PRIMARY GEO filter                     #
+    #  Step 1: GEO metadata screening (no PubMed needed)                  #
+    # ------------------------------------------------------------------ #
+
+    def _geo_screen_dataset(self, ds: Dict[str, Any], intent: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        Step 1 filter: screen a GEO dataset using ONLY its metadata
+        (title, summary, overall_design) against the user intent.
+
+        No NCBI API calls needed — uses only fields already fetched by
+        filter_methylation_datasets(). Cheap and fast.
+
+        Returns ds enriched with:
+          screen_keep  (bool)  — False → drop before PubMed verification
+          screen_reason (str)  — one-sentence explanation
+          detected_sample_type (str)
+          detected_cancer_type (str)
+        """
+        import json as _json
+
+        acc = ds.get("accession", "?")
+
+        # ---- Build intent block ----
+        intent_lines = []
+        if intent:
+            ct = intent.get("cancer_type")
+            ct_label = (ct.get("display") if isinstance(ct, dict) else str(ct)) if ct else                        intent.get("cancer_type_display") or "not specified"
+            intent_lines.append(f"Requested cancer type: {ct_label}")
+
+            sample_types = intent.get("sample_types") or []
+            primary_st = intent.get("sample_type") or ""
+            if sample_types:
+                intent_lines.append(f"Requested sample type(s): {primary_st} (all: {sample_types})")
+            elif primary_st:
+                intent_lines.append(f"Requested sample type: {primary_st}")
+            else:
+                intent_lines.append("Requested sample type: not specified")
+
+            platform_req = intent.get("platform") or "not specified"
+            intent_lines.append(f"Requested platform: {platform_req}")
+
+            detail = intent.get("sample_type_detail") or ""
+            if detail:
+                intent_lines.append(f"Sample type detail: {detail}")
+
+        intent_block = "\n".join(intent_lines) if intent_lines else "not specified"
+
+        user_msg = (
+            f"=== USER REQUEST ===\n"
+            f"{intent_block}\n\n"
+            f"=== GEO DATASET METADATA ===\n"
+            f"GEO Accession: {acc}\n"
+            f"Title: {ds.get('title', '')[:200]}\n"
+            f"Summary: {ds.get('summary', '')[:500]}\n"
+            f"Overall Design: {ds.get('overall_design', '')[:400]}\n"
+            f"Platform: {ds.get('platform_canonical') or ds.get('platforms', [])}\n"
+            f"Sample count (GEO): {ds.get('sample_count')}\n"
+        )
+
+        try:
+            response = self.llm.invoke([
+                SystemMessage(content=LLM_SCREEN_SYSTEM_PROMPT),
+                HumanMessage(content=user_msg),
+            ])
+            raw = response.content.strip()
+            if raw.startswith("```"):
+                raw = re.sub(r"^```[a-z]*\n?", "", raw)
+                raw = re.sub(r"\n?```$", "", raw)
+            v = _json.loads(raw)
+
+            updated = dict(ds)
+            updated["screen_keep"] = bool(v.get("keep", True))
+            updated["screen_reason"] = v.get("reason", "")
+            if v.get("detected_sample_type"):
+                updated["detected_sample_type"] = v["detected_sample_type"]
+            if v.get("detected_cancer_type"):
+                updated["detected_cancer_type"] = v["detected_cancer_type"]
+
+            logger.info(
+                f"geo_screen {acc}: keep={updated['screen_keep']} "
+                f"cancer={v.get('detected_cancer_type','?')} "
+                f"sample={v.get('detected_sample_type','?')} "
+                f"reason={v.get('reason','')[:80]}"
+            )
+            return updated
+
+        except Exception as e:
+            logger.warning(f"geo_screen {acc}: LLM/parse error — {e} — keeping (conservative)")
+            return {**ds, "screen_keep": True, "screen_reason": f"screen_error: {e}"}
+
+    def _geo_screen_datasets_concurrent(
+        self,
+        datasets: List[Dict[str, Any]],
+        max_concurrent: int = 5,
+        intent: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Run Step 1 GEO metadata screening on all datasets concurrently.
+        Drops datasets where screen_keep=False before PubMed verification.
+        """
+        if not datasets:
+            return datasets
+
+        sem = asyncio.Semaphore(max_concurrent)
+
+        async def _screen_one_async(ds: Dict[str, Any]) -> Dict[str, Any]:
+            async with sem:
+                loop = asyncio.get_event_loop()
+                return await loop.run_in_executor(
+                    None, self._geo_screen_dataset, ds, intent
+                )
+
+        async def _run_all() -> List[Dict[str, Any]]:
+            tasks = [_screen_one_async(ds) for ds in datasets]
+            return await asyncio.gather(*tasks)
+
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures as _cf
+                with _cf.ThreadPoolExecutor() as pool:
+                    future = pool.submit(asyncio.run, _run_all())
+                    screened = future.result()
+            else:
+                screened = loop.run_until_complete(_run_all())
+        except RuntimeError:
+            screened = asyncio.run(_run_all())
+
+        kept = [d for d in screened if d.get("screen_keep", True)]
+        rejected = [d for d in screened if not d.get("screen_keep", True)]
+
+        logger.info(
+            f"geo_screen (Step 1): {len(kept)}/{len(datasets)} passed, "
+            f"{len(rejected)} rejected"
+        )
+        for d in rejected:
+            logger.info(
+                f"  Step1-rejected {d.get('accession','?')}: {d.get('screen_reason','')[:80]}"
+            )
+        return kept
+
+    # ------------------------------------------------------------------ #
+    #  Step 2: PubMed cross-verification                                  #
     # ------------------------------------------------------------------ #
 
     def _pubmed_verify_dataset(self, ds: Dict[str, Any], intent: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -604,28 +817,39 @@ class DatabaseAgent:
         acc = ds.get("accession", "?")
         pmids = ds.get("pubmed_ids", [])
 
-        # ---- No PMID: keep by default ----
+        # ---- No PMID: trust Step 1 screen result, mark no_pubmed_link ----
         if not pmids:
-            logger.debug(f"pubmed_verify {acc}: no PMID — keeping (conservative)")
+            # Step 1 already ran on GEO metadata; adopt its keep decision.
+            # screen_keep=True means Step 1 found no obvious mismatch.
+            screen_keep = ds.get("screen_keep", True)
             existing_notes = ds.get("notes") or ""
+            note_tag = "no_pubmed_link"
+            logger.info(
+                f"pubmed_verify {acc}: no PMID — "
+                f"adopting Step1 screen_keep={screen_keep} ({ds.get('screen_reason','')[:60]})"
+            )
             return {
                 **ds,
                 "pubmed_verified": False,
-                "pubmed_keep": True,
-                "notes": (existing_notes + "; no_pubmed_link").lstrip("; "),
+                "pubmed_keep": screen_keep,
+                "notes": (existing_notes + f"; {note_tag}").lstrip("; "),
             }
 
         pmid = str(pmids[0])
         abstract = self.geo_client.fetch_pubmed_abstract(pmid)
 
-        # ---- Abstract unavailable: keep by default ----
+        # ---- Abstract unavailable: trust Step 1 screen result ----
         if not abstract:
-            logger.debug(f"pubmed_verify {acc}: abstract unavailable for PMID {pmid} — keeping")
+            screen_keep = ds.get("screen_keep", True)
             existing_notes = ds.get("notes") or ""
+            logger.info(
+                f"pubmed_verify {acc}: abstract unavailable (PMID={pmid}) — "
+                f"adopting Step1 screen_keep={screen_keep}"
+            )
             return {
                 **ds,
                 "pubmed_verified": False,
-                "pubmed_keep": True,
+                "pubmed_keep": screen_keep,
                 "notes": (existing_notes + f"; abstract_unavailable(PMID={pmid})").lstrip("; "),
             }
 
