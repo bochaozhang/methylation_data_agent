@@ -663,6 +663,27 @@ class Registry:
                     "datasets_skipped": cur_datasets.rowcount,
                 }
 
+    def retry_failed_datasets(self) -> int:
+        """
+        Reset all failed dataset downloads back to 'pending' so the
+        agent daemon will pick them up on the next poll.
+
+        Returns:
+            Number of datasets reset to pending.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            with self._get_conn() as conn:
+                cur = conn.execute(
+                    """
+                    UPDATE datasets
+                    SET download_status = 'pending', updated_at = ?
+                    WHERE download_status = 'failed'
+                    """,
+                    (now,),
+                )
+                return cur.rowcount
+
     def get_task(self, task_id: str) -> Optional[Dict]:
         """Return a single task record as a dict, or None."""
         with self._get_conn() as conn:
