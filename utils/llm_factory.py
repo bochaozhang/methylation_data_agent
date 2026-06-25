@@ -9,6 +9,8 @@ Environment variables (all optional, override settings.yaml values):
                         Default: https://api.openai.com/v1
     OPENAI_MODEL        Model name override (e.g. gpt-4o-mini, deepseek-chat)
     ZHIPU_API_KEY       API key for ZhipuAI (https://open.bigmodel.cn)
+    DEEPSEEK_API_KEY    API key for DeepSeek (https://platform.deepseek.com)
+    DEEPSEEK_MODEL      DeepSeek model name (default: deepseek-chat)
     ZHIPU_MODEL         ZhipuAI model name (default: glm-4-flash)
     ANTHROPIC_API_KEY   API key for Anthropic
     ANTHROPIC_MODEL     Model name override for Anthropic
@@ -41,6 +43,7 @@ def get_llm(config: Dict[str, Any]) -> BaseChatModel:
         zhipu     — ZhipuAI GLM series (explicit backend, handles auth header correctly)
         anthropic — Anthropic Claude
         ollama    — Local Ollama
+        deepseek  — DeepSeek (OpenAI-compatible, https://platform.deepseek.com)
 
     Args:
         config: The 'llm' section of settings.yaml, e.g.:
@@ -196,8 +199,43 @@ def get_llm(config: Dict[str, Any]) -> BaseChatModel:
             temperature=temperature,
         )
 
+    # ------------------------------------------------------------------ #
+    #  DeepSeek (OpenAI-compatible)                                       #
+    # ------------------------------------------------------------------ #
+    elif backend == "deepseek":
+        from langchain_openai import ChatOpenAI
+
+        _DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1"
+
+        api_key = (
+            os.environ.get("DEEPSEEK_API_KEY")
+            or os.environ.get(api_key_env)
+            or ""
+        )
+        if not api_key:
+            raise ValueError(
+                "DeepSeek API key not found. "
+                "Set DEEPSEEK_API_KEY in your .env file. "
+                "Get a key at: https://platform.deepseek.com"
+            )
+
+        model = (
+            os.environ.get("DEEPSEEK_MODEL")
+            or os.environ.get("OPENAI_MODEL")
+            or config.get("model")
+            or "deepseek-chat"
+        )
+
+        return ChatOpenAI(
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            api_key=api_key,
+            base_url=_DEEPSEEK_BASE_URL,
+        )
+
     else:
         raise ValueError(
             f"Unsupported LLM backend: '{backend}'. "
-            "Choose from: openai, zhipu, anthropic, ollama"
+            "Choose from: openai, zhipu, anthropic, ollama, deepseek"
         )
