@@ -45,7 +45,8 @@ class Registry:
     """
 
     # Valid download status values
-    STATUS_PENDING = "pending"
+    STATUS_AWAITING_APPROVAL = "awaiting_approval"  # found by agent, waiting for human confirmation
+    STATUS_PENDING = "pending"       # approved, queued for download
     STATUS_DOWNLOADING = "downloading"
     STATUS_DONE = "done"
     STATUS_FAILED = "failed"
@@ -414,6 +415,54 @@ class Registry:
                 "SELECT * FROM datasets WHERE needs_review = 1 ORDER BY created_at"
             ).fetchall()
             return [dict(r) for r in rows]
+
+    def get_awaiting_approval(self) -> List[Dict]:
+        """Return all datasets awaiting human download approval."""
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                "SELECT * FROM datasets WHERE download_status = 'awaiting_approval' ORDER BY created_at"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def approve_downloads(self, approved_accessions: List[str]) -> Dict[str, int]:
+        """
+        Confirm download for the given accessions.
+
+        - approved_accessions → download_status = 'pending'
+        - all other 'awaiting_approval' records NOT in the list → 'skipped'
+
+        Returns dict with keys "approved" and "skipped".
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            with self._get_conn() as conn:
+                approved_count = 0
+                skipped_count = 0
+                if approved_accessions:
+                    placeholders = ",".join("?" * len(approved_accessions))
+                    cur = conn.execute(
+                        f"UPDATE datasets SET download_status = 'pending', updated_at = ? "
+                        f"WHERE accession IN ({placeholders}) AND download_status = 'awaiting_approval'",
+                        [now] + list(approved_accessions),
+                    )
+                    approved_count = cur.rowcount
+                # Skip all remaining awaiting_approval records not in the approved list
+                if approved_accessions:
+                    placeholders = ",".join("?" * len(approved_accessions))
+                    cur2 = conn.execute(
+                        f"UPDATE datasets SET download_status = 'skipped', updated_at = ? "
+                        f"WHERE download_status = 'awaiting_approval' AND accession NOT IN ({placeholders})",
+                        [now] + list(approved_accessions),
+                    )
+                else:
+                    # No accessions approved → skip all awaiting
+                    cur2 = conn.execute(
+                        "UPDATE datasets SET download_status = 'skipped', updated_at = ? "
+                        "WHERE download_status = 'awaiting_approval'",
+                        (now,),
+                    )
+                skipped_count = cur2.rowcount
+                return {"approved": approved_count, "skipped": skipped_count}
 
     def get_accession_set(self) -> set:
         """Return the set of all registered accessions (fast dedup check)."""

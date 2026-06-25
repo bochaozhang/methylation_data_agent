@@ -145,3 +145,41 @@ class RetryFailedResponse(BaseModel):
     """POST /datasets/retry-failed — reset failed downloads to pending."""
     datasets_reset: int
     message: str
+
+
+class ApprovalItem(BaseModel):
+    """Single dataset awaiting human download approval."""
+    accession: str
+    source: str
+    title: Optional[str] = None
+    cancer_type: Optional[str] = None
+    platform: Optional[str] = None
+    sample_count: Optional[int] = None
+    year: Optional[int] = None
+    sample_type: Optional[str] = None
+    paper_pmid: Optional[str] = None
+    no_pubmed_link: bool = False
+    notes: Optional[str] = None
+    created_at: str
+
+
+class ApprovalListResponse(BaseModel):
+    """GET /datasets/awaiting-approval — list of datasets pending human confirmation."""
+    items: List[ApprovalItem]
+    total: int
+
+
+class ApprovalRequest(BaseModel):
+    """POST /datasets/approve — accessions the user has chosen to download."""
+    approved: List[str] = Field(
+        default=[],
+        description="List of accession IDs to approve for download. "
+                    "All other awaiting_approval datasets will be skipped.",
+    )
+
+
+class ApprovalResponse(BaseModel):
+    """POST /datasets/approve — result of the approval action."""
+    approved_count: int
+    skipped_count: int
+    message: str

@@ -223,6 +223,87 @@ def run_literature_agent(query: str, registry: Registry) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Pending-download execution loop (database agent only)
+# ---------------------------------------------------------------------------
+
+def run_pending_downloads(registry: Registry) -> None:
+    """
+    Scan the registry for datasets with download_status='pending' and
+    execute their downloads.  Called at the end of every daemon poll cycle
+    (database agent only).
+
+    This handles two cases:
+      1. Datasets approved by the user via POST /datasets/approve
+      2. Failed datasets reset to 'pending' via POST /datasets/retry-failed
+    """
+    pending = registry.get_all(status="pending")
+    if not pending:
+        return
+
+    logger.info(f"[download] Found {len(pending)} pending dataset(s) — starting downloads")
+
+    try:
+        from tools.download_tools import DownloadEngine, build_geo_download_tasks, build_tcga_download_tasks
+        config = load_config()
+        downloader = DownloadEngine(config=config)
+    except Exception as exc:
+        logger.error(f"[download] Failed to initialise DownloadEngine: {exc}")
+        return
+
+    # Build download tasks for all pending datasets
+    download_tasks = []
+    for ds in pending:
+        acc = ds["accession"]
+        registry.update_status(acc, "downloading")
+        try:
+            if ds.get("source") == "TCGA":
+                tasks = build_tcga_download_tasks(
+                    ds,
+                    config["download"]["output_dir"],
+                    config["tcga"]["gdc_api_base"],
+                )
+            else:
+                tasks = build_geo_download_tasks(ds, config["download"]["output_dir"])
+            download_tasks.extend(tasks)
+        except Exception as exc:
+            logger.error(f"[download] Failed to build tasks for {acc}: {exc}")
+            registry.update_status(acc, "failed")
+            registry.log_event(acc, "error", f"Task build failed: {exc}")
+
+    if not download_tasks:
+        return
+
+    # Execute downloads
+    try:
+        results = downloader.download_many_sync(download_tasks)
+    except Exception as exc:
+        logger.error(f"[download] download_many_sync raised: {exc}")
+        for ds in pending:
+            registry.update_status(ds["accession"], "failed")
+            registry.log_event(ds["accession"], "error", f"Download engine error: {exc}")
+        return
+
+    # Aggregate results by accession
+    acc_results: dict = {}
+    for r in results:
+        acc_results.setdefault(r["accession"], []).append(r)
+
+    for acc, acc_res in acc_results.items():
+        all_done = all(r["status"] == "done" for r in acc_res)
+        if all_done:
+            local_path = acc_res[0]["local_path"]
+            file_size = sum(r.get("file_size_bytes", 0) for r in acc_res)
+            registry.update_status(acc, "done", local_path=str(local_path), file_size_bytes=file_size)
+            registry.log_event(acc, "done", f"Downloaded {len(acc_res)} file(s)")
+            logger.info(f"[download] {acc} — done ({file_size} bytes)")
+        else:
+            error_msgs = [r.get("error", "") for r in acc_res if r["status"] == "failed"]
+            registry.update_status(acc, "failed")
+            registry.log_event(acc, "error", "; ".join(error_msgs))
+            logger.warning(f"[download] {acc} — failed: {error_msgs}")
+
+
+# ---------------------------------------------------------------------------
 # Main daemon loop
 # ---------------------------------------------------------------------------
 
@@ -259,7 +340,12 @@ def daemon_loop(agent_type: str, registry: Registry):
             continue
 
         if task is None:
-            # No pending tasks — sleep and poll again
+            # No pending tasks — check for approved downloads, then sleep
+            if agent_type == "database":
+                try:
+                    run_pending_downloads(registry)
+                except Exception as dl_exc:
+                    logger.error(f"[download] Error in idle download poll: {dl_exc}")
             time.sleep(POLL_INTERVAL)
             continue
 
@@ -276,6 +362,14 @@ def daemon_loop(agent_type: str, registry: Registry):
             error_msg = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
             registry.fail_task(task_id, error=error_msg)
             logger.error(f"Task {task_id} failed: {exc}")
+
+        # ---- Download pending datasets (database agent only) ----
+        # Picks up datasets approved via Web UI or reset via retry-failed.
+        if agent_type == "database":
+            try:
+                run_pending_downloads(registry)
+            except Exception as dl_exc:
+                logger.error(f"[download] Unexpected error in run_pending_downloads: {dl_exc}")
 
     logger.info(f"Daemon {agent_type!r} shut down cleanly.")
 

@@ -26,11 +26,6 @@ from langchain_core.tools import tool
 
 from registry.registry import Registry
 from state.graph_state import MethyAgentState
-from tools.download_tools import (
-    DownloadEngine,
-    build_geo_download_tasks,
-    build_tcga_download_tasks,
-)
 from tools.geo_tools import GEOClient
 from tools.parser_tools import SAMPLE_TYPE_RELATED, TCGA_CODE_TO_ENGLISH
 from tools.tcga_tools import GDCClient
@@ -228,14 +223,6 @@ class DatabaseAgent:
         gdc_token = os.environ.get(config["tcga"].get("gdc_token_env", ""), "")
         self.gdc_client = GDCClient(token=gdc_token or None)
 
-        self.downloader = DownloadEngine(
-            output_dir=config["download"]["output_dir"],
-            max_concurrent=config["download"]["max_concurrent"],
-            retry_attempts=config["download"]["retry_attempts"],
-            retry_delay=config["download"]["retry_delay"],
-            chunk_size_mb=config["download"]["chunk_size_mb"],
-            timeout=config["download"]["timeout"],
-        )
 
     # ------------------------------------------------------------------ #
     #  LangGraph node entry point                                          #
@@ -289,12 +276,13 @@ class DatabaseAgent:
 
         logger.info(f"New datasets to download: {len(new_candidates)} (skipped {len(skipped)})")
 
-        # ---- Step 4: Register and download ----
-        download_tasks = []
+        # ---- Step 4: Register as awaiting_approval ----
+        # Downloads are NOT triggered here. Datasets are queued for human
+        # approval in the Web UI. The daemon download loop picks them up
+        # after the user confirms via POST /datasets/approve.
+        queued = []
         for c in new_candidates:
             acc = c["accession"]
-            # Register with pending status
-            # Determine no_pubmed_link flag from verification result
             _notes = c.get("notes") or ""
             _no_pubmed = "no_pubmed_link" in _notes
             self.registry.upsert_dataset(
@@ -311,66 +299,24 @@ class DatabaseAgent:
                 paper_pmid=c.get("paper_pmid"),
                 notes=c.get("notes"),
                 no_pubmed_link=_no_pubmed,
-                download_status="pending",
+                download_status="awaiting_approval",
             )
-            self.registry.log_event(acc, "start", f"Registered by DatabaseAgent")
-
-            # Build download tasks
-            if c.get("source") == "TCGA":
-                tasks = build_tcga_download_tasks(
-                    c,
-                    self.config["download"]["output_dir"],
-                    self.config["tcga"]["gdc_api_base"],
-                )
-            else:
-                tasks = build_geo_download_tasks(c, self.config["download"]["output_dir"])
-
-            download_tasks.extend(tasks)
-
-        # ---- Step 5: Execute downloads ----
-        if download_tasks:
-            self.registry.update_status(
-                download_tasks[0]["accession"], "downloading"
+            self.registry.log_event(
+                acc, "queued",
+                "Registered by DatabaseAgent — awaiting human approval to download"
             )
-            results = self.downloader.download_many_sync(download_tasks)
+            queued.append(acc)
 
-            # Aggregate results by accession
-            acc_results: Dict[str, List] = {}
-            for r in results:
-                acc = r["accession"]
-                acc_results.setdefault(acc, []).append(r)
-
-            for acc, acc_res in acc_results.items():
-                all_done = all(r["status"] == "done" for r in acc_res)
-                any_done = any(r["status"] == "done" for r in acc_res)
-
-                if all_done:
-                    local_path = acc_res[0]["local_path"]
-                    file_size = sum(r.get("file_size_bytes", 0) for r in acc_res)
-                    self.registry.update_status(
-                        acc, "done",
-                        local_path=str(local_path),
-                        file_size_bytes=file_size,
-                    )
-                    self.registry.log_event(acc, "done", f"Downloaded {len(acc_res)} files")
-                    downloaded.append(acc)
-                else:
-                    error_msgs = [r.get("error", "") for r in acc_res if r["status"] == "failed"]
-                    self.registry.update_status(acc, "failed")
-                    self.registry.log_event(acc, "error", "; ".join(error_msgs))
-                    failed.append(acc)
-                    errors.append(f"DatabaseAgent: {acc} failed: {'; '.join(error_msgs)}")
-
-        # ---- Step 6: LLM summary message ----
+        # ---- Step 5: Summary message ----
         summary_msg = self._generate_summary_message(
-            candidates, new_candidates, downloaded, failed, skipped
+            candidates, new_candidates, queued, skipped
         )
 
         return {
             **state,
             "db_candidates": candidates,
-            "db_downloaded": downloaded,
-            "db_failed": failed,
+            "db_downloaded": [],
+            "db_failed": [],
             "db_skipped": skipped,
             "error_log": errors,
             "messages": [AIMessage(content=summary_msg, name="DatabaseAgent")],
@@ -1152,8 +1098,7 @@ class DatabaseAgent:
         self,
         candidates: List,
         new_candidates: List,
-        downloaded: List,
-        failed: List,
+        queued: List,
         skipped: List,
     ) -> str:
         return (
@@ -1162,9 +1107,7 @@ class DatabaseAgent:
             f"(GEO: {sum(1 for c in candidates if c.get('source') == 'GEO')}, "
             f"TCGA: {sum(1 for c in candidates if c.get('source') == 'TCGA')})\n"
             f"  Already in registry (skipped): {len(skipped)}\n"
-            f"  New datasets registered: {len(new_candidates)}\n"
-            f"  Successfully downloaded: {len(downloaded)}\n"
-            f"  Failed: {len(failed)}\n"
-            f"  Downloaded accessions: {downloaded}\n"
-            f"  Failed accessions: {failed}"
+            f"  New datasets queued for approval: {len(queued)}\n"
+            f"  Queued accessions: {queued}\n"
+            f"  (Datasets will be downloaded after human approval in Web UI)"
         )

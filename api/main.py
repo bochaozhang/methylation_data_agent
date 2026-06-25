@@ -49,6 +49,10 @@ from api.models import (  # noqa: E402
     CancelTaskResponse,
     CancelAllResponse,
     RetryFailedResponse,
+    ApprovalItem,
+    ApprovalListResponse,
+    ApprovalRequest,
+    ApprovalResponse,
 )
 
 # ---------------------------------------------------------------------------
@@ -352,6 +356,57 @@ async def cancel_task(task_id: str):
         task_id=task_id,
         cancelled=cancelled,
         message="Task cancelled." if cancelled else "Task could not be cancelled (may have just started running).",
+    )
+
+
+@app.get("/datasets/awaiting-approval", response_model=ApprovalListResponse)
+async def list_awaiting_approval():
+    """
+    Return all datasets discovered by the agent that are waiting for
+    human confirmation before downloading.
+    """
+    registry = get_registry()
+    items = registry.get_awaiting_approval()
+    return ApprovalListResponse(
+        items=[
+            ApprovalItem(
+                accession=d["accession"],
+                source=d["source"],
+                title=d.get("title"),
+                cancer_type=d.get("cancer_type"),
+                platform=d.get("platform"),
+                sample_count=d.get("sample_count"),
+                year=d.get("year"),
+                sample_type=d.get("sample_type"),
+                paper_pmid=d.get("paper_pmid"),
+                no_pubmed_link=bool(d.get("no_pubmed_link", 0)),
+                notes=d.get("notes"),
+                created_at=d["created_at"],
+            )
+            for d in items
+        ],
+        total=len(items),
+    )
+
+
+@app.post("/datasets/approve", response_model=ApprovalResponse)
+async def approve_downloads(body: ApprovalRequest):
+    """
+    Confirm download for the selected datasets.
+
+    - Accessions in `approved` → download_status = 'pending' (daemon picks up)
+    - All other awaiting_approval datasets NOT in the list → 'skipped'
+    """
+    registry = get_registry()
+    result = registry.approve_downloads(body.approved)
+    return ApprovalResponse(
+        approved_count=result["approved"],
+        skipped_count=result["skipped"],
+        message=(
+            f"Approved {result['approved']} dataset(s) for download. "
+            f"Skipped {result['skipped']} dataset(s). "
+            f"The agent daemon will start downloading shortly."
+        ),
     )
 
 
