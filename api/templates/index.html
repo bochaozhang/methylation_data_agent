@@ -743,7 +743,16 @@ async function retryFailed() {
   btn.textContent = '处理中...';
   try {
     const r = await fetch('/datasets/retry-failed', { method: 'POST' });
-    const d = await r.json();
+    // Guard: parse JSON safely — server may return plain text on 404/500
+    let d = null;
+    const ct = r.headers.get('content-type') || '';
+    if (ct.includes('application/json')) {
+      d = await r.json();
+    } else {
+      const txt = await r.text();
+      alert('服务器错误 (' + r.status + '): ' + txt.slice(0, 200));
+      return;
+    }
     if (r.ok) {
       if (d.datasets_reset === 0) {
         alert('没有失败的下载任务。');
@@ -752,7 +761,7 @@ async function retryFailed() {
         loadDatasets();
       }
     } else {
-      alert(d.detail || '请求失败');
+      alert(d.detail || '请求失败 (' + r.status + ')');
     }
   } catch(e) {
     alert('网络错误: ' + e.message);
