@@ -1,9 +1,13 @@
 llm:
-  # backend options: openai | zhipu | anthropic | ollama
+  # backend options: openai | zhipu | anthropic | ollama | deepseek
   #
   # For ZhipuAI (智谱), set backend: zhipu and configure .env:
   #   ZHIPU_API_KEY=your_key
   #   ZHIPU_MODEL=glm-4-flash        # or glm-4-air, glm-4, glm-4-long
+  #
+  # For DeepSeek, set backend: deepseek and configure .env:
+  #   DEEPSEEK_API_KEY=sk-...
+  #   DEEPSEEK_MODEL=deepseek-chat   # or deepseek-reasoner
   #
   # Alternatively, keep backend: openai and set in .env:
   #   OPENAI_API_KEY=your_zhipu_key
@@ -28,10 +32,11 @@ registry:
   db_path: ./registry/methyagent.db
 
 geo:
-  api_key_env: NCBI_API_KEY
+  api_key_env: NCBI_API_KEY   # optional, raises rate limit from 3 to 10 req/s
   base_url: https://eutils.ncbi.nlm.nih.gov/entrez/eutils
   ftp_base: ftp://ftp.ncbi.nlm.nih.gov/geo/series
-  proxy: socks5h://127.0.0.1:1080
+  proxy: ""                   # optional, e.g. "socks5h://127.0.0.1:1080" or "http://proxy:port"
+                              # env var NCBI_PROXY overrides this setting
 
 tcga:
   gdc_api_base: https://api.gdc.cancer.gov
