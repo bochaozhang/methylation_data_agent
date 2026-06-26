@@ -14,10 +14,14 @@ llm:
   #   OPENAI_BASE_URL=https://open.bigmodel.cn/api/paas/v4
   #   OPENAI_MODEL=glm-4-flash
   # (the factory auto-detects bigmodel.cn and applies correct auth)
-  backend: zhipu
-  model: glm-4-flash
-  api_key_env: ZHIPU_API_KEY
-  temperature: 0
+  backend: deepseek
+  # model and temperature are intentionally omitted here:
+  #   - model    → read from DEEPSEEK_MODEL env var at runtime
+  #                (deepseek-chat or deepseek-reasoner; default: deepseek-chat)
+  #   - temperature → auto-selected by llm_factory based on model:
+  #                   deepseek-chat     → 0  (deterministic)
+  #                   deepseek-reasoner → 1  (R1 requirement, fixed by API)
+  api_key_env: DEEPSEEK_API_KEY
   max_tokens: 4096
 
 download:

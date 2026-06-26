@@ -219,6 +219,7 @@ def get_llm(config: Dict[str, Any]) -> BaseChatModel:
                 "Get a key at: https://platform.deepseek.com"
             )
 
+        # Model: env var takes priority over settings.yaml
         model = (
             os.environ.get("DEEPSEEK_MODEL")
             or os.environ.get("OPENAI_MODEL")
@@ -226,13 +227,27 @@ def get_llm(config: Dict[str, Any]) -> BaseChatModel:
             or "deepseek-chat"
         )
 
-        return ChatOpenAI(
+        # Temperature: auto-select based on model
+        #   deepseek-reasoner (R1) — must use temperature=1, API rejects other values
+        #   deepseek-chat (V3)     — use 0 for deterministic output
+        #   settings.yaml temperature is ignored for deepseek to avoid misconfiguration
+        is_reasoner = "reasoner" in model.lower()
+        effective_temperature = 1 if is_reasoner else 0
+
+        kwargs: Dict[str, Any] = dict(
             model=model,
-            temperature=temperature,
-            max_tokens=max_tokens,
+            temperature=effective_temperature,
             api_key=api_key,
             base_url=_DEEPSEEK_BASE_URL,
         )
+        # deepseek-reasoner does not support max_tokens in the same way;
+        # use max_completion_tokens instead (passed via model_kwargs)
+        if is_reasoner:
+            kwargs["model_kwargs"] = {"max_completion_tokens": max_tokens}
+        else:
+            kwargs["max_tokens"] = max_tokens
+
+        return ChatOpenAI(**kwargs)
 
     else:
         raise ValueError(
