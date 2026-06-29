@@ -73,7 +73,7 @@ SAMPLE_GROUP_KEYWORDS: Dict[str, List[str]] = {
         "cell line", "organoid", "in vitro", "culture",
     ],
 }
-# Samples not matching any group above are assigned to "other"
+# Samples not matching any group above are assigned to "unknown"
 
 
 class GEOClient:
@@ -819,11 +819,11 @@ class GEOClient:
 
             # ---- Step 2: group by title keywords ----
             groups: Dict[str, List[Dict[str, str]]] = {
-                g: [] for g in list(SAMPLE_GROUP_KEYWORDS.keys()) + ["other"]
+                g: [] for g in list(SAMPLE_GROUP_KEYWORDS.keys()) + ["unknown"]
             }
             for s in all_samples:
                 title_lower = s["title"].lower()
-                assigned = "other"
+                assigned = "unknown"
                 for group_name, keywords in SAMPLE_GROUP_KEYWORDS.items():
                     if any(kw in title_lower for kw in keywords):
                         assigned = group_name
@@ -895,7 +895,7 @@ class GEOClient:
                         "retmode": "xml",
                     })
                     details = self._parse_gsm_miniml(gsm, fetch_resp.text)
-                    details["group"] = gsm_to_group.get(gsm, "other")
+                    details["group"] = gsm_to_group.get(gsm, "unknown")
                     results.append(details)
                 except Exception as e:
                     logger.debug(f"get_representative_gsm_details: efetch failed for {gsm}: {e}")
@@ -904,7 +904,7 @@ class GEOClient:
                         "source_name": "",
                         "molecule": "",
                         "characteristics": {},
-                        "group": gsm_to_group.get(gsm, "other"),
+                        "group": gsm_to_group.get(gsm, "unknown"),
                     })
 
             logger.info(
@@ -1038,11 +1038,11 @@ class GEOClient:
 
             # ---- Step 2: group by title keywords (for 'group' column) ----
             groups: Dict[str, List[Dict[str, str]]] = {
-                g: [] for g in list(SAMPLE_GROUP_KEYWORDS.keys()) + ["other"]
+                g: [] for g in list(SAMPLE_GROUP_KEYWORDS.keys()) + ["unknown"]
             }
             for s in all_samples:
                 title_lower = s["title"].lower()
-                assigned = "other"
+                assigned = "unknown"
                 for group_name, keywords in SAMPLE_GROUP_KEYWORDS.items():
                     if any(kw in title_lower for kw in keywords):
                         assigned = group_name
@@ -1066,7 +1066,7 @@ class GEOClient:
                         "retmode": "xml",
                     })
                     details = self._parse_gsm_miniml(gsm, fetch_resp.text)
-                    details["group"] = gsm_to_group.get(gsm, "other")
+                    details["group"] = gsm_to_group.get(gsm, "unknown")
                     results.append(details)
                 except Exception as e:
                     logger.debug(f"get_all_gsm_metadata: efetch failed for {gsm}: {e}")
@@ -1075,7 +1075,7 @@ class GEOClient:
                         "source_name": s.get("title", ""),
                         "molecule": "",
                         "characteristics": {},
-                        "group": gsm_to_group.get(gsm, "other"),
+                        "group": gsm_to_group.get(gsm, "unknown"),
                     })
 
             logger.info(
