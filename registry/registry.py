@@ -284,6 +284,7 @@ class Registry:
                             notes                   = COALESCE(?, notes),
                             no_pubmed_link          = COALESCE(?, no_pubmed_link),
                             sample_metadata_path    = COALESCE(?, sample_metadata_path),
+                            download_status         = ?,
                             updated_at              = ?
                         WHERE accession = ?
                         """,
@@ -296,6 +297,7 @@ class Registry:
                             reason, notes,
                             int(no_pubmed_link),
                             sample_metadata_path,
+                            download_status,
                             now, accession,
                         ),
                     )
