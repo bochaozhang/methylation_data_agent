@@ -220,6 +220,74 @@ async def list_datasets(
     )
 
 
+@app.get("/datasets/awaiting-approval", response_model=ApprovalListResponse)
+async def list_awaiting_approval():
+    """
+    Return all datasets discovered by the agent that are waiting for
+    human confirmation before downloading.
+    """
+    registry = get_registry()
+    items = registry.get_awaiting_approval()
+    return ApprovalListResponse(
+        items=[
+            ApprovalItem(
+                accession=d["accession"],
+                source=d["source"],
+                title=d.get("title"),
+                cancer_type=d.get("cancer_type"),
+                platform=d.get("platform"),
+                sample_count=d.get("sample_count"),
+                year=d.get("year"),
+                sample_type=d.get("sample_type"),
+                paper_pmid=d.get("paper_pmid"),
+                no_pubmed_link=bool(d.get("no_pubmed_link", 0)),
+                notes=d.get("notes"),
+                sample_metadata_path=d.get("sample_metadata_path"),
+                created_at=d["created_at"],
+            )
+            for d in items
+        ],
+        total=len(items),
+    )
+
+
+@app.post("/datasets/approve", response_model=ApprovalResponse)
+async def approve_downloads(body: ApprovalRequest):
+    """
+    Confirm download for the selected datasets.
+
+    - Accessions in `approved` → download_status = 'pending' (daemon picks up)
+    - All other awaiting_approval datasets NOT in the list → 'skipped'
+    """
+    registry = get_registry()
+    result = registry.approve_downloads(body.approved)
+    return ApprovalResponse(
+        approved_count=result["approved"],
+        skipped_count=result["skipped"],
+        message=(
+            f"Approved {result['approved']} dataset(s) for download. "
+            f"Skipped {result['skipped']} dataset(s). "
+            f"The agent daemon will start downloading shortly."
+        ),
+    )
+
+
+@app.post("/datasets/retry-failed", response_model=RetryFailedResponse)
+async def retry_failed_datasets():
+    """
+    Reset all failed dataset downloads back to pending.
+
+    The agent daemon will pick them up on the next poll cycle
+    (default every 5 seconds) and attempt to re-download.
+    """
+    registry = get_registry()
+    n = registry.retry_failed_datasets()
+    return RetryFailedResponse(
+        datasets_reset=n,
+        message=f"Reset {n} failed dataset(s) to pending. Agent will retry on next poll.",
+    )
+
+
 @app.get("/datasets/{accession}", response_model=DatasetResponse)
 async def get_dataset(accession: str):
     """Get a single dataset record by accession ID."""
@@ -356,74 +424,6 @@ async def cancel_task(task_id: str):
         task_id=task_id,
         cancelled=cancelled,
         message="Task cancelled." if cancelled else "Task could not be cancelled (may have just started running).",
-    )
-
-
-@app.get("/datasets/awaiting-approval", response_model=ApprovalListResponse)
-async def list_awaiting_approval():
-    """
-    Return all datasets discovered by the agent that are waiting for
-    human confirmation before downloading.
-    """
-    registry = get_registry()
-    items = registry.get_awaiting_approval()
-    return ApprovalListResponse(
-        items=[
-            ApprovalItem(
-                accession=d["accession"],
-                source=d["source"],
-                title=d.get("title"),
-                cancer_type=d.get("cancer_type"),
-                platform=d.get("platform"),
-                sample_count=d.get("sample_count"),
-                year=d.get("year"),
-                sample_type=d.get("sample_type"),
-                paper_pmid=d.get("paper_pmid"),
-                no_pubmed_link=bool(d.get("no_pubmed_link", 0)),
-                notes=d.get("notes"),
-                sample_metadata_path=d.get("sample_metadata_path"),
-                created_at=d["created_at"],
-            )
-            for d in items
-        ],
-        total=len(items),
-    )
-
-
-@app.post("/datasets/approve", response_model=ApprovalResponse)
-async def approve_downloads(body: ApprovalRequest):
-    """
-    Confirm download for the selected datasets.
-
-    - Accessions in `approved` → download_status = 'pending' (daemon picks up)
-    - All other awaiting_approval datasets NOT in the list → 'skipped'
-    """
-    registry = get_registry()
-    result = registry.approve_downloads(body.approved)
-    return ApprovalResponse(
-        approved_count=result["approved"],
-        skipped_count=result["skipped"],
-        message=(
-            f"Approved {result['approved']} dataset(s) for download. "
-            f"Skipped {result['skipped']} dataset(s). "
-            f"The agent daemon will start downloading shortly."
-        ),
-    )
-
-
-@app.post("/datasets/retry-failed", response_model=RetryFailedResponse)
-async def retry_failed_datasets():
-    """
-    Reset all failed dataset downloads back to pending.
-
-    The agent daemon will pick them up on the next poll cycle
-    (default every 5 seconds) and attempt to re-download.
-    """
-    registry = get_registry()
-    n = registry.retry_failed_datasets()
-    return RetryFailedResponse(
-        datasets_reset=n,
-        message=f"Reset {n} failed dataset(s) to pending. Agent will retry on next poll.",
     )
 
 
