@@ -233,7 +233,7 @@ LLM_DATASET_KEEP_SYSTEM_PROMPT = """You are a biomedical data curator specializi
 You will receive:
 1. The user's search intent (cancer type, sample type, query detail)
 2. GEO dataset summary (title, summary, overall_design)
-3. Sample-level statistics: how many samples were judged include vs exclude
+3. Sample-level statistics: include/exclude counts AND unknown-group counts
 
 Your task: decide the fate of this dataset based on the statistics and GEO summary.
 
@@ -245,12 +245,22 @@ Respond ONLY with a JSON object (no markdown, no explanation outside JSON):
 
 Decision rules — evaluate in ORDER, stop at the first matching rule:
 
+RULE 0 — dataset_keep="unsure" (unclassifiable sample types, must check literature):
+- unknown_fraction > 50% (more than half of samples could not be classified by title keywords)
+- Rationale: when most samples fall into the "unknown" group, the include/exclude statistics
+  are unreliable — all unknowns default to "include" conservatively, so a high include_fraction
+  is meaningless. The paper must be read to determine actual sample types.
+- Example: a dataset where all samples have generic titles like "Sample 1", "Sample 2" will
+  have unknown_fraction=100% and include_fraction=100%, but this tells us nothing about
+  whether the samples are plasma cfDNA, tissue, or something else entirely.
+
 RULE 1 — dataset_keep="false" (clear reject):
 - include_fraction is very low (< 5%) AND GEO summary confirms the dataset is not the requested type
 - e.g. requested cfDNA/plasma but >95% samples are tumor tissue and summary confirms tissue study
 
 RULE 2 — dataset_keep="true" (clear accept):
-- include_fraction is reasonably high (>= 20%) AND GEO summary is consistent with the request
+- include_fraction is reasonably high (>= 20%) AND unknown_fraction is low (<= 30%)
+  AND GEO summary is consistent with the request
 - e.g. requested cfDNA/plasma, 60% samples are plasma cfDNA, summary mentions liquid biopsy
 
 RULE 3 — dataset_keep="unsure" (needs PubMed confirmation):
@@ -690,7 +700,7 @@ class DatabaseAgent:
                 "gsm": g.get("gsm", ""),
                 "source_name": g.get("source_name", ""),
                 "molecule": g.get("molecule", ""),
-                "group": g.get("group", "other"),
+                "group": g.get("group", "unknown"),
             }
             for k, v in (g.get("characteristics") or {}).items():
                 row[k] = v
@@ -807,13 +817,21 @@ class DatabaseAgent:
         ds: Dict[str, Any],
         gsm_verdicts: List[Dict[str, Any]],
         intent: Dict[str, Any],
+        unknown_fraction: float = 0.0,
     ) -> Dict[str, Any]:
         """
         LLM Call 2: decide dataset_keep (true/false/unsure) based on
         include/exclude statistics + GEO summary.
 
-        Input: aggregated stats from gsm_verdicts + ds title/summary/overall_design.
-        Output: {"dataset_keep": "true"|"false"|"unsure", "reason": str}
+        Args:
+            ds:               Dataset dict (accession, title, summary, overall_design, …)
+            gsm_verdicts:     List of {gsm, include, reason} from _judge_all_gsms_concurrent()
+            intent:           Search intent dict
+            unknown_fraction: Fraction of samples in the "unknown" group (0.0–1.0).
+                              Computed from df["group"] in _sample_metadata_judge().
+
+        Returns:
+            {"dataset_keep": "true"|"false"|"unsure", "reason": str}
 
         On any error: returns dataset_keep="unsure" (conservative).
         """
@@ -833,6 +851,8 @@ class DatabaseAgent:
         detail = intent.get("sample_type_detail") or ""
         raw_query = intent.get("raw_query") or ""
 
+        n_unknown = round(unknown_fraction * n_total)
+
         user_msg = (
             f"=== USER REQUEST ===\n"
             f"Cancer type: {ct_label}\n"
@@ -848,6 +868,9 @@ class DatabaseAgent:
             f"Total samples: {n_total}\n"
             f"Include count: {n_include}  (include_fraction: {include_frac:.1%})\n"
             f"Exclude count: {n_exclude}  (exclude_fraction: {exclude_frac:.1%})\n"
+            f"Unknown-group count: {n_unknown}  (unknown_fraction: {unknown_fraction:.1%})\n"
+            f"  [unknown = samples whose title matched no known sample-type keywords;\n"
+            f"   these were conservatively counted as 'include' in Call 1]\n"
         )
 
         try:
@@ -899,7 +922,12 @@ class DatabaseAgent:
         acc = ds.get("accession", "?")
         data_dir = self.config.get("download", {}).get("output_dir", "/data")
         csv_path = Path(data_dir) / acc / "sample_metadata.csv"
-        query_col = (intent.get("raw_query") or "")[:80]
+        # Build query column name: use raw_query (truncated to 80 chars).
+        # Fall back to a timestamp-based name if raw_query is absent/empty,
+        # so the column is never an empty string (which silently disappears in CSV).
+        import datetime as _dt
+        _raw_q = (intent.get("raw_query") or "").strip()
+        query_col = _raw_q[:80] if _raw_q else f"query_{_dt.datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
         # ---- 1. Cache check ----
         if csv_path.exists():
@@ -914,13 +942,14 @@ class DatabaseAgent:
                         k: str(v) for k, v in row.items()
                         if k not in _fixed_cols
                         and str(v) != "nan"
-                        and len(k) <= 40  # skip old query cols (long names > 40 chars)
+                        and len(k) <= 30  # GEO characteristic keys are ≤30 chars;
+                                          # query cols (raw_query[:80]) are longer → excluded
                     }
                     gsm_list.append({
                         "gsm": str(row.get("gsm", "")),
                         "source_name": str(row.get("source_name", "")),
                         "molecule": str(row.get("molecule", "")),
-                        "group": str(row.get("group", "other")),
+                        "group": str(row.get("group", "unknown")),
                         "characteristics": ch,
                     })
                 logger.info(f"_sample_metadata_judge({acc}): reusing cached CSV ({len(gsm_list)} GSMs)")
@@ -941,6 +970,10 @@ class DatabaseAgent:
         gsm_verdicts = self._judge_all_gsms_concurrent(gsm_list, intent)
 
         # ---- 4. Write query column to CSV (full, no truncation) ----
+        # Safety check: query_col must be non-empty (fixed above, but guard anyway)
+        if not query_col:
+            import datetime as _dt2
+            query_col = f"query_{_dt2.datetime.now().strftime('%Y%m%d_%H%M%S')}"
         verdict_map = {v["gsm"]: v for v in gsm_verdicts}
         df[query_col] = df["gsm"].map(lambda g: (
             "include"
@@ -955,7 +988,18 @@ class DatabaseAgent:
             logger.warning(f"_sample_metadata_judge({acc}): CSV write failed: {e}")
 
         # ---- 5. LLM Call 2: dataset_keep ----
-        keep_verdict = self._judge_dataset_keep(ds, gsm_verdicts, intent)
+        # Compute unknown_fraction from df["group"] before calling LLM Call 2.
+        # "unknown" samples have no title keywords → their include/exclude verdict
+        # from Call 1 is unreliable (all default to include=True conservatively).
+        # A high unknown_fraction triggers RULE 0 → dataset_keep="unsure" → PubMed.
+        n_total_df = len(df)
+        n_unknown_df = int((df["group"] == "unknown").sum()) if "group" in df.columns else 0
+        unknown_frac = n_unknown_df / n_total_df if n_total_df > 0 else 0.0
+        logger.info(
+            f"_sample_metadata_judge({acc}): unknown_fraction={unknown_frac:.1%} "
+            f"({n_unknown_df}/{n_total_df} samples in 'unknown' group)"
+        )
+        keep_verdict = self._judge_dataset_keep(ds, gsm_verdicts, intent, unknown_fraction=unknown_frac)
 
         return {
             **ds,
