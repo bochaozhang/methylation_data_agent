@@ -199,6 +199,70 @@ Rules for other fields:
 - notes: record any discrepancy (e.g. sample count mismatch, different cancer subtype, cancer type mismatch with request)
 """
 
+# GSM-level include/exclude judge prompt — Call 1 of the two-step sample metadata pipeline.
+# Input: intent + single GSM characteristics. Output: include bool + reason.
+# Kept CONSTANT for Z.AI system cache.
+LLM_GSM_JUDGE_SYSTEM_PROMPT = """You are a biomedical data curator specializing in DNA methylation datasets.
+
+You will receive:
+1. The user's search intent (cancer type, sample type, query detail)
+2. A single GEO sample (GSM) with its source_name, molecule, and characteristics
+
+Your task: decide whether this individual sample matches the user's requested sample type.
+
+Respond ONLY with a JSON object (no markdown, no explanation outside JSON):
+{
+  "include": true or false,
+  "reason": null or "one sentence explaining why excluded"
+}
+
+Rules:
+- include=true  if the sample matches the requested sample type
+  * reason MUST be null when include=true
+- include=false if the sample clearly does NOT match
+  * reason MUST be a concise explanation (e.g. "tumor tissue, not cfDNA")
+- When in doubt (ambiguous characteristics), include=true (conservative)
+- Focus ONLY on sample type match — do not judge cancer type or platform here
+"""
+
+# Dataset-level keep/unsure/reject prompt — Call 2 of the two-step sample metadata pipeline.
+# Input: include/exclude statistics + GEO summary. Output: dataset_keep tri-state.
+# Kept CONSTANT for Z.AI system cache.
+LLM_DATASET_KEEP_SYSTEM_PROMPT = """You are a biomedical data curator specializing in DNA methylation datasets.
+
+You will receive:
+1. The user's search intent (cancer type, sample type, query detail)
+2. GEO dataset summary (title, summary, overall_design)
+3. Sample-level statistics: how many samples were judged include vs exclude
+
+Your task: decide the fate of this dataset based on the statistics and GEO summary.
+
+Respond ONLY with a JSON object (no markdown, no explanation outside JSON):
+{
+  "dataset_keep": "true" | "false" | "unsure",
+  "reason": "one sentence explaining the decision"
+}
+
+Decision rules — evaluate in ORDER, stop at the first matching rule:
+
+RULE 1 — dataset_keep="false" (clear reject):
+- include_fraction is very low (< 5%) AND GEO summary confirms the dataset is not the requested type
+- e.g. requested cfDNA/plasma but >95% samples are tumor tissue and summary confirms tissue study
+
+RULE 2 — dataset_keep="true" (clear accept):
+- include_fraction is reasonably high (>= 20%) AND GEO summary is consistent with the request
+- e.g. requested cfDNA/plasma, 60% samples are plasma cfDNA, summary mentions liquid biopsy
+
+RULE 3 — dataset_keep="unsure" (needs PubMed confirmation):
+- include_fraction is borderline (5–20%), OR
+- GEO summary is ambiguous or contradicts the statistics, OR
+- Characteristics fields were mostly missing/empty (statistics may be unreliable)
+
+RULE 4 — DEFAULT:
+- dataset_keep="unsure" if none of the above rules clearly apply
+- Be conservative: prefer "unsure" over "false" when uncertain
+"""
+
 
 class DatabaseAgent:
     """
@@ -299,6 +363,7 @@ class DatabaseAgent:
                 paper_pmid=c.get("paper_pmid"),
                 notes=c.get("notes"),
                 no_pubmed_link=_no_pubmed,
+                sample_metadata_path=c.get("sample_metadata_path"),
                 download_status="awaiting_approval",
             )
             self.registry.log_event(
@@ -330,7 +395,7 @@ class DatabaseAgent:
         """
         Search GEO using the parsed intent.
 
-        Two-step filtering pipeline:
+        Three-step filtering pipeline:
           1. esearch → GSE UID list (NCBI E-utilities keyword search)
           2. filter_methylation_datasets() → platform/year filter + batch esummary
           3. Inject cancer_type from intent
@@ -338,10 +403,16 @@ class DatabaseAgent:
                - LLM reads title/summary/overall_design vs intent
                - Drops obvious mismatches (cell lines, wrong cancer, wrong sample type)
                - No NCBI API calls needed; cheap and fast
-          5. Step 2 — PubMed cross-verification (_pubmed_verify_datasets_concurrent):
-               - Has PMID  → fetch abstract + LLM verify; paper takes priority over GEO metadata
-               - No PMID   → adopt Step 1 screen_keep decision; mark no_pubmed_link
-               - No abstract → adopt Step 1 screen_keep decision; mark abstract_unavailable
+          5. Step 2 — GSM sample metadata judge (_sample_metadata_judge_concurrent):
+               - Full efetch all GSMs (no cap), cached to sample_metadata.csv
+               - LLM Call 1: per-GSM include/exclude
+               - LLM Call 2: dataset_keep (true/false/unsure) from statistics + GEO summary
+               - true  → awaiting_approval (skip Step 3)
+               - false → discard
+               - unsure → Step 3
+          6. Step 3 — PubMed cross-verification (only for unsure datasets):
+               - Has PMID + abstract → LLM verify
+               - No PMID or no abstract → pubmed_keep=False (discard)
         """
         from tools.parser_tools import build_geo_search_string
 
@@ -382,15 +453,31 @@ class DatabaseAgent:
 
             # ---- Step 1: GEO metadata screening (no NCBI calls, LLM only) ----
             datasets = self._geo_screen_datasets_concurrent(datasets, intent=intent)
-            logger.info(f"GEO: {len(datasets)} datasets after Step 1 metadata screen")
+            logger.info(f"GEO Step 1: {len(datasets)} datasets passed metadata screen")
 
-            # ---- Step 2: PubMed cross-verification ----
-            # Has PMID  → fetch abstract + LLM verify (paper takes priority)
-            # No PMID   → adopt Step 1 screen_keep; mark no_pubmed_link
-            datasets = self._pubmed_verify_datasets_concurrent(datasets, intent=intent)
-            logger.info(f"GEO: {len(datasets)} datasets after Step 2 PubMed verify")
+            # ---- Step 2: GSM sample metadata judge (full efetch + two LLM calls) ----
+            keep_list, reject_list, unsure_list = self._sample_metadata_judge_concurrent(
+                datasets, intent
+            )
+            logger.info(
+                f"GEO Step 2: keep={len(keep_list)} reject={len(reject_list)} "
+                f"unsure={len(unsure_list)}"
+            )
 
-            return datasets
+            # ---- Step 3: PubMed cross-verification (only for unsure datasets) ----
+            if unsure_list:
+                pubmed_results = self._pubmed_verify_datasets_concurrent(
+                    unsure_list, intent=intent
+                )
+                keep_list += [d for d in pubmed_results if d.get("pubmed_keep")]
+                reject_list += [d for d in pubmed_results if not d.get("pubmed_keep")]
+                logger.info(
+                    f"GEO Step 3 (PubMed): {sum(1 for d in pubmed_results if d.get('pubmed_keep'))} "
+                    f"kept from {len(unsure_list)} unsure"
+                )
+
+            logger.info(f"GEO final: {len(keep_list)} datasets → awaiting_approval")
+            return keep_list
         except Exception as e:
             logger.error(f"GEO search failed: {e}")
             return []
@@ -586,6 +673,357 @@ class DatabaseAgent:
         return kept
 
     # ------------------------------------------------------------------ #
+    #  Step 2: GSM sample metadata judge (two LLM calls)                  #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _build_sample_df(gsm_list: List[Dict[str, Any]]):
+        """
+        Build a pandas DataFrame from a list of GSM dicts returned by
+        get_all_gsm_metadata(). Characteristics are expanded into columns.
+        """
+        import pandas as pd
+
+        rows = []
+        for g in gsm_list:
+            row = {
+                "gsm": g.get("gsm", ""),
+                "source_name": g.get("source_name", ""),
+                "molecule": g.get("molecule", ""),
+                "group": g.get("group", "other"),
+            }
+            for k, v in (g.get("characteristics") or {}).items():
+                row[k] = v
+            rows.append(row)
+        return pd.DataFrame(rows)
+
+    def _judge_single_gsm(
+        self,
+        gsm_dict: Dict[str, Any],
+        intent: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        LLM Call 1: judge a single GSM sample — include or exclude.
+
+        Input: intent + one GSM's source_name, molecule, characteristics.
+        Output: {"gsm": str, "include": bool, "reason": str|None}
+
+        On any error: returns include=True (conservative).
+        """
+        import json as _json
+
+        gsm_id = gsm_dict.get("gsm", "?")
+
+        # Build intent block
+        ct = intent.get("cancer_type")
+        ct_label = (ct.get("display") if isinstance(ct, dict) else str(ct)) if ct else                    intent.get("cancer_type_display") or "not specified"
+        sample_types = intent.get("sample_types") or []
+        primary_st = intent.get("sample_type") or "not specified"
+        st_label = f"{primary_st} (all: {sample_types})" if sample_types else primary_st
+        detail = intent.get("sample_type_detail") or ""
+        raw_query = intent.get("raw_query") or ""
+
+        ch = gsm_dict.get("characteristics") or {}
+        ch_str = "; ".join(f"{k}: {v}" for k, v in ch.items()) if ch else "(none)"
+
+        user_msg = (
+            f"=== USER REQUEST ===\n"
+            f"Cancer type: {ct_label}\n"
+            f"Sample type: {st_label}\n"
+            + (f"Detail: {detail}\n" if detail else "")
+            + (f"Query: {raw_query[:200]}\n" if raw_query else "")
+            + f"\n=== GSM SAMPLE ===\n"
+            f"GSM: {gsm_id}\n"
+            f"source_name: {gsm_dict.get('source_name', '')}\n"
+            f"molecule: {gsm_dict.get('molecule', '')}\n"
+            f"characteristics: {ch_str}\n"
+        )
+
+        try:
+            response = self.llm.invoke([
+                SystemMessage(content=LLM_GSM_JUDGE_SYSTEM_PROMPT),
+                HumanMessage(content=user_msg),
+            ])
+            raw = response.content.strip()
+            if raw.startswith("```"):
+                raw = re.sub(r"^```[a-z]*\n?", "", raw)
+                raw = re.sub(r"\n?```$", "", raw)
+            v = _json.loads(raw)
+            include = bool(v.get("include", True))
+            reason = v.get("reason") if not include else None
+            return {"gsm": gsm_id, "include": include, "reason": reason}
+        except Exception as e:
+            logger.debug(f"_judge_single_gsm({gsm_id}): LLM/parse error — {e} — including (conservative)")
+            return {"gsm": gsm_id, "include": True, "reason": None}
+
+    def _judge_all_gsms_concurrent(
+        self,
+        gsm_list: List[Dict[str, Any]],
+        intent: Dict[str, Any],
+        max_concurrent: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """
+        Run LLM Call 1 (per-GSM include/exclude) concurrently for all GSMs.
+
+        Uses asyncio + Semaphore(max_concurrent). Each call is short (~100-300 tokens).
+        Returns list of {"gsm", "include", "reason"} dicts.
+        """
+        if not gsm_list:
+            return []
+
+        sem = asyncio.Semaphore(max_concurrent)
+
+        async def _judge_one_async(g: Dict[str, Any]) -> Dict[str, Any]:
+            async with sem:
+                loop = asyncio.get_event_loop()
+                return await loop.run_in_executor(
+                    None, self._judge_single_gsm, g, intent
+                )
+
+        async def _run_all() -> List[Dict[str, Any]]:
+            tasks = [_judge_one_async(g) for g in gsm_list]
+            return await asyncio.gather(*tasks)
+
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures as _cf
+                with _cf.ThreadPoolExecutor() as pool:
+                    future = pool.submit(asyncio.run, _run_all())
+                    results = future.result()
+            else:
+                results = loop.run_until_complete(_run_all())
+        except RuntimeError:
+            results = asyncio.run(_run_all())
+
+        n_include = sum(1 for r in results if r.get("include"))
+        logger.info(
+            f"_judge_all_gsms_concurrent: {n_include}/{len(results)} GSMs included"
+        )
+        return results
+
+    def _judge_dataset_keep(
+        self,
+        ds: Dict[str, Any],
+        gsm_verdicts: List[Dict[str, Any]],
+        intent: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        LLM Call 2: decide dataset_keep (true/false/unsure) based on
+        include/exclude statistics + GEO summary.
+
+        Input: aggregated stats from gsm_verdicts + ds title/summary/overall_design.
+        Output: {"dataset_keep": "true"|"false"|"unsure", "reason": str}
+
+        On any error: returns dataset_keep="unsure" (conservative).
+        """
+        import json as _json
+
+        acc = ds.get("accession", "?")
+        n_total = len(gsm_verdicts)
+        n_include = sum(1 for v in gsm_verdicts if v.get("include"))
+        n_exclude = n_total - n_include
+        include_frac = n_include / n_total if n_total > 0 else 0.0
+        exclude_frac = n_exclude / n_total if n_total > 0 else 0.0
+
+        # Build intent block
+        ct = intent.get("cancer_type")
+        ct_label = (ct.get("display") if isinstance(ct, dict) else str(ct)) if ct else                    intent.get("cancer_type_display") or "not specified"
+        primary_st = intent.get("sample_type") or "not specified"
+        detail = intent.get("sample_type_detail") or ""
+        raw_query = intent.get("raw_query") or ""
+
+        user_msg = (
+            f"=== USER REQUEST ===\n"
+            f"Cancer type: {ct_label}\n"
+            f"Sample type: {primary_st}\n"
+            + (f"Detail: {detail}\n" if detail else "")
+            + (f"Query: {raw_query[:200]}\n" if raw_query else "")
+            + f"\n=== DATASET ===\n"
+            f"Accession: {acc}\n"
+            f"Title: {ds.get('title', '')[:200]}\n"
+            f"Summary: {ds.get('summary', '')[:500]}\n"
+            f"Overall Design: {ds.get('overall_design', '')[:300]}\n"
+            f"\n=== SAMPLE STATISTICS ===\n"
+            f"Total samples: {n_total}\n"
+            f"Include count: {n_include}  (include_fraction: {include_frac:.1%})\n"
+            f"Exclude count: {n_exclude}  (exclude_fraction: {exclude_frac:.1%})\n"
+        )
+
+        try:
+            response = self.llm.invoke([
+                SystemMessage(content=LLM_DATASET_KEEP_SYSTEM_PROMPT),
+                HumanMessage(content=user_msg),
+            ])
+            raw = response.content.strip()
+            if raw.startswith("```"):
+                raw = re.sub(r"^```[a-z]*\n?", "", raw)
+                raw = re.sub(r"\n?```$", "", raw)
+            v = _json.loads(raw)
+            dataset_keep = v.get("dataset_keep", "unsure")
+            if dataset_keep not in ("true", "false", "unsure"):
+                dataset_keep = "unsure"
+            reason = v.get("reason", "")
+            logger.info(
+                f"_judge_dataset_keep({acc}): dataset_keep={dataset_keep} "
+                f"include={n_include}/{n_total} ({include_frac:.1%}) reason={reason[:80]}"
+            )
+            return {"dataset_keep": dataset_keep, "reason": reason}
+        except Exception as e:
+            logger.warning(
+                f"_judge_dataset_keep({acc}): LLM/parse error — {e} — returning unsure (conservative)"
+            )
+            return {"dataset_keep": "unsure", "reason": f"judge_error: {e}"}
+
+    def _sample_metadata_judge(
+        self,
+        ds: Dict[str, Any],
+        intent: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Full Step 2 pipeline for one dataset:
+          1. Cache check: reuse existing sample_metadata.csv if present
+          2. Full efetch all GSMs (get_all_gsm_metadata) if no cache
+          3. LLM Call 1: per-GSM include/exclude (concurrent)
+          4. Write query column to CSV (full, no truncation)
+          5. LLM Call 2: dataset_keep based on statistics + GEO summary
+
+        Returns ds enriched with:
+          dataset_keep       ("true" | "false" | "unsure")
+          sample_reason      (str)
+          sample_metadata_path (str)
+        """
+        import pandas as pd
+        from pathlib import Path
+
+        acc = ds.get("accession", "?")
+        data_dir = self.config.get("download", {}).get("output_dir", "/data")
+        csv_path = Path(data_dir) / acc / "sample_metadata.csv"
+        query_col = (intent.get("raw_query") or "")[:80]
+
+        # ---- 1. Cache check ----
+        if csv_path.exists():
+            try:
+                df = pd.read_csv(csv_path)
+                # Reconstruct gsm_list from CSV for LLM Call 1
+                # Fixed columns that are NOT characteristics
+                _fixed_cols = {"gsm", "source_name", "molecule", "group"}
+                gsm_list = []
+                for _, row in df.iterrows():
+                    ch = {
+                        k: str(v) for k, v in row.items()
+                        if k not in _fixed_cols
+                        and str(v) != "nan"
+                        and len(k) <= 40  # skip old query cols (long names > 40 chars)
+                    }
+                    gsm_list.append({
+                        "gsm": str(row.get("gsm", "")),
+                        "source_name": str(row.get("source_name", "")),
+                        "molecule": str(row.get("molecule", "")),
+                        "group": str(row.get("group", "other")),
+                        "characteristics": ch,
+                    })
+                logger.info(f"_sample_metadata_judge({acc}): reusing cached CSV ({len(gsm_list)} GSMs)")
+            except Exception as e:
+                logger.warning(f"_sample_metadata_judge({acc}): CSV read failed ({e}), re-efetching")
+                gsm_list = self.geo_client.get_all_gsm_metadata(acc)
+                df = self._build_sample_df(gsm_list)
+        else:
+            # ---- 2. Full efetch ----
+            gsm_list = self.geo_client.get_all_gsm_metadata(acc)
+            if not gsm_list:
+                logger.warning(f"_sample_metadata_judge({acc}): no GSMs fetched — returning unsure")
+                return {**ds, "dataset_keep": "unsure", "sample_reason": "no GSMs fetched",
+                        "sample_metadata_path": None}
+            df = self._build_sample_df(gsm_list)
+
+        # ---- 3. LLM Call 1: per-GSM include/exclude (concurrent) ----
+        gsm_verdicts = self._judge_all_gsms_concurrent(gsm_list, intent)
+
+        # ---- 4. Write query column to CSV (full, no truncation) ----
+        verdict_map = {v["gsm"]: v for v in gsm_verdicts}
+        df[query_col] = df["gsm"].map(lambda g: (
+            "include"
+            if verdict_map.get(str(g), {}).get("include", True)
+            else f"exclude: {verdict_map.get(str(g), {}).get('reason', 'unknown')}"
+        ))
+        try:
+            csv_path.parent.mkdir(parents=True, exist_ok=True)
+            df.to_csv(csv_path, index=False)
+            logger.info(f"_sample_metadata_judge({acc}): wrote CSV → {csv_path}")
+        except Exception as e:
+            logger.warning(f"_sample_metadata_judge({acc}): CSV write failed: {e}")
+
+        # ---- 5. LLM Call 2: dataset_keep ----
+        keep_verdict = self._judge_dataset_keep(ds, gsm_verdicts, intent)
+
+        return {
+            **ds,
+            "dataset_keep": keep_verdict["dataset_keep"],
+            "sample_reason": keep_verdict["reason"],
+            "sample_metadata_path": str(csv_path),
+        }
+
+    def _sample_metadata_judge_concurrent(
+        self,
+        datasets: List[Dict[str, Any]],
+        intent: Dict[str, Any],
+        max_concurrent: int = 3,
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """
+        Run Step 2 (_sample_metadata_judge) on all datasets concurrently.
+        Semaphore(3) because each call triggers many efetch requests.
+
+        Returns:
+            (keep_list, reject_list, unsure_list)
+            keep_list   — dataset_keep="true"
+            reject_list — dataset_keep="false"
+            unsure_list — dataset_keep="unsure"
+        """
+        if not datasets:
+            return [], [], []
+
+        sem = asyncio.Semaphore(max_concurrent)
+
+        async def _judge_one_async(ds: Dict[str, Any]) -> Dict[str, Any]:
+            async with sem:
+                loop = asyncio.get_event_loop()
+                return await loop.run_in_executor(
+                    None, self._sample_metadata_judge, ds, intent
+                )
+
+        async def _run_all() -> List[Dict[str, Any]]:
+            tasks = [_judge_one_async(ds) for ds in datasets]
+            return await asyncio.gather(*tasks)
+
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures as _cf
+                with _cf.ThreadPoolExecutor() as pool:
+                    future = pool.submit(asyncio.run, _run_all())
+                    judged = future.result()
+            else:
+                judged = loop.run_until_complete(_run_all())
+        except RuntimeError:
+            judged = asyncio.run(_run_all())
+
+        keep_list = [d for d in judged if d.get("dataset_keep") == "true"]
+        reject_list = [d for d in judged if d.get("dataset_keep") == "false"]
+        unsure_list = [d for d in judged if d.get("dataset_keep") == "unsure"]
+
+        logger.info(
+            f"Step 2 sample_metadata_judge: "
+            f"keep={len(keep_list)} reject={len(reject_list)} unsure={len(unsure_list)} "
+            f"/ total={len(datasets)}"
+        )
+        for d in reject_list:
+            logger.info(
+                f"  Step2-rejected {d.get('accession','?')}: {d.get('sample_reason','')[:80]}"
+            )
+        return keep_list, reject_list, unsure_list
+
+    # ------------------------------------------------------------------ #
     #  Step 1: GEO metadata screening (no PubMed needed)                  #
     # ------------------------------------------------------------------ #
 
@@ -755,9 +1193,9 @@ class DatabaseAgent:
                notes                 → discrepancy details
 
         Fallback behaviour (conservative — prefer false positives):
-          - No PMID available     → keep=True, notes="no_pubmed_link"
-          - Abstract fetch fails  → keep=True, notes="abstract_unavailable"
-          - LLM/parse error       → keep=True, notes="verify_error: ..."
+          - No PMID available     → keep=False (unsure + no paper = discard)
+          - Abstract fetch fails  → keep=False (unsure + no abstract = discard)
+          - LLM/parse error       → keep=False (conservative reject for unsure datasets)
 
         Returns updated ds dict with added fields:
           pubmed_verified  (bool)
@@ -769,39 +1207,34 @@ class DatabaseAgent:
         acc = ds.get("accession", "?")
         pmids = ds.get("pubmed_ids", [])
 
-        # ---- No PMID: trust Step 1 screen result, mark no_pubmed_link ----
+        # ---- No PMID: discard (unsure + no paper = cannot confirm = don't download) ----
         if not pmids:
-            # Step 1 already ran on GEO metadata; adopt its keep decision.
-            # screen_keep=True means Step 1 found no obvious mismatch.
-            screen_keep = ds.get("screen_keep", True)
             existing_notes = ds.get("notes") or ""
-            note_tag = "no_pubmed_link"
             logger.info(
-                f"pubmed_verify {acc}: no PMID — "
-                f"adopting Step1 screen_keep={screen_keep} ({ds.get('screen_reason','')[:60]})"
+                f"pubmed_verify {acc}: no PMID — pubmed_keep=False (unsure, no paper to confirm)"
             )
             return {
                 **ds,
                 "pubmed_verified": False,
-                "pubmed_keep": screen_keep,
-                "notes": (existing_notes + f"; {note_tag}").lstrip("; "),
+                "pubmed_keep": False,
+                "notes": (existing_notes + "; no_pubmed_link").lstrip("; "),
             }
 
         pmid = str(pmids[0])
         abstract = self.geo_client.fetch_pubmed_abstract(pmid)
 
-        # ---- Abstract unavailable: trust Step 1 screen result ----
+        # ---- Abstract unavailable: discard (unsure + no abstract = cannot confirm) ----
         if not abstract:
-            screen_keep = ds.get("screen_keep", True)
             existing_notes = ds.get("notes") or ""
             logger.info(
                 f"pubmed_verify {acc}: abstract unavailable (PMID={pmid}) — "
-                f"adopting Step1 screen_keep={screen_keep}"
+                f"pubmed_keep=False (unsure, no abstract to confirm)"
             )
             return {
                 **ds,
                 "pubmed_verified": False,
-                "pubmed_keep": screen_keep,
+                "pubmed_keep": False,
+                "paper_pmid": pmid,
                 "notes": (existing_notes + f"; abstract_unavailable(PMID={pmid})").lstrip("; "),
             }
 
@@ -938,12 +1371,12 @@ class DatabaseAgent:
 
         except Exception as e:
             # On any error: keep the dataset (conservative)
-            logger.warning(f"pubmed_verify {acc}: LLM/parse error — {e} — keeping dataset")
+            logger.warning(f"pubmed_verify {acc}: LLM/parse error — {e} — rejecting (conservative for unsure)")
             existing_notes = ds.get("notes") or ""
             return {
                 **ds,
                 "pubmed_verified": False,
-                "pubmed_keep": True,
+                "pubmed_keep": False,
                 "notes": (existing_notes + f"; verify_error: {e}").lstrip("; "),
             }
 

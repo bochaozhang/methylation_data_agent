@@ -27,9 +27,9 @@
 
 两个 Agent 通过共享 SQLite 注册表协调，Agent 2 下载前自动检查注册表，跳过已由 Agent 1 下载的数据集。
 
-## GEO Search 流程（v4）
+## GEO Search 流程（v5）
 
-GEO 检索采用 4 层漏斗式过滤，从宽到窄逐步筛选：
+GEO 检索采用 **三步漏斗式过滤**，从粗到细逐步筛选：
 
 ```
 用户查询
@@ -47,15 +47,39 @@ NCBI esearch → GSE UID list
 batch esummary → 元数据 + 平台/年份过滤
   │
   ▼
-_pubmed_verify_datasets_concurrent(5 并发)  ← 主过滤器
-  每个 GSE：efetch PubMed abstract → LLM 对比 GEO summary/design vs 摘要
-  keep=True → 保留并更新字段；keep=False → 丢弃并记录原因
+Step 1: GEO metadata screen（GSE 级，LLM 粗筛，无 NCBI 调用）
+  LLM 读 title/summary/overall_design vs intent
+  明显不符（cell line / 错误癌种 / 错误样本类型）→ 丢弃
+  │
+  ▼ screen_keep=True
+Step 2: GSM sample metadata judge（GSM 级，ground truth，两次 LLM 调用）
+  ├── 全量 efetch 所有 GSM MINiML XML（无上限，结果缓存到 CSV）
+  ├── LLM Call 1（per-GSM，并发）
+  │     输入：intent + 单个 GSM characteristics（~100-300 tokens/call）
+  │     输出：{"include": bool, "reason": str|null}
+  │     → 写入 sample_metadata.csv（全量，每行一个 GSM）
+  ├── 计算 include_fraction = include数 / 总GSM数
+  └── LLM Call 2（dataset 级，单次）
+        输入：include_fraction + exclude_fraction + GEO summary（~200-400 tokens）
+        输出：{"dataset_keep": "true"|"false"|"unsure", "reason": str}
+  │
+  ├── "true"  → 直接进 awaiting_approval（跳过 Step 3）
+  ├── "false" → 丢弃
+  └── "unsure" → Step 3
+  │
+  ▼ dataset_keep="unsure"
+Step 3: PubMed verify（仅对 unsure 数据集）
+  有 PMID + 有 abstract → LLM 对比 GEO summary vs 摘要 → keep=True/False
+  无 PMID 或无 abstract → pubmed_keep=False（丢弃）
+  │
+  ▼
+awaiting_approval → 人工审批 → pending → daemon 下载
   │
   ▼
 Registry 去重 → 注册 → 下载
   │
   ▼
-geo_candidates_<ts>.json + report_<ts>.json
+sample_metadata.csv + report_<ts>.json
 ```
 
 ### 第 1 层：检索式构建
@@ -71,11 +95,6 @@ geo_candidates_<ts>.json + report_<ts>.json
 | **年份** | 可选的 PDAT 范围过滤 | `("2020/01/01"[PDAT] : "2024/12/31"[PDAT])` |
 | **Entry Type** | 固定 `GSE[Entry Type]` | — |
 
-最终查询形如：
-```
-(CRC OR "colorectal cancer" OR ...) AND (cfDNA OR "cell-free DNA" OR ...) AND ("DNA methylation" OR 450K OR EPIC OR ...) AND (human OR "Homo sapiens") AND GSE[Entry Type]
-```
-
 ### 第 2 层：元数据获取 + 平台/年份过滤
 
 `GEOClient.search_gse()` → `filter_methylation_datasets()`：
@@ -84,11 +103,74 @@ geo_candidates_<ts>.json + report_<ts>.json
 2. **batch esummary** 批量获取元数据（title, summary, overall_design, platforms, sample_count, year, pubmed_ids）
 3. **过滤**：data_type 检测（array vs sequencing）、platform_canonical 匹配、year 范围；platform_unknown 的保留（不过度过滤）
 
-### GSM 分组选取策略
+### Step 1：GEO metadata screen（GSE 级粗筛）
 
-`get_representative_gsm_details(accession, wanted_sample_type)` 用于从 GSE 的全部 GSM 中选取代表性样本做 efetch MiniML，避免只取前 N 个导致混合设计数据集的偏差。
+`_geo_screen_datasets_concurrent(datasets, max_concurrent=5)`
 
-**分组规则**：根据 GSM title 中的关键词，将每个样本归入以下 5 组 + 1 个兜底组（按优先级从上到下匹配，首次命中即归入）：
+LLM 仅读取 GEO 元数据（title、summary、overall_design），无需 NCBI API 调用，快速丢弃明显不符的数据集：
+
+- **RULE 1**：cell line / organoid / in-vitro → 直接拒绝
+- **RULE 2**：数据类型明显不是 DNA 甲基化 → 拒绝
+- **RULE 3**：癌种明显不符 → 拒绝
+- **RULE 4**：样本类型明显不符 → 拒绝
+- **RULE 5（默认）**：保留（宽松，允许假阳性，Step 2 做精细判断）
+
+### Step 2：GSM sample metadata judge（GSM 级，ground truth）
+
+`_sample_metadata_judge_concurrent(datasets, max_concurrent=3)`
+
+这是主过滤器，基于 GSM 级别的真实样本信息做判断，分两次 LLM 调用：
+
+#### LLM Call 1：per-GSM include/exclude（并发，Semaphore=5）
+
+对每个 GSM 独立判断，输入极短（单个样本的 characteristics）：
+
+```
+输入：
+  Intent: {cancer_type}, {sample_type}, {query_detail}
+  GSM: {gsm_id}
+    source_name: {source_name}
+    molecule: {molecule}
+    characteristics: {key: value, ...}
+
+输出：
+  {"include": true, "reason": null}          ← include 时 reason 为 null
+  {"include": false, "reason": "tumor tissue, not cfDNA"}
+```
+
+结果写入 `sample_metadata.csv`（全量，不截断）：
+- include=true → 该 query 列写 `"include"`
+- include=false → 该 query 列写 `"exclude: {reason}"`
+
+#### LLM Call 2：dataset_keep 三态判断（单次）
+
+基于汇总统计 + GEO summary，输入极短（~200-400 tokens）：
+
+```
+输入：
+  Intent: {cancer_type}, {sample_type}
+  Dataset: {accession}
+    title / summary / overall_design
+    include_count: {k}  (include_fraction: {k/n:.1%})
+    exclude_count: {n-k}  (exclude_fraction: {(n-k)/n:.1%})
+
+输出：
+  {"dataset_keep": "true" | "false" | "unsure", "reason": "..."}
+```
+
+**三态路由规则**：
+
+| dataset_keep | 条件 | 行为 |
+|-------------|------|------|
+| `"true"` | include_fraction ≥ 20% 且 GEO summary 一致 | → awaiting_approval（跳过 Step 3） |
+| `"false"` | include_fraction < 5% 且 GEO summary 明确不符 | → 丢弃 |
+| `"unsure"` | 边界情况，或 characteristics 字段缺失/模糊 | → Step 3 PubMed 核验 |
+
+**CSV 缓存**：`sample_metadata.csv` 写入 `{output_dir}/{accession}/sample_metadata.csv`，同一数据集再次查询时复用 efetch 结果，仅重跑 LLM 判断，追加新 query 列。
+
+#### GSM 分组策略（用于 CSV group 列）
+
+根据 GSM title 关键词分组（仅用于 CSV 标注，不影响 LLM 判断）：
 
 | 分组 | 匹配关键词 |
 |------|-----------|
@@ -99,89 +181,50 @@ geo_candidates_<ts>.json + report_<ts>.json
 | `cell_line` | cell line, organoid, in vitro, culture |
 | `other` | 不匹配以上任何关键词的样本 |
 
-**选取规则**：
+### Step 3：PubMed verify（仅对 unsure 数据集）
 
-| 数据集样本数 | 选取策略 |
-|-------------|---------|
-| n ≤ 30 | 全取（小数据集，完整覆盖） |
-| n > 30 | 每组最多 6 个代表，总上限 30 个 |
+`_pubmed_verify_datasets_concurrent(unsure_list, max_concurrent=5)`
 
-大样本数据集的选取细节：
-- 用户查询的 `wanted_sample_type` 对应的分组优先选满（如查 cfDNA → `plasma_cfdna` 组先选）
-- 其余分组按顺序填充，直到总上限 30
-- 只对选中的 GSM 做 efetch MiniML（节省 API 调用）
+**仅当 Step 2 返回 `dataset_keep="unsure"` 时触发**，不再对所有数据集执行。
 
-### 第 3 层：PubMed 文献核验（主过滤器）
+**核验流程（每个 unsure GSE）**：
 
-`_pubmed_verify_datasets_concurrent(datasets, max_concurrent=5)`
+1. 取 `pubmed_ids[0]`（esummary 已返回）
+2. `GEOClient.fetch_pubmed_abstract(pmid)` → NCBI efetch 获取摘要
+3. 将 GEO 元数据 + 摘要发给 LLM（`LLM_VERIFY_SYSTEM_PROMPT`，固定不变触发 Z.AI system cache）
+4. LLM 返回 `keep=True/False` + 更新字段
 
-**每一个** esummary 返回的 GSE 都经过此步骤，无论样本类型或其他元数据如何。LLM 直接对比 GEO 的 summary/overall_design 与文章摘要，判断两者是否一致，并输出 `keep` 决策。
-
-**核验流程（每个 GSE）**：
-
-1. 取 `pubmed_ids[0]`（esummary 已返回，零额外 API 调用）
-2. `GEOClient.fetch_pubmed_abstract(pmid)` → NCBI efetch 获取摘要全文
-3. 将 GEO 元数据（title、summary、**overall_design**、platform、sample_count、sample_type、cancer_type）+ 摘要发给 LLM
-4. LLM 使用固定 `LLM_VERIFY_SYSTEM_PROMPT`（触发 Z.AI system cache）返回 JSON：
-
-```json
-{
-  "keep": true,
-  "confirmed_sample_type": "plasma",
-  "confirmed_cancer_type": "colorectal cancer",
-  "sample_count_in_paper": 130,
-  "stage_treatment": "stage II-III, treatment-naive",
-  "accession_mentioned": true,
-  "consistency": "consistent",
-  "recommended_action": "download",
-  "reason": "Abstract confirms plasma cfDNA from CRC patients, n=130",
-  "notes": ""
-}
-```
-
-5. 根据 `keep` 字段决定去留：
-
-| `keep` | 行为 |
-|--------|------|
-| `true` | 保留数据集，更新字段（sample_type、cancer_type、sample_count、stage_treatment 等） |
-| `false` | 丢弃数据集，记录 reason 到日志 |
-
-**更新字段规则**：
-
-| 字段 | 更新条件 |
-|------|---------|
-| `sample_type` | 摘要中明确描述生物材料类型（非 unknown） |
-| `cancer_type` | 摘要中明确癌种名称 |
-| `sample_count` | 摘要中 n= 与 GEO 差异 >20% 时修正 |
-| `stage_treatment` | 摘要中有分期/治疗信息 |
-| `consistency` | consistent / minor_discrepancy / major_discrepancy |
-| `usable` | 与 keep 同步（keep=false → usable=0） |
-| `recommended_action` | download / review / skip |
-| `reason` | 核验结论一句话摘要 |
-| `notes` | 追加差异说明（不覆盖已有内容） |
-
-**保守策略（宁可多留，不误杀）**：
+**严格策略（unsure 状态下不保守保留）**：
 
 | 情况 | 行为 |
 |------|------|
-| 无 PMID | `keep=True`，notes 追加 `no_pubmed_link` |
-| 摘要获取失败 | `keep=True`，notes 追加 `abstract_unavailable` |
-| LLM / 解析出错 | `keep=True`，notes 追加 `verify_error: ...` |
+| 无 PMID | `pubmed_keep=False`，丢弃（unsure + 无文章 = 无法确认 = 不下载） |
+| 摘要获取失败 | `pubmed_keep=False`，丢弃 |
+| LLM / 解析出错 | `pubmed_keep=False`，丢弃（保守拒绝） |
 
-**5 并发**：asyncio + Semaphore(5)，efetch + LLM 调用并行执行。
+> **设计原则**：Step 2 已经是 ground truth 判断，进入 Step 3 的数据集本身就是"存疑"的。无法通过文献确认的存疑数据集，宁可漏掉也不要噪音。
 
-日志格式示例：
-```
-pubmed_verify: 45 total → 38 verified, 5 no-PMID, 2 errors | 41 kept, 4 rejected
-  Rejected GSE999001 (PMID=99999999): reason=Abstract describes tumor tissue, not plasma cfDNA
-```
+**5 并发**：asyncio + Semaphore(5)。
 
-### 第 4 层：去重 + 注册 + 下载
+### Token 控制策略
+
+| LLM 调用 | 输入内容 | Token 量 |
+|---------|---------|---------|
+| Step 1 screen（per-GSE） | title + summary + overall_design | ~300-600 tokens |
+| Step 2 Call 1（per-GSM） | intent + 单个 GSM characteristics | ~100-300 tokens/call |
+| Step 2 Call 2（per-dataset） | include/exclude 统计 + GEO summary | ~200-400 tokens |
+| Step 3 PubMed verify（per-unsure） | GEO metadata + PubMed abstract | ~800-1500 tokens |
+
+全量 GSM 数据只写 CSV，**不发给任何 LLM**。
+
+### 第 4 层：去重 + 注册 + 人工审批 + 下载
 
 1. **Registry 去重**：已存在的 accession 跳过
-2. **注册**：`upsert_dataset()` 写入 SQLite（含核心列 + PubMed 核验列）
-3. **下载**：构建下载任务，执行
-4. **报告**：`generate_report` 节点输出 `report_<ts>.json` + `geo_candidates_<ts>.json`
+2. **注册**：`upsert_dataset()` 写入 SQLite（含 `sample_metadata_path` 字段）
+3. **人工审批**：Web UI "审批下载" Tab → 勾选确认 → `POST /datasets/approve`
+4. **daemon 下载**：后台轮询 `pending` 状态数据集，执行下载
+5. **报告**：`report_<ts>.json` + `sample_metadata.csv`（每个数据集一份）
+
 
 ## 安装
 
@@ -268,11 +311,11 @@ methyagent/
 │   ├── settings.yaml          # 配置文件
 │   └── cancer_synonyms.yaml   # 癌种同义词 + 技术词 + 液体活检词
 ├── agents/
-│   ├── database_agent.py      # Agent 1：GEO + TCGA 搜索下载（PubMed 核验主过滤器 + 5 并发）
+│   ├── database_agent.py      # Agent 1：GEO + TCGA 搜索下载（三步过滤：GEO screen → GSM judge → PubMed verify）
 │   ├── literature_agent.py    # Agent 2：文献挖掘 + 补充下载
 │   └── orchestrator.py        # LangGraph 图定义与编排
 ├── tools/
-│   ├── geo_tools.py           # GEO NCBI E-utilities API（含 get_representative_gsm_details + fetch_pubmed_abstract）
+│   ├── geo_tools.py           # GEO NCBI E-utilities API（含 get_all_gsm_metadata + get_representative_gsm_details + fetch_pubmed_abstract）
 │   ├── tcga_tools.py          # GDC REST API
 │   ├── pubmed_tools.py        # PubMed / PMC / bioRxiv
 │   ├── download_tools.py      # 异步断点续传下载器
@@ -298,6 +341,8 @@ data/methylation/
 │   └── GSE124600_series_matrix.txt.gz
 ├── TCGA-BRCA/
 │   └── *.methylation_array.sesame.level3betas.txt
+├── GSE220160/
+│   └── sample_metadata.csv             # GSM 级样本元数据（v5 新增）
 ├── report_20240522_143021.json         # 完整报告（JSON）
 ├── report_20240522_143021.md           # 可读报告（Markdown）
 └── geo_candidates_20240522_143021.json  # GEO 候选列表（含 PubMed 核验字段）
@@ -379,6 +424,7 @@ Agent 2 下载前检查流程：
 | notes | TEXT | 自由备注，追加不覆盖 |
 | pubmed_verified | INTEGER | 1=已完成 PubMed 核验，0=跳过（v4 新增） |
 | pubmed_keep | INTEGER | 1=核验通过，0=核验拒绝（v4 新增） |
+| sample_metadata_path | TEXT | GSM 级样本元数据 CSV 路径（v5 新增） |
 | paper_pmid | TEXT | 核验所用 PMID（v4 新增） |
 
 旧数据库自动通过 `_migrate_schema()` 迁移，无需手动操作。
@@ -399,10 +445,10 @@ Agent 2 下载前检查流程：
 - NCBI API Key 可选，但建议设置（提高速率限制从 3 req/s 到 10 req/s）
 - 云服务器 IP 可能被 NCBI 标记为 abuse，可通过 `settings.yaml` 的 `geo.proxy` 或环境变量 `NCBI_PROXY` 配置 SOCKS5/HTTP 代理
 - 补充材料解析仅支持 PMC 开放获取文章
-- PubMed 核验使用 Z.AI GLM，`LLM_VERIFY_SYSTEM_PROMPT` 固定不变以触发隐式缓存（cached_tokens 降费加速）
-- PubMed 核验对**每一个** esummary 返回的 GSE 执行，每个数据集消耗 1 次 NCBI efetch + 1 次 LLM 调用
-- 无 PMID / 摘要获取失败 / LLM 出错时，数据集默认保留（保守策略）
+- Step 2 使用 `LLM_GSM_JUDGE_SYSTEM_PROMPT`（Call 1）和 `LLM_DATASET_KEEP_SYSTEM_PROMPT`（Call 2），Step 3 使用 `LLM_VERIFY_SYSTEM_PROMPT`；三个 prompt 均固定不变以触发 Z.AI 隐式缓存（cached_tokens 降费加速）
+- PubMed 核验（Step 3）**仅对 Step 2 返回 `dataset_keep="unsure"` 的数据集执行**，大幅减少 NCBI efetch 和 LLM 调用次数
+- Step 3 中无 PMID / 摘要获取失败 / LLM 出错时，数据集**默认丢弃**（unsure + 无法确认 = 不下载）；Step 1 screen 出错时仍保守保留
 - `keep=False` 的数据集直接丢弃，不写入注册表；`recommended_action=review` 的数据集写入注册表供人工复查
 - `cancer_synonyms.yaml` 可独立更新，无需改代码即可添加新癌种同义词
 - 查询字符串上限 400 字符（`MAX_QUERY_LENGTH`），超长时自动裁剪癌种同义词，避免触发 NCBI abuse 检测
-- v4 移除了 GSM 级 LLM judge（`_llm_judge_datasets_concurrent`），该方法保留在代码中但不在主流程中调用
+- v5 新增 GSM 级两次 LLM 判断（`_sample_metadata_judge_concurrent`），是主过滤器；旧的 `_llm_judge_datasets_concurrent` 保留在代码中但不在主流程中调用

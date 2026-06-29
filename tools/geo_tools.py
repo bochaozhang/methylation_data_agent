@@ -971,6 +971,124 @@ class GEOClient:
         }
 
     # ------------------------------------------------------------------ #
+    #  Full GSM metadata fetch (no sampling cap)                          #
+    # ------------------------------------------------------------------ #
+
+    def get_all_gsm_metadata(
+        self,
+        accession: str,
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch GSM-level annotation for ALL samples in a GSE series.
+
+        Unlike get_representative_gsm_details() which applies sampling caps,
+        this method efetches every GSM without any limit. Results are intended
+        to be cached in a CSV file by the caller.
+
+        Workflow:
+          1. esearch + esummary to get the full sample list (same as representative method)
+          2. Group samples by SAMPLE_GROUP_KEYWORDS (for the 'group' column in CSV)
+          3. efetch MiniML XML for EVERY GSM — no cap
+
+        Args:
+            accession: GSE accession string (e.g. 'GSE220160').
+
+        Returns:
+            List of dicts, each with keys:
+              gsm, source_name, molecule, characteristics (dict), group
+            Returns [] on any error.
+        """
+        try:
+            # ---- Step 1: fetch all sample titles from esummary ----
+            params = {
+                "db": "gds",
+                "term": f"{accession}[Accession]",
+                "retmode": "json",
+            }
+            resp = self._get("esearch.fcgi", params)
+            uids = resp.json().get("esearchresult", {}).get("idlist", [])
+            gse_uid = next((u for u in uids if u.startswith("200")), uids[0] if uids else None)
+            if not gse_uid:
+                logger.warning(f"get_all_gsm_metadata({accession}): no GDS UID found")
+                return []
+
+            sum_resp = self._get("esummary.fcgi", {"db": "gds", "id": gse_uid, "retmode": "json"})
+            data = sum_resp.json().get("result", {}).get(gse_uid, {})
+            samples_field = data.get("samples", [])
+
+            # Build full list of (gsm_accession, title) — ALL samples, no truncation
+            all_samples: List[Dict[str, str]] = []
+            for s in samples_field:
+                if isinstance(s, dict):
+                    gsm = s.get("accession", "").upper()
+                    title = s.get("title", "")
+                elif isinstance(s, str):
+                    gsm, title = s.upper(), ""
+                else:
+                    continue
+                if gsm:
+                    all_samples.append({"gsm": gsm, "title": title})
+
+            if not all_samples:
+                logger.debug(f"get_all_gsm_metadata({accession}): no samples found")
+                return []
+
+            n = len(all_samples)
+            logger.info(f"get_all_gsm_metadata({accession}): {n} total samples — efetching all")
+
+            # ---- Step 2: group by title keywords (for 'group' column) ----
+            groups: Dict[str, List[Dict[str, str]]] = {
+                g: [] for g in list(SAMPLE_GROUP_KEYWORDS.keys()) + ["other"]
+            }
+            for s in all_samples:
+                title_lower = s["title"].lower()
+                assigned = "other"
+                for group_name, keywords in SAMPLE_GROUP_KEYWORDS.items():
+                    if any(kw in title_lower for kw in keywords):
+                        assigned = group_name
+                        break
+                groups[assigned].append(s)
+
+            gsm_to_group: Dict[str, str] = {}
+            for group_name, members in groups.items():
+                for s in members:
+                    gsm_to_group[s["gsm"]] = group_name
+
+            # ---- Step 3: efetch MiniML for ALL GSMs (no cap) ----
+            results = []
+            for s in all_samples:
+                gsm = s["gsm"]
+                try:
+                    fetch_resp = self._get("efetch.fcgi", {
+                        "db": "gsm",
+                        "acc": gsm,
+                        "rettype": "miniml",
+                        "retmode": "xml",
+                    })
+                    details = self._parse_gsm_miniml(gsm, fetch_resp.text)
+                    details["group"] = gsm_to_group.get(gsm, "other")
+                    results.append(details)
+                except Exception as e:
+                    logger.debug(f"get_all_gsm_metadata: efetch failed for {gsm}: {e}")
+                    results.append({
+                        "gsm": gsm,
+                        "source_name": s.get("title", ""),
+                        "molecule": "",
+                        "characteristics": {},
+                        "group": gsm_to_group.get(gsm, "other"),
+                    })
+
+            logger.info(
+                f"get_all_gsm_metadata({accession}): "
+                f"efetched {len(results)}/{n} GSMs"
+            )
+            return results
+
+        except Exception as e:
+            logger.warning(f"get_all_gsm_metadata({accession}) failed: {e}")
+            return []
+
+    # ------------------------------------------------------------------ #
     #  Supplementary file discovery                                        #
     # ------------------------------------------------------------------ #
 

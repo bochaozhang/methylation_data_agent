@@ -160,6 +160,7 @@ class ApprovalItem(BaseModel):
     paper_pmid: Optional[str] = None
     no_pubmed_link: bool = False
     notes: Optional[str] = None
+    sample_metadata_path: Optional[str] = None
     created_at: str
 
 

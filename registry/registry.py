@@ -186,6 +186,8 @@ class Registry:
             "ALTER TABLE datasets ADD COLUMN notes TEXT",
             # v5 columns
             "ALTER TABLE datasets ADD COLUMN no_pubmed_link INTEGER DEFAULT 0",
+            # v6 columns
+            "ALTER TABLE datasets ADD COLUMN sample_metadata_path TEXT",
         ]
         with self._get_conn() as conn:
             for sql in migrations:
@@ -241,6 +243,7 @@ class Registry:
         reason: Optional[str] = None,
         notes: Optional[str] = None,
         no_pubmed_link: bool = False,
+        sample_metadata_path: Optional[str] = None,
     ) -> bool:
         """
         Insert a new dataset or update metadata if it already exists.
@@ -280,6 +283,7 @@ class Registry:
                             reason                  = COALESCE(?, reason),
                             notes                   = COALESCE(?, notes),
                             no_pubmed_link          = COALESCE(?, no_pubmed_link),
+                            sample_metadata_path    = COALESCE(?, sample_metadata_path),
                             updated_at              = ?
                         WHERE accession = ?
                         """,
@@ -291,6 +295,7 @@ class Registry:
                             sample_level_annotation, usable, recommended_action,
                             reason, notes,
                             int(no_pubmed_link),
+                            sample_metadata_path,
                             now, accession,
                         ),
                     )
@@ -306,9 +311,10 @@ class Registry:
                             disease_groups, stage_treatment, available_file_type,
                             sample_level_annotation, usable, recommended_action,
                             reason, notes, no_pubmed_link,
+                            sample_metadata_path,
                             created_at, updated_at
                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                                  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             accession, source, data_type, cancer_type, platform,
@@ -319,6 +325,7 @@ class Registry:
                             sample_level_annotation, usable, recommended_action,
                             reason, notes,
                             int(no_pubmed_link),
+                            sample_metadata_path,
                             now, now,
                         ),
                     )

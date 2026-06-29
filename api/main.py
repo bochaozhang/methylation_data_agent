@@ -381,6 +381,7 @@ async def list_awaiting_approval():
                 paper_pmid=d.get("paper_pmid"),
                 no_pubmed_link=bool(d.get("no_pubmed_link", 0)),
                 notes=d.get("notes"),
+                sample_metadata_path=d.get("sample_metadata_path"),
                 created_at=d["created_at"],
             )
             for d in items
