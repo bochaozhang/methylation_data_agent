@@ -75,16 +75,45 @@ GOLD_STANDARD: List[Dict[str, Any]] = [
             "as a dataset_id."
         ),
     },
-    # --- Remaining 8 records: TODO — paste in PMID + gold-verified fields below,
-    #     set gold_verified=True once confirmed against PubMed. ---
-    {"pmid": "", "gold_verified": False},
-    {"pmid": "", "gold_verified": False},
-    {"pmid": "", "gold_verified": False},
-    {"pmid": "", "gold_verified": False},
-    {"pmid": "", "gold_verified": False},
-    {"pmid": "", "gold_verified": False},
-    {"pmid": "", "gold_verified": False},
-    {"pmid": "", "gold_verified": False},
+    # --- Remaining 8 records: candidates below are real PMIDs pulled from the
+    #     2026-06-30 live run of `python -m tools.ncbi_search` (see
+    #     docs/6_30/NCBI_Test_out.rtf). LLM's *current* guess is in the comment
+    #     for reference only — verify against the real PubMed abstract, fill in
+    #     the actual gold fields (see the two examples above for field names),
+    #     and set gold_verified=True. ---
+
+    # LLM guess: CRC, plasma_cfdna, AUC_val=0.91, n_case=114 n_ctrl=57 — same 0.91
+    # value as the known Bug 1 case; check whether this abstract actually states AUC.
+    {"pmid": "39491766", "gold_verified": False},
+
+    # LLM guess: multi-cancer, plasma_cfdna, AUC_val=0.91, dataset=['NCT02889978']
+    # (a clinical trial registry ID, not a GSE/TCGA accession) — check both the
+    # AUC and whether NCT02889978 should count as a dataset_id at all.
+    {"pmid": "36400018", "gold_verified": False},
+
+    # LLM guess: multi-cancer, plasma_cfdna, AUC_val=0.979, dataset=['HYGEIA']
+    # (a named platform/panel, not a GSE/TCGA accession) — dataset_ids edge case.
+    {"pmid": "41851734", "gold_verified": False},
+
+    # LLM guess: CRC, plasma_cfdna, no metrics, dataset=['ColonAiQ'] (commercial
+    # assay name, not a GSE/TCGA accession) — dataset_ids edge case.
+    {"pmid": "39604913", "gold_verified": False},
+
+    # LLM guess: esophagogastric, plasma_cfdna, n_case=122, no metrics — only
+    # non-CRC/breast cancer type in this batch, useful for cancer_type coverage.
+    {"pmid": "42149660", "gold_verified": False},
+
+    # LLM guess: CRC, sample_type=tissue, no metrics — check tissue classification
+    # is actually correct (not another tissue/cfDNA mixup).
+    {"pmid": "41828475", "gold_verified": False},
+
+    # LLM guess: CRC, plasma_cfdna, AUC_val=0.955, n_case=67, no dataset — looks
+    # like a "clean" high-confidence case, useful as a baseline sanity check.
+    {"pmid": "40992728", "gold_verified": False},
+
+    # LLM guess: CRC, sample_type=unknown, no metrics — investigate why sample
+    # type wasn't determined (abstract ambiguity vs. extraction gap).
+    {"pmid": "42240732", "gold_verified": False},
 ]
 
 _SCALAR_FIELDS = [
@@ -105,27 +134,41 @@ def _norm(v: Any) -> Any:
 def compare_record(gold: Dict[str, Any], predicted: Dict[str, Any]) -> List[Dict[str, Any]]:
     """Return a list of {field, gold, predicted, match} for every gold field present."""
     rows: List[Dict[str, Any]] = []
+    sample_type_row: Dict[str, Any] | None = None
 
     for field in _SCALAR_FIELDS:
         if field not in gold:
             continue
         pred_val = predicted.get(field)
-        rows.append({
+        row = {
             "field": field,
             "gold": gold[field],
             "predicted": pred_val,
             "match": _norm(gold[field]) == _norm(pred_val),
-        })
+        }
+        rows.append(row)
+        if field == "sample_type":
+            sample_type_row = row
 
     if "performance_metrics" in gold:
         pred_metrics = predicted.get("performance_metrics") or {}
         for sub_key, gold_val in gold["performance_metrics"].items():
             pred_val = pred_metrics.get(sub_key)
+            match = gold_val == pred_val
+            # A metric can match numerically while still being wrong if it's
+            # attached to the wrong sample_type (e.g. the tissue AUC reported
+            # under a plasma_cfdna classification — Bug 2, PMID 40860669).
+            # Flag this instead of silently counting it as a clean pass.
+            attribution_risk = (
+                match and gold_val is not None
+                and sample_type_row is not None and not sample_type_row["match"]
+            )
             rows.append({
                 "field": f"performance_metrics.{sub_key}",
                 "gold": gold_val,
                 "predicted": pred_val,
-                "match": gold_val == pred_val,
+                "match": match,
+                "attribution_risk": attribution_risk,
             })
 
     if "dataset_ids_exclude" in gold:
@@ -196,7 +239,8 @@ def run_evaluation() -> None:
         rows = compare_record(gold, predicted)
         for row in rows:
             status = "PASS" if row["match"] else "FAIL"
-            print(f"  [{status}] {row['field']}: gold={row['gold']!r}  predicted={row['predicted']!r}")
+            warning = "  ⚠ ATTRIBUTION RISK — numeric match but sample_type is wrong" if row.get("attribution_risk") else ""
+            print(f"  [{status}] {row['field']}: gold={row['gold']!r}  predicted={row['predicted']!r}{warning}")
         all_rows.extend(rows)
 
     # ------------------------------------------------------------------ #

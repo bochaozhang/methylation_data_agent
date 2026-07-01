@@ -643,7 +643,13 @@ CRITICAL RULES:
    supplementary_links is a list of URLs to supplementary data if mentioned in the abstract,
    otherwise null.
 
-Output schema:
+10. The schema below is a FORMAT TEMPLATE ONLY. Every value in it (numbers, accession IDs,
+    gene names, URLs) is a fake placeholder to illustrate the expected type and shape.
+    Do NOT copy any value from the schema into your output under any circumstance. Every
+    field you output must come from the abstract text itself, or be null if the abstract
+    does not state it.
+
+Output schema (values below are placeholders — do not copy them):
 {
   "cancer_type": "CRC | lung | breast | liver | gastric | pancreatic | multi | other | null",
   "sample_type": "tissue | plasma_cfdna | serum_cfdna | wbc | whole_blood | mixed | unknown",
@@ -651,18 +657,18 @@ Output schema:
   "has_cancer_samples": true,
   "normal_control_description": "e.g. healthy donors n=40, benign polyps n=20",
   "technology": "WGBS | RRBS | EPIC | 450K | MCTA-Seq | targeted | other | null",
-  "dataset_ids": ["GSE12345", "TCGA-COAD"],
-  "sample_size_case": 120,
-  "sample_size_control": 80,
-  "early_stage_count": 30,
+  "dataset_ids": ["<real accession from abstract, e.g. GSE203944>"],
+  "sample_size_case": 143,
+  "sample_size_control": 59,
+  "early_stage_count": 22,
   "has_external_validation": false,
   "supplementary_links": ["https://..."],
   "markers_or_panel": [
-    {"id": "cg12345678", "gene": "SEPT9", "type": "CpG | gene | DMR | panel"}
+    {"id": "cg08122047", "gene": "VIM", "type": "CpG | gene | DMR | panel"}
   ],
   "performance_metrics": {
     "auc_training": null,
-    "auc_validation": 0.91,
+    "auc_validation": 0.76,
     "auc_external": null,
     "sensitivity_at_specificity": "80% sensitivity at 95% specificity"
   },
@@ -670,7 +676,38 @@ Output schema:
   "confidence_level": "high | medium | low",
   "needs_human_review": false,
   "reason": "brief explanation of confidence level and any flags"
-}"""
+}
+
+Reminder: the JSON above is a shape example, not real data. Re-derive every value from the
+abstract you were given."""
+
+# Keywords that must appear in the abstract for an AUC value to be considered real.
+_AUC_KEYWORDS = ("auc", "area under the curve", "roc")
+
+
+def _sanitize_extracted(result: Dict[str, Any], abstract: str) -> Dict[str, Any]:
+    """
+    Post-hoc guard against the LLM anchoring on the schema's example placeholder
+    values instead of the abstract (observed on 2026-06-30: glm-4-flash echoed
+    the schema's example AUC/dataset_ids verbatim, and even copied the literal
+    "<placeholder>" template text, regardless of prompt wording). Enforces
+    CRITICAL RULE 6 in code rather than relying on the model to follow it.
+    """
+    abstract_lower = (abstract or "").lower()
+    has_auc_mention = any(kw in abstract_lower for kw in _AUC_KEYWORDS)
+
+    metrics = result.get("performance_metrics")
+    if isinstance(metrics, dict) and not has_auc_mention:
+        for key in ("auc_training", "auc_validation", "auc_external"):
+            if metrics.get(key) is not None:
+                metrics[key] = None
+
+    dataset_ids = result.get("dataset_ids")
+    if isinstance(dataset_ids, list):
+        cleaned = [d for d in dataset_ids if isinstance(d, str) and "<" not in d and ">" not in d]
+        result["dataset_ids"] = cleaned or None
+
+    return result
 
 
 def extract_paper_structured(
@@ -710,6 +747,7 @@ def extract_paper_structured(
 
     try:
         result = json.loads(content)
+        result = _sanitize_extracted(result, abstract)
         # Ensure traceability fields are set
         if pmid:
             result.setdefault("pmid", pmid)
