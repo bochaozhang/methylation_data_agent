@@ -14,14 +14,10 @@ llm:
   #   OPENAI_BASE_URL=https://open.bigmodel.cn/api/paas/v4
   #   OPENAI_MODEL=glm-4-flash
   # (the factory auto-detects bigmodel.cn and applies correct auth)
-  backend: deepseek
-  # model and temperature are intentionally omitted here:
-  #   - model    → read from DEEPSEEK_MODEL env var at runtime
-  #                (deepseek-chat or deepseek-reasoner; default: deepseek-chat)
-  #   - temperature → auto-selected by llm_factory based on model:
-  #                   deepseek-chat     → 0  (deterministic)
-  #                   deepseek-reasoner → 1  (R1 requirement, fixed by API)
-  api_key_env: DEEPSEEK_API_KEY
+  backend: zhipu
+  model: glm-4-flash
+  api_key_env: ZHIPU_API_KEY
+  temperature: 0
   max_tokens: 4096
 
 download:
@@ -41,6 +37,13 @@ geo:
   ftp_base: ftp://ftp.ncbi.nlm.nih.gov/geo/series
   proxy: ""                   # optional, e.g. "socks5h://127.0.0.1:1080" or "http://proxy:port"
                               # env var NCBI_PROXY overrides this setting
+  # GEO filtering mode:
+  #   false (default) → legacy 3-step funnel (screen → GSM judge → PubMed verify),
+  #                     with hardcoded thresholds.
+  #   true             → spec-driven geo_filter skill: one threshold-free LLM
+  #                     verdict per dataset, following skills/geo_filter/SPEC.md.
+  #                     Edit filtering behaviour by editing that SPEC.md.
+  skill_filter: true
 
 tcga:
   gdc_api_base: https://api.gdc.cancer.gov

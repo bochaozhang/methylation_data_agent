@@ -395,6 +395,50 @@ def _sort_by_confidence(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 # ------------------------------------------------------------------ #
+#  Pass-rate / completeness summary                                   #
+# ------------------------------------------------------------------ #
+
+# field -> predicate that returns True if the structured record has a
+# non-null/non-empty value for that field
+_COMPLETENESS_CHECKS = {
+    "auc (any)": lambda r: any(
+        (r.get("performance_metrics") or {}).get(k) is not None
+        for k in ("auc_training", "auc_validation", "auc_external")
+    ),
+    "dataset_ids": lambda r: bool(r.get("dataset_ids")),
+    "has_normal_control": lambda r: r.get("has_normal_control") is not None,
+    "sample_type": lambda r: r.get("sample_type") not in (None, "unknown"),
+    "markers_or_panel": lambda r: bool(r.get("markers_or_panel")),
+    "data_availability": lambda r: r.get("data_availability") not in (None, "unknown"),
+}
+
+
+def _print_pipeline_summary(
+    total_fetched: int,
+    passed_s1: int,
+    structured: List[Dict[str, Any]],
+) -> None:
+    extracted = len(structured)
+    rejected_s1 = total_fetched - passed_s1
+
+    print(f"\n{'=' * 60}")
+    print("Pipeline summary")
+    print('=' * 60)
+    print(f"  Total fetched:     {total_fetched}")
+    print(f"  Stage 1 passed:    {passed_s1}")
+    print(f"  Stage 1 rejected:  {rejected_s1}")
+    print(f"  Stage 2 extracted: {extracted}")
+
+    if extracted:
+        print("\n  Per-field completeness (Stage 2 output):")
+        for label, check in _COMPLETENESS_CHECKS.items():
+            n_complete = sum(1 for r in structured if check(r))
+            pct = n_complete / extracted * 100
+            print(f"    {label:20s} {n_complete}/{extracted}  ({pct:.0f}%)")
+    print('=' * 60)
+
+
+# ------------------------------------------------------------------ #
 #  Main entry point                                                   #
 # ------------------------------------------------------------------ #
 
@@ -436,6 +480,8 @@ def search_and_extract(
 
     # Stage 2: LLM extraction
     structured = stage2_extract(passed_s1, llm)
+
+    _print_pipeline_summary(len(all_raw), len(passed_s1), structured)
 
     # Sort by confidence
     return _sort_by_confidence(structured)

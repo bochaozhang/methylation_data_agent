@@ -625,6 +625,24 @@ CRITICAL RULES:
    medium = mentions methylation + cancer + controls but key fields are ambiguous
    low    = vaguely relevant, most fields are null
 
+6. Only extract auc_validation/auc_external if the abstract explicitly contains the term
+   "AUC" or "area under the curve" or "ROC". Do NOT infer AUC from sensitivity, specificity,
+   or accuracy values.
+
+7. When a paper reports metrics for both tissue and cfDNA samples, only report the metrics
+   matching the PRIMARY sample_type you assigned. If you set sample_type to plasma_cfdna,
+   only report cfDNA metrics, not tissue metrics.
+
+8. Only extract dataset_ids that contain the study's PRIMARY experimental data. Exclude
+   datasets used only as reference panels, background noise filters, normalization controls,
+   or annotation sources.
+
+9. early_stage_count is an integer count of early-stage (I/II) samples, only if the abstract
+   explicitly states it — otherwise null. has_external_validation is a boolean: true only if
+   the abstract describes validation on an independent/external cohort, otherwise false.
+   supplementary_links is a list of URLs to supplementary data if mentioned in the abstract,
+   otherwise null.
+
 Output schema:
 {
   "cancer_type": "CRC | lung | breast | liver | gastric | pancreatic | multi | other | null",
@@ -638,6 +656,7 @@ Output schema:
   "sample_size_control": 80,
   "early_stage_count": 30,
   "has_external_validation": false,
+  "supplementary_links": ["https://..."],
   "markers_or_panel": [
     {"id": "cg12345678", "gene": "SEPT9", "type": "CpG | gene | DMR | panel"}
   ],

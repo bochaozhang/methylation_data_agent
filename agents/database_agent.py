@@ -25,6 +25,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
 
 from registry.registry import Registry
+from skills.geo_filter import apply_verdict, filter_dataset
 from state.graph_state import MethyAgentState
 from tools.geo_tools import GEOClient
 from tools.parser_tools import SAMPLE_TYPE_RELATED, TCGA_CODE_TO_ENGLISH
@@ -297,6 +298,14 @@ class DatabaseAgent:
         gdc_token = os.environ.get(config["tcga"].get("gdc_token_env", ""), "")
         self.gdc_client = GDCClient(token=gdc_token or None)
 
+        # Feature flag: when True, GEO filtering uses the spec-driven geo_filter
+        # skill (single threshold-free verdict per dataset) instead of the legacy
+        # 3-step funnel (screen → GSM judge → PubMed verify). Default off for a
+        # safe rollout; flip via config/settings.yaml → geo.skill_filter.
+        self._use_skill_filter = bool(config.get("geo", {}).get("skill_filter", False))
+        if self._use_skill_filter:
+            logger.info("DatabaseAgent: GEO skill_filter ENABLED (spec-driven, no thresholds)")
+
 
     # ------------------------------------------------------------------ #
     #  LangGraph node entry point                                          #
@@ -374,6 +383,18 @@ class DatabaseAgent:
                 notes=c.get("notes"),
                 no_pubmed_link=_no_pubmed,
                 sample_metadata_path=c.get("sample_metadata_path"),
+                # Verdict fields (populated by geo_filter skill / PubMed verify).
+                # COALESCE in upsert → no-op when absent (legacy/T proteins).
+                # NOTE: `consistency` is a DB column but not an upsert kwarg; it
+                # stays on the dataset dict / _verdict for reporting only.
+                usable=c.get("usable", 1),
+                recommended_action=c.get("recommended_action"),
+                reason=c.get("reason"),
+                stage_treatment=c.get("stage_treatment"),
+                available_file_type=c.get("available_file_type"),
+                sample_level_annotation=c.get("sample_level_annotation"),
+                disease_groups=c.get("disease_groups"),
+                needs_review=(c.get("recommended_action") == "manual_review"),
                 download_status="awaiting_approval",
             )
             self.registry.log_event(
@@ -461,6 +482,17 @@ class DatabaseAgent:
 
             logger.info(f"GEO: {len(datasets)} datasets after platform/year filter")
 
+            # ============================================================ #
+            #  Branch: spec-driven geo_filter skill vs legacy 3-step funnel #
+            # ============================================================ #
+            if self._use_skill_filter:
+                keep_list = self._filter_datasets_skill_concurrent(datasets, intent)
+                logger.info(
+                    f"GEO (skill_filter): {len(keep_list)}/{len(datasets)} datasets "
+                    f"→ awaiting_approval"
+                )
+                return keep_list
+
             # ---- Step 1: GEO metadata screening (no NCBI calls, LLM only) ----
             datasets = self._geo_screen_datasets_concurrent(datasets, intent=intent)
             logger.info(f"GEO Step 1: {len(datasets)} datasets passed metadata screen")
@@ -491,6 +523,163 @@ class DatabaseAgent:
         except Exception as e:
             logger.error(f"GEO search failed: {e}")
             return []
+
+    # ------------------------------------------------------------------ #
+    #  Skill path: spec-driven geo_filter (threshold-free)                #
+    # ------------------------------------------------------------------ #
+
+    def _filter_dataset_skill(
+        self,
+        ds: Dict[str, Any],
+        intent: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Apply the geo_filter skill to a single dataset.
+
+        Fetches representative GSM details (+ optional PubMed abstract) and
+        asks the LLM — guided by the SPEC — for one verdict. Returns the
+        dataset dict enriched with verdict fields (ready for registry upsert)
+        plus a written sample_metadata.csv (representative coverage).
+        """
+        acc = ds.get("accession", "?")
+        wanted = intent.get("sample_type", "") or ""
+        gsm_details = self.geo_client.get_representative_gsm_details(
+            acc, wanted_sample_type=wanted
+        )
+
+        abstract = None
+        pmids = ds.get("pubmed_ids") or []
+        if pmids:
+            try:
+                abstract = self.geo_client.fetch_pubmed_abstract(str(pmids[0]))
+            except Exception as e:
+                logger.debug(f"_filter_dataset_skill({acc}): abstract fetch failed ({e})")
+
+        verdict = filter_dataset(self.llm, ds, intent, gsm_details, abstract=abstract)
+        enriched = apply_verdict(ds, verdict)
+        if pmids:
+            enriched["paper_pmid"] = str(pmids[0])
+
+        enriched["sample_metadata_path"] = self._write_sample_metadata_csv(
+            acc, gsm_details, verdict, intent
+        )
+        return enriched
+
+    def _write_sample_metadata_csv(
+        self,
+        acc: str,
+        gsm_details: List[Dict[str, Any]],
+        verdict: Dict[str, Any],
+        intent: Dict[str, Any],
+    ) -> Optional[str]:
+        """
+        Write representative GSM metadata + the verdict's per-sample verdict to
+        {output_dir}/{accession}/sample_metadata.csv. Mirrors the legacy
+        artifact shape, with representative coverage instead of full efetch.
+        """
+        import datetime as _dt
+        from pathlib import Path
+
+        import pandas as pd
+
+        data_dir = self.config.get("download", {}).get("output_dir", "/data")
+        csv_path = Path(data_dir) / acc / "sample_metadata.csv"
+        try:
+            inc_map = {str(g.get("gsm")): g for g in (verdict.get("gsm_includes") or [])}
+            rows = []
+            for g in gsm_details:
+                row = {
+                    "gsm": g.get("gsm", ""),
+                    "source_name": g.get("source_name", ""),
+                    "molecule": g.get("molecule", ""),
+                    "group": g.get("group", "unknown"),
+                }
+                for k, v in (g.get("characteristics") or {}).items():
+                    row[k] = v
+                rows.append(row)
+            df = pd.DataFrame(rows)
+
+            _raw_q = (intent.get("raw_query") or "").strip()
+            qcol = (
+                _raw_q[:80]
+                if _raw_q
+                else f"query_{_dt.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            )
+            df[qcol] = df["gsm"].map(
+                lambda g: (
+                    "include"
+                    if inc_map.get(str(g), {}).get("include", True)
+                    else f"exclude: {inc_map.get(str(g), {}).get('reason', 'unknown')}"
+                )
+            )
+
+            csv_path.parent.mkdir(parents=True, exist_ok=True)
+            df.to_csv(csv_path, index=False)
+            logger.debug(f"_write_sample_metadata_csv({acc}): wrote {csv_path}")
+            return str(csv_path)
+        except Exception as e:
+            logger.warning(f"_write_sample_metadata_csv({acc}): write failed ({e})")
+            return None
+
+    def _filter_datasets_skill_concurrent(
+        self,
+        datasets: List[Dict[str, Any]],
+        intent: Dict[str, Any],
+        max_concurrent: int = 3,
+    ) -> List[Dict[str, Any]]:
+        """
+        Run the geo_filter skill on all datasets concurrently (Semaphore=3,
+        since each call triggers several efetch requests). Returns the datasets
+        to keep: recommended_action in {keep, manual_review}. exclude and
+        article_only are dropped (per SPEC: not usable data).
+        """
+        if not datasets:
+            return []
+
+        sem = asyncio.Semaphore(max_concurrent)
+
+        async def _filter_one_async(ds: Dict[str, Any]) -> Dict[str, Any]:
+            async with sem:
+                loop = asyncio.get_event_loop()
+                return await loop.run_in_executor(
+                    None, self._filter_dataset_skill, ds, intent
+                )
+
+        async def _run_all() -> List[Dict[str, Any]]:
+            tasks = [_filter_one_async(ds) for ds in datasets]
+            return await asyncio.gather(*tasks)
+
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures as _cf
+                with _cf.ThreadPoolExecutor() as pool:
+                    future = pool.submit(asyncio.run, _run_all())
+                    judged = future.result()
+            else:
+                judged = loop.run_until_complete(_run_all())
+        except RuntimeError:
+            judged = asyncio.run(_run_all())
+
+        keep_list = [
+            d for d in judged
+            if d.get("recommended_action") in ("keep", "manual_review")
+        ]
+        reject_list = [
+            d for d in judged
+            if d.get("recommended_action") not in ("keep", "manual_review")
+        ]
+        logger.info(
+            f"geo_filter (skill): {len(datasets)} total → "
+            f"{len(keep_list)} kept, {len(reject_list)} excluded"
+        )
+        for d in reject_list:
+            logger.info(
+                f"  Skill-excluded {d.get('accession','?')}: "
+                f"action={d.get('recommended_action')} "
+                f"reason={(d.get('reason') or '')[:80]}"
+            )
+        return keep_list
 
     def _fetch_geo_by_accessions(self, accessions: List[str]) -> List[Dict[str, Any]]:
         """Fetch metadata for explicit GEO accessions."""

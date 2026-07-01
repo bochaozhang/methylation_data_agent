@@ -1,11 +1,96 @@
+# ---- Python ----
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
 
-# Misc
-.env
-data/
-logs/
-registry/methyagent.db
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Unit test / coverage
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+.pytest_cache/
+*.cover
+
+# Type checking
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# ---- Project specific ----
+# Environment variables (secrets)
+.env
+.env.local
+.env.*.local
+
+# Data and output (large files)
+data/
+data/methylation/
+registry/*.db
+registry/*.db.bak
+registry/*.db-journal
+registry/*.db-shm
+registry/*.db-wal
+
+# Logs
+logs/
+*.log
+logs.txt
+*.log.*
+
+# Report files
+report_*.json
+report_*.md
+geo_candidates_*.json
+
+# Cache and temporary
+*.cache
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
+
+# ---- Docker ----
+docker-compose.override.yml
+
+# ---- CI/CD ----
+.github/workflows/*.local.yml
