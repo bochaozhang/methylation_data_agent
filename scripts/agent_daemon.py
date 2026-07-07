@@ -245,7 +245,15 @@ def run_pending_downloads(registry: Registry) -> None:
     try:
         from tools.download_tools import DownloadEngine, build_geo_download_tasks, build_tcga_download_tasks
         config = load_config()
-        downloader = DownloadEngine(config=config)
+        dl_cfg = config["download"]
+        downloader = DownloadEngine(
+            output_dir=dl_cfg["output_dir"],
+            max_concurrent=dl_cfg["max_concurrent"],
+            retry_attempts=dl_cfg["retry_attempts"],
+            retry_delay=dl_cfg["retry_delay"],
+            chunk_size_mb=dl_cfg["chunk_size_mb"],
+            timeout=dl_cfg["timeout"],
+        )
     except Exception as exc:
         logger.error(f"[download] Failed to initialise DownloadEngine: {exc}")
         return
