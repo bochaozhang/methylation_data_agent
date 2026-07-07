@@ -14,10 +14,9 @@ llm:
   #   OPENAI_BASE_URL=https://open.bigmodel.cn/api/paas/v4
   #   OPENAI_MODEL=glm-4-flash
   # (the factory auto-detects bigmodel.cn and applies correct auth)
-  backend: zhipu
-  model: glm-4-flash
-  api_key_env: ZHIPU_API_KEY
-  temperature: 0
+  backend: deepseek
+  # model read from DEEPSEEK_MODEL env (deepseek-chat); temperature auto-selected
+  api_key_env: DEEPSEEK_API_KEY
   max_tokens: 4096
 
 download:
@@ -113,3 +112,7 @@ literature:
 logging:
   level: INFO
   log_file: /app/data/logs/methyagent.log
+  # Per-query CSV log of geo_filter judgments (one file per query under
+  # {download.output_dir}/query_logs/). Records the LLM model, the 注意事项
+  # SPEC name, and one row per dataset: keep/exclude, reason, token usage.
+  query_csv: true

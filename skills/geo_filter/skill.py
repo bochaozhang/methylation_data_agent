@@ -58,6 +58,7 @@ single JSON object (no markdown fences, no prose outside the JSON). The object
 MUST have exactly these keys:
 
 {
+  "reasoning": "<REQUIRED: step-by-step logic chain — see below>",
   "usable": "yes" | "no" | "partial" | "unclear",
   "recommended_action": "keep" | "exclude" | "article_only" | "manual_review",
   "confirmed_sample_type": "plasma|tumor|adjacent|normal|wbc|cfdna|serum|whole_blood|cell_line|other|unknown",
@@ -76,6 +77,16 @@ MUST have exactly these keys:
 }
 
 Field guidance:
+- reasoning (REQUIRED, fill FIRST): a short step-by-step logic chain that walks through, in order:
+    1. What biological samples this dataset actually contains (use GSM details + summary + abstract).
+    2. Human / target cancer type? (per SPEC)
+    3. Sample type vs request — note that plasma / serum ARE cell-free DNA (cfDNA).
+    4. Are there non-cancer / control samples as the request needs?
+    5. File type / data type (is it methylation? downloadable?)
+    6. Therefore → the verdict.
+  This chain is logged for human audit, so it MUST make your logic explicit and
+  internally consistent. If your chain shows the requested samples ARE present,
+  the verdict MUST follow that — do not contradict your own reasoning.
 - recommended_action values:
     keep           → usable data matching the request; queue for approval
     exclude        → cell line / organoid / animal / in-vitro / treated / non-target /
@@ -93,6 +104,26 @@ Field guidance:
 
 
 SYSTEM_PROMPT: str = SPEC + "\n" + _OUTPUT_CONTRACT
+
+
+def _parse_spec_name(spec_text: str) -> str:
+    """Return the SPEC document name from its first '# ' heading.
+
+    The user manages versioning by renaming the source doc (e.g. updating the
+    title to '... v4'); the logger simply records whatever this name is.
+    """
+    for line in spec_text.splitlines():
+        line = line.strip()
+        if line.startswith("#"):
+            return line.lstrip("# ").strip() or "unknown"
+        elif line:
+            break
+    return "unknown"
+
+
+# Name of the filtering SPEC (auto-derived from SPEC.md heading, e.g.
+# 'GEO 数据检索注意事项 v3'). Recorded in the per-query CSV log.
+SPEC_NAME: str = _parse_spec_name(SPEC)
 
 
 # ---------------------------------------------------------------------- #
@@ -233,9 +264,21 @@ def filter_dataset(
         raw = response.content if isinstance(response.content, str) else str(response.content)
         verdict = _safe_json(raw)
 
-        # Normalise enum fields + log cache telemetry.
-        _log_cache(acc, response)
+        # Capture token usage + API-returned model (for the per-query CSV log).
+        usage = _extract_usage(response)
+        if usage.get("cached_tokens"):
+            logger.debug(f"geo_filter {acc}: cached_tokens={usage['cached_tokens']}")
         verdict = _normalise_verdict(verdict, gsm_details)
+        verdict["_usage"] = usage
+        # Evidence snapshot (logged so a human can see WHAT the model was given
+        # alongside HOW it reasoned — e.g. all-unknown GSM groups + no abstract
+        # = weak evidence that often explains a bad verdict).
+        verdict["_evidence"] = {
+            "gsm_groups": group_summary(gsm_details),
+            "n_representative_gsm": len(gsm_details),
+            "had_abstract": bool(abstract),
+            "geo_sample_count": ds.get("sample_count"),
+        }
         logger.info(
             f"geo_filter {acc}: action={verdict.get('recommended_action')} "
             f"usable={verdict.get('usable')} sample={verdict.get('confirmed_sample_type')} "
@@ -258,20 +301,47 @@ def filter_dataset(
             "disease_groups": None,
             "reason": f"filter_error: {e}",
             "notes": f"filter_error: {e}",
+            "reasoning": f"filter_error: {e}",
             "gsm_includes": [],
         }
 
 
-def _log_cache(acc: str, response: Any) -> None:
-    usage = getattr(response, "usage_metadata", None) or getattr(response, "response_metadata", {})
-    if isinstance(usage, dict):
-        cached = (
-            usage.get("cached_tokens")
-            or usage.get("prompt_tokens_details", {}).get("cached_tokens", 0)
-            or 0
-        )
-        if cached:
-            logger.debug(f"geo_filter {acc}: cached_tokens={cached}")
+def _extract_usage(response: Any) -> Dict[str, Any]:
+    """
+    Pull token-usage + the API-returned model name from an LLM response.
+
+    Handles both LangChain's standardized `usage_metadata` (input_tokens /
+    output_tokens / total_tokens / input_token_details.cache_read) and the raw
+    OpenAI-style `response_metadata` (prompt_tokens / completion_tokens /
+    prompt_tokens_details.cached_tokens). Returns 0s if unavailable.
+    """
+    um = getattr(response, "usage_metadata", None) or {}
+    if not isinstance(um, dict):
+        um = {}
+    rm = getattr(response, "response_metadata", None) or {}
+    if not isinstance(rm, dict):
+        rm = {}
+
+    itd = um.get("input_token_details") or {}
+    cached = (
+        itd.get("cache_read")
+        or itd.get("cached_tokens")
+        or um.get("cached_tokens")
+        or rm.get("prompt_tokens_details", {}).get("cached_tokens", 0)
+        or 0
+    )
+    prompt = um.get("input_tokens") or um.get("prompt_tokens") or rm.get("prompt_tokens") or 0
+    completion = um.get("output_tokens") or um.get("completion_tokens") or rm.get("completion_tokens") or 0
+    total = um.get("total_tokens") or rm.get("total_tokens") or (prompt + completion) or 0
+    api_model = rm.get("model_name") or rm.get("model") or ""
+
+    return {
+        "prompt_tokens": int(prompt),
+        "completion_tokens": int(completion),
+        "total_tokens": int(total),
+        "cached_tokens": int(cached),
+        "api_model": str(api_model),
+    }
 
 
 # Enum normalisation so downstream code never sees an unexpected value.
@@ -287,6 +357,11 @@ def _normalise_verdict(verdict: Dict[str, Any], gsm_details: List[Dict[str, Any]
     usable = verdict.get("usable")
     if usable not in _USABLE_VALUES:
         verdict["usable"] = "unclear"
+
+    # Ensure the reasoning chain is a non-empty string (default "" so the CSV
+    # column always exists; an empty value signals the model skipped it).
+    if not isinstance(verdict.get("reasoning"), str):
+        verdict["reasoning"] = ""
 
     # Ensure gsm_includes is a list of well-formed dicts covering the representatives.
     raw_inc = verdict.get("gsm_includes") or []

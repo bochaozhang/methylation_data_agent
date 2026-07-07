@@ -25,8 +25,9 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
 
 from registry.registry import Registry
-from skills.geo_filter import apply_verdict, filter_dataset
+from skills.geo_filter import SPEC_NAME, apply_verdict, filter_dataset
 from state.graph_state import MethyAgentState
+from utils.query_logger import QueryLogger
 from tools.geo_tools import GEOClient
 from tools.parser_tools import SAMPLE_TYPE_RELATED, TCGA_CODE_TO_ENGLISH
 from tools.tcga_tools import GDCClient
@@ -306,10 +307,33 @@ class DatabaseAgent:
         if self._use_skill_filter:
             logger.info("DatabaseAgent: GEO skill_filter ENABLED (spec-driven, no thresholds)")
 
+        # Per-query CSV log (one file per query, with model/SPEC metadata +
+        # per-dataset verdicts + token usage). Toggle via settings.yaml → logging.query_csv.
+        self._query_csv = bool(config.get("logging", {}).get("query_csv", True))
+        # Populated per run() — the active query's logger.
+        self._qlog: Optional[QueryLogger] = None
+
 
     # ------------------------------------------------------------------ #
     #  LangGraph node entry point                                          #
     # ------------------------------------------------------------------ #
+
+    def _llm_model_name(self) -> str:
+        """Best-effort LLM model identifier (config model name / env / llm attr)."""
+        cfg_model = (self.config.get("llm") or {}).get("model")
+        env_model = (
+            os.environ.get("DEEPSEEK_MODEL")
+            or os.environ.get("ZHIPU_MODEL")
+            or os.environ.get("OPENAI_MODEL")
+            or os.environ.get("ANTHROPIC_MODEL")
+        )
+        return (
+            getattr(self.llm, "model_name", None)
+            or getattr(self.llm, "model", None)
+            or env_model
+            or cfg_model
+            or "unknown"
+        )
 
     def run(self, state: MethyAgentState) -> MethyAgentState:
         """
@@ -317,6 +341,25 @@ class DatabaseAgent:
         Takes the current state, runs the database search+download pipeline,
         and returns the updated state.
         """
+        # Start a per-query CSV logger (best-effort; failures are swallowed).
+        if self._query_csv:
+            self._qlog = QueryLogger(
+                query=state.get("raw_query", ""),
+                model_name=self._llm_model_name(),
+                spec_name=SPEC_NAME,
+                output_dir=self.config.get("download", {}).get("output_dir", "./data/methylation"),
+            )
+        else:
+            self._qlog = None
+
+        try:
+            return self._run_impl(state)
+        finally:
+            if self._qlog is not None:
+                self._qlog.finalize()
+
+    def _run_impl(self, state: MethyAgentState) -> MethyAgentState:
+        """Actual pipeline body (wrapped by run() for query-log lifecycle)."""
         intent = state.get("parsed_intent", {})
         logger.info(f"DatabaseAgent starting. Intent: {intent}")
 
@@ -556,6 +599,9 @@ class DatabaseAgent:
                 logger.debug(f"_filter_dataset_skill({acc}): abstract fetch failed ({e})")
 
         verdict = filter_dataset(self.llm, ds, intent, gsm_details, abstract=abstract)
+        # Record this judgment in the per-query CSV log (thread-safe).
+        if self._qlog is not None:
+            self._qlog.log_dataset(ds, verdict)
         enriched = apply_verdict(ds, verdict)
         if pmids:
             enriched["paper_pmid"] = str(pmids[0])
