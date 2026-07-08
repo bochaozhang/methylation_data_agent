@@ -23,6 +23,10 @@ services:
     environment:
       LOG_LEVEL: "DEBUG"
       POLL_INTERVAL: "3"
+      # v1 (default) = agents/orchestrator.py, the working pipeline. Set to "v2"
+      # to switch to the new agentic agents/orchestrator_v2.py. Overrides
+      # settings.yaml's orchestrator.version.
+      ORCHESTRATOR_VERSION: "v1"
 
   agent2:
     volumes:
@@ -32,6 +36,7 @@ services:
     environment:
       LOG_LEVEL: "DEBUG"
       POLL_INTERVAL: "3"
+      ORCHESTRATOR_VERSION: "v1"
 
   webui:
     command: >

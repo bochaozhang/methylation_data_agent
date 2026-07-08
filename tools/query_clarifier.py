@@ -28,6 +28,9 @@ from tools.parser_tools import (
     _load_cancer_synonyms,
     parse_query_rules,
 )
+from utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 # ============================================================
@@ -710,6 +713,139 @@ def _sanitize_extracted(result: Dict[str, Any], abstract: str) -> Dict[str, Any]
     return result
 
 
+# Sentence boundary: punctuation + whitespace + capital letter. Deliberately does
+# NOT special-case decimals (e.g. "0.922") — a decimal point is never followed by
+# whitespace, so \s+ already excludes it without a lookbehind that would otherwise
+# also block real sentence breaks like "...AUC of 0.728. The findings..."
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z])")
+
+# sample_type enum (from _EXTRACTOR_SYSTEM schema) -> synonyms to look for in the
+# same sentence as a reported AUC value. mixed/unknown are deliberately omitted:
+# there's no single synonym set to cross-check against.
+_SAMPLE_TYPE_SYNONYMS: Dict[str, tuple] = {
+    "tissue": ("tissue", "tumor", "tumour", "biopsy", "resection"),
+    "plasma_cfdna": ("plasma", "cfdna", "cell-free dna", "circulating", "ctdna"),
+    "serum_cfdna": ("serum", "cfdna", "cell-free dna", "circulating"),
+    "wbc": ("wbc", "leukocyte", "buffy coat", "pbmc", "white blood cell"),
+    "whole_blood": ("whole blood",),
+}
+
+# Keywords marking a dataset mention as a reference/background/normalization
+# panel rather than the study's primary experimental data.
+_REFERENCE_DATASET_KEYWORDS = (
+    "reference", "background", "normalization", "normalisation",
+    "control panel", "filter",
+)
+
+
+def _split_sentences(text: str) -> List[str]:
+    if not text:
+        return []
+    return [s.strip() for s in _SENTENCE_SPLIT_RE.split(text) if s.strip()]
+
+
+def _auc_value_candidates(value: Any) -> List[str]:
+    """Plausible textual forms of a numeric AUC value, e.g. 0.922 -> ["0.922", "92.2%", ...]."""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return []
+    candidates = []
+    for s in (f"{f:.3f}", f"{f:.2f}", f"{f:.1f}", str(f)):
+        if s not in candidates:
+            candidates.append(s)
+    pct = f * 100
+    for s in (f"{pct:.1f}%", f"{pct:.0f}%"):
+        if s not in candidates:
+            candidates.append(s)
+    return candidates
+
+
+def _validate_auc_sample_type_cooccurrence(result: Dict[str, Any], abstract: str) -> Dict[str, Any]:
+    """
+    Bug fix (PMID 40860669, 2026-07-03): the LLM sometimes reports an AUC value
+    measured on one sample type (e.g. tissue/TCGA, AUC=0.922) under a different
+    assigned sample_type (e.g. plasma_cfdna, real cfDNA AUC=0.728). Require the
+    AUC value and the assigned sample_type (or a synonym) to appear in the same
+    abstract sentence; otherwise null the value and flag for human review.
+    """
+    metrics = result.get("performance_metrics")
+    if not isinstance(metrics, dict):
+        return result
+
+    synonyms = _SAMPLE_TYPE_SYNONYMS.get(result.get("sample_type"))
+    if not synonyms:
+        return result  # mixed/unknown/unrecognized — nothing reliable to check against
+
+    sentences = _split_sentences(abstract)
+    if not sentences:
+        return result
+
+    flagged = False
+    for key in ("auc_training", "auc_validation", "auc_external"):
+        value = metrics.get(key)
+        if value is None:
+            continue
+        candidates = _auc_value_candidates(value)
+        sentence = next(
+            (s for s in sentences if any(c in s for c in candidates)),
+            None,
+        )
+        if sentence is None:
+            # Couldn't locate the value verbatim in the abstract — leave it to the
+            # existing AUC-keyword sanitizer above rather than guessing.
+            continue
+        if not any(syn in sentence.lower() for syn in synonyms):
+            metrics[key] = None
+            flagged = True
+
+    if flagged:
+        result["needs_human_review"] = True
+        note = "AUC value did not co-occur with assigned sample_type in the same sentence; nulled for review."
+        result["reason"] = f"{result.get('reason') or ''} {note}".strip()
+
+    return result
+
+
+def _exclude_reference_datasets(result: Dict[str, Any], abstract: str) -> Dict[str, Any]:
+    """
+    Bug fix (PMID 40860669, 2026-07-03): exclude accessions used only as a
+    reference/background/normalization panel (e.g. GSE50132, cited only as a
+    background-methylation filter set) rather than the study's primary data.
+    Scans ~15 words of context on either side of each accession's mention.
+    """
+    dataset_ids = result.get("dataset_ids")
+    if not isinstance(dataset_ids, list) or not dataset_ids or not abstract:
+        return result
+
+    words = abstract.split()
+    lower_words = [w.lower() for w in words]
+
+    kept, excluded = [], []
+    for accession in dataset_ids:
+        if not isinstance(accession, str):
+            continue
+        is_reference = False
+        for idx, word in enumerate(words):
+            if accession not in word:
+                continue
+            window = " ".join(lower_words[max(0, idx - 15):idx + 16])
+            if any(kw in window for kw in _REFERENCE_DATASET_KEYWORDS):
+                is_reference = True
+                break
+        (excluded if is_reference else kept).append(accession)
+
+    if excluded:
+        result["dataset_ids"] = kept or None
+        result["excluded_reference_datasets"] = excluded
+        logger.info(
+            f"Excluded reference/background dataset(s) {excluded} "
+            f"(PMID {result.get('pmid', '')})"
+        )
+
+    return result
+
+
 def extract_paper_structured(
     abstract: str,
     llm: BaseChatModel,
@@ -748,6 +884,8 @@ def extract_paper_structured(
     try:
         result = json.loads(content)
         result = _sanitize_extracted(result, abstract)
+        result = _validate_auc_sample_type_cooccurrence(result, abstract)
+        result = _exclude_reference_datasets(result, abstract)
         # Ensure traceability fields are set
         if pmid:
             result.setdefault("pmid", pmid)

@@ -117,22 +117,35 @@ def main():
     # ---- Check API key ----
     _check_api_key(config)
 
+    # ---- Pick orchestrator version ----
+    # Priority: ORCHESTRATOR_VERSION env var > orchestrator.version in settings.yaml > "v1".
+    # v1 = agents/orchestrator.py (fixed sequential pipeline, in production use).
+    # v2 = agents/orchestrator_v2.py (agentic tool-calling graph, new/experimental).
+    orchestrator_version = (
+        os.environ.get("ORCHESTRATOR_VERSION")
+        or config.get("orchestrator", {}).get("version", "v1")
+    ).lower()
+
     # ---- Run MethyAgent ----
     print(f"\n{'='*60}")
     print(f"  MethyAgent Starting")
-    print(f"  Query : {args.query}")
-    print(f"  Mode  : {args.agent}")
-    print(f"  Output: {config['download']['output_dir']}")
+    print(f"  Query       : {args.query}")
+    print(f"  Mode        : {args.agent}")
+    print(f"  Orchestrator: {orchestrator_version}")
+    print(f"  Output      : {config['download']['output_dir']}")
     print(f"{'='*60}\n")
 
-    from agents.orchestrator import run_methyagent
-
     try:
-        final_state = run_methyagent(
-            query=args.query,
-            config_path=args.config,
-            agent_mode=args.agent,
-        )
+        if orchestrator_version == "v2":
+            from agents.orchestrator_v2 import run_methyagent_v2
+            final_state = run_methyagent_v2(query=args.query, config_path=args.config)
+        else:
+            from agents.orchestrator import run_methyagent
+            final_state = run_methyagent(
+                query=args.query,
+                config_path=args.config,
+                agent_mode=args.agent,
+            )
     except KeyboardInterrupt:
         print("\n[INTERRUPTED] MethyAgent stopped by user.")
         print("  Partial results are saved in the registry.")
@@ -145,7 +158,10 @@ def main():
         sys.exit(1)
 
     # ---- Print summary ----
-    _print_summary(final_state)
+    if orchestrator_version == "v2":
+        _print_summary_v2(final_state)
+    else:
+        _print_summary(final_state)
 
 
 def _show_status(config: dict):
@@ -227,6 +243,22 @@ def _check_api_key(config: dict):
         print(f"  The system will use rule-based query parsing (no LLM).")
         print(f"  Set the environment variable for full LLM-powered parsing:\n")
         print(f"    export {api_key_env}=your_api_key_here\n")
+
+
+def _print_summary_v2(report: dict):
+    """Print a human-readable summary of an orchestrator_v2 (agentic) run."""
+    print(f"\n{'='*60}")
+    print(f"  MethyAgent (v2, agentic) Completed")
+    print(f"{'='*60}")
+    print(f"\nQuery: {report.get('query', '')}")
+    print(f"\nResults:")
+    print(f"  Papers found        : {report.get('papers_found', 0)}")
+    print(f"  GEO datasets evaluated : {len(report.get('gse_evaluated', []))}")
+    print(f"  Registry writes     : {len(report.get('registry_writes', []))}")
+    if report.get("agent_summary"):
+        print(f"\nAgent summary:\n  {report['agent_summary']}")
+    if report.get("log_path"):
+        print(f"\nRun log saved: {report['log_path']}")
 
 
 def _print_summary(state: dict):

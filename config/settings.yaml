@@ -27,6 +27,12 @@ download:
   chunk_size_mb: 10
   timeout: 300             # seconds per request
 
+orchestrator:
+  # v1 → agents/orchestrator.py (fixed sequential pipeline; production default).
+  # v2 → agents/orchestrator_v2.py (agentic tool-calling graph; new/experimental).
+  # Override at deploy time with the ORCHESTRATOR_VERSION env var (takes priority).
+  version: v1
+
 registry:
   db_path: ./registry/methyagent.db
 

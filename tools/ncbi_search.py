@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional
 import requests
 from langchain_core.language_models import BaseChatModel
 
+from tools.extraction_reviewer import review_extraction
 from tools.parser_tools import parse_query_rules
 from tools.query_clarifier import (
     build_pubmed_query_with_controls,
@@ -353,11 +354,20 @@ def stage2_extract(
     records: List[Dict[str, str]],
     llm: BaseChatModel,
     max_records: int = _STAGE2_MAX,
+    review: bool = True,
 ) -> List[Dict[str, Any]]:
     """
     Run extract_paper_structured() on each record passing Stage 1.
     Capped at max_records to limit LLM calls (each call ~3-8s).
     Prints progress so callers can see it's working.
+
+    Args:
+        review: When True (default), pass each draft extraction through
+            review_extraction() (tools/extraction_reviewer.py) — a second
+            LLM call that independently re-checks AUC/sample_type
+            consistency (Bug 2) and dataset_id attribution (Bug 3) against
+            the abstract. Costs one extra LLM call per record; set False to
+            skip for cost/speed.
     """
     capped = records[:max_records]
     if len(records) > max_records:
@@ -366,15 +376,21 @@ def stage2_extract(
     structured: List[Dict[str, Any]] = []
     for i, rec in enumerate(capped, 1):
         pmid = rec.get("pmid", "")
+        abstract = rec.get("abstract", "")
         print(f"  [stage2] {i}/{len(capped)} LLM extract — PMID={pmid} ...", flush=True)
         result = extract_paper_structured(
-            abstract=rec.get("abstract", ""),
+            abstract=abstract,
             llm=llm,
             pmid=pmid,
             title=rec.get("title", ""),
         )
         result.setdefault("pmid", pmid)
         result.setdefault("title", rec.get("title", ""))
+
+        if review:
+            print(f"  [stage2] {i}/{len(capped)} LLM review — PMID={pmid} ...", flush=True)
+            result = review_extraction(abstract=abstract, draft_extraction=result, llm=llm)
+
         structured.append(result)
 
     return structured
@@ -446,6 +462,7 @@ def search_and_extract(
     intent: Dict[str, Any],
     llm: BaseChatModel,
     top_n: int = 5,
+    review: bool = True,
 ) -> List[Dict[str, Any]]:
     """
     Full pipeline: intent → PubMed queries → fetch → filter → LLM extract.
@@ -455,6 +472,10 @@ def search_and_extract(
         llm:    LangChain chat model (used in Stage 2 and query building).
         top_n:  Maximum structured records to return per variant query
                 before deduplication (total results may be up to 3×top_n).
+        review: Passed through to stage2_extract() — when True (default),
+                each extraction gets a second-pass LLM review
+                (tools/extraction_reviewer.py). Set False to disable for
+                cost/speed.
 
     Returns:
         Deduplicated list of structured paper records sorted by confidence_level
@@ -478,8 +499,8 @@ def search_and_extract(
     # Stage 1: rule-based filter
     passed_s1 = stage1_filter(all_raw)
 
-    # Stage 2: LLM extraction
-    structured = stage2_extract(passed_s1, llm)
+    # Stage 2: LLM extraction (+ review, unless disabled)
+    structured = stage2_extract(passed_s1, llm, review=review)
 
     _print_pipeline_summary(len(all_raw), len(passed_s1), structured)
 
