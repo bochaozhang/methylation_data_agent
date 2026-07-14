@@ -27,6 +27,7 @@ from langchain_core.language_models import BaseChatModel
 
 from tools.extraction_reviewer import review_extraction
 from tools.parser_tools import parse_query_rules
+from tools.pubmed_tools import LiteratureClient
 from tools.query_clarifier import (
     build_pubmed_query_with_controls,
     extract_paper_structured,
@@ -56,6 +57,22 @@ def _build_session() -> requests.Session:
     return session
 
 _SESSION: requests.Session = _build_session()
+
+# ------------------------------------------------------------------ #
+#  Lazy LiteratureClient (PMC full text, Stage 2 only)                #
+# ------------------------------------------------------------------ #
+
+_LIT_CLIENT: Optional["LiteratureClient"] = None
+
+
+def _get_lit_client() -> "LiteratureClient":
+    global _LIT_CLIENT
+    if _LIT_CLIENT is None:
+        _LIT_CLIENT = LiteratureClient(
+            ncbi_api_key=os.environ.get("NCBI_API_KEY", "") or None,
+            geo_email=os.environ.get("GEO_EMAIL", "methyagent@research.local"),
+        )
+    return _LIT_CLIENT
 
 
 def _resolve_proxy() -> str:
@@ -349,6 +366,69 @@ def stage1_filter(records: List[Dict[str, str]]) -> List[Dict[str, str]]:
 
 _STAGE2_MAX = 10  # cap LLM calls per search_and_extract invocation
 
+_FULLTEXT_MAX_CHARS = 12000
+
+# get_pmc_fulltext() returns one flattened, whitespace-joined string with no
+# section markers or newlines preserved (see _extract_text_from_pmc_xml in
+# pubmed_tools.py) — so there's nothing to structurally parse. This keyword
+# order is a priority list: earlier keywords get first claim on the char
+# budget, since AUC values and accessions concentrate in these sections.
+_SECTION_KEYWORDS = [
+    "abstract", "data availability", "data accessibility",
+    "results", "methods", "materials and methods",
+]
+
+
+def _fetch_fulltext_safe(pmid: str) -> Optional[str]:
+    """
+    Best-effort PMC full text fetch. Any failure (no PMC record, network,
+    missing proxy on the fetching host, etc.) falls back to None so callers
+    fall back to the abstract — full text is never required.
+    """
+    if not pmid:
+        return None
+    try:
+        return _get_lit_client().get_pmc_fulltext(pmid)
+    except Exception as exc:
+        print(f"  [stage2] full text fetch failed for PMID={pmid}: {exc}")
+        return None
+
+
+def _prepare_fulltext_for_extraction(
+    full_text: str,
+    max_chars: int = _FULLTEXT_MAX_CHARS,
+) -> str:
+    """
+    Truncate full text to max_chars, preferring windows around
+    Abstract/Data-Availability/Results/Methods keyword occurrences (that's
+    where AUC values and accessions live). Falls back to a head truncation
+    when none of the keywords are found.
+    """
+    if len(full_text) <= max_chars:
+        return full_text
+
+    lower = full_text.lower()
+    budget_per_section = max_chars // len(_SECTION_KEYWORDS)
+    windows: List[tuple] = []
+    for kw in _SECTION_KEYWORDS:
+        idx = lower.find(kw)
+        if idx != -1:
+            windows.append((idx, min(len(full_text), idx + budget_per_section)))
+
+    if not windows:
+        return full_text[:max_chars]
+
+    windows.sort()
+    merged: List[list] = []
+    for start, end in windows:
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+
+    pieces = [full_text[s:e] for s, e in merged]
+    return "\n...\n".join(pieces)[:max_chars]
+
 
 def stage2_extract(
     records: List[Dict[str, str]],
@@ -360,6 +440,11 @@ def stage2_extract(
     Run extract_paper_structured() on each record passing Stage 1.
     Capped at max_records to limit LLM calls (each call ~3-8s).
     Prints progress so callers can see it's working.
+
+    For each record, best-effort fetches PMC full text (only for records that
+    already passed Stage 1, to limit API calls) and extracts from that instead
+    of the abstract when available; falls back to the abstract otherwise. Each
+    result carries a `source_basis` field ("fulltext" or "abstract").
 
     Args:
         review: When True (default), pass each draft extraction through
@@ -377,19 +462,29 @@ def stage2_extract(
     for i, rec in enumerate(capped, 1):
         pmid = rec.get("pmid", "")
         abstract = rec.get("abstract", "")
-        print(f"  [stage2] {i}/{len(capped)} LLM extract — PMID={pmid} ...", flush=True)
+
+        full_text = _fetch_fulltext_safe(pmid)
+        if full_text:
+            extraction_text = _prepare_fulltext_for_extraction(full_text)
+            source_basis = "fulltext"
+        else:
+            extraction_text = abstract
+            source_basis = "abstract"
+
+        print(f"  [stage2] {i}/{len(capped)} LLM extract ({source_basis}) — PMID={pmid} ...", flush=True)
         result = extract_paper_structured(
-            abstract=abstract,
+            abstract=extraction_text,
             llm=llm,
             pmid=pmid,
             title=rec.get("title", ""),
         )
         result.setdefault("pmid", pmid)
         result.setdefault("title", rec.get("title", ""))
+        result["source_basis"] = source_basis
 
         if review:
             print(f"  [stage2] {i}/{len(capped)} LLM review — PMID={pmid} ...", flush=True)
-            result = review_extraction(abstract=abstract, draft_extraction=result, llm=llm)
+            result = review_extraction(abstract=extraction_text, draft_extraction=result, llm=llm)
 
         structured.append(result)
 
