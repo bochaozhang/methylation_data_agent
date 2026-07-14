@@ -88,6 +88,10 @@ geo_candidates_*.json
 *.bak
 .DS_Store
 Thumbs.db
+~$*
+
+# Claude Code local settings
+.claude/settings.local.json
 
 # ---- Docker ----
 docker-compose.override.yml

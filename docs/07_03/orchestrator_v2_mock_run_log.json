@@ -1,0 +1,41 @@
+{
+  "query": "breast cancer plasma cfDNA methylation EPIC early detection",
+  "timestamp": "2026-07-08T05:09:57.118672+00:00",
+  "papers_found": 1,
+  "papers": [
+    {
+      "pmid": "40860669",
+      "title": "Genome-wide discovery of circulating cell-free DNA methylation signatures for the differential diagnosis of triple-negative breast cancer.",
+      "cancer_type": "breast",
+      "sample_type": "plasma_cfdna",
+      "performance_metrics": {
+        "auc_training": null,
+        "auc_validation": null,
+        "auc_external": null
+      },
+      "dataset_ids": [
+        "TCGA",
+        "GSE69914"
+      ],
+      "excluded_reference_datasets": [
+        "GSE50132"
+      ],
+      "needs_human_review": true,
+      "confidence_level": "medium",
+      "reason": "[reviewer] auc_validation nulled (was TCGA tissue AUC, not cfDNA); GSE50132 removed (WBC background-filter panel, not analyzed data)."
+    }
+  ],
+  "gse_evaluated": [
+    {
+      "accession": "GSE50132",
+      "usable": "no",
+      "recommended_action": "exclude",
+      "reason": "Reference/background WBC methylation panel cited only for noise filtering in the source paper, not the study's own case/control cohort."
+    }
+  ],
+  "registry_writes": [
+    "GSE50132"
+  ],
+  "agent_summary": "Found 1 paper (PMID 40860669, breast cancer plasma cfDNA). It cites GSE50132, but evaluation found it's a WBC background-filtering reference panel, not usable case/control data — excluded and logged to the registry. No other GEO accessions in this paper's dataset_ids were evaluable GSE series.",
+  "log_path": "/var/folders/m1/zxf_n2p92k3076w_x1j057hc0000gn/T/tmpmu503qef/output/orchestrator_v2_run_20260708_010957.json"
+}
