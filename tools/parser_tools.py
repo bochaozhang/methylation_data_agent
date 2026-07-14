@@ -545,8 +545,12 @@ def parse_query_with_llm(query: str, llm: BaseChatModel) -> Dict[str, Any]:
 @lru_cache(maxsize=1)
 def _load_cancer_synonyms() -> dict:
     """
-    Load cancer synonyms, methylation tech terms, and liquid biopsy terms
-    from config/cancer_synonyms.yaml.
+    Load cancer synonyms, methylation tech terms, and liquid biopsy terms.
+
+    The canonical home is now the geo_search skill's data file
+    (skills/geo_search/synonyms.yaml); the legacy config/ path is kept as a
+    fallback so any external reference still resolves. This function is a
+    thin loader/shim — the geo_search skill owns the data.
 
     Returns dict with keys:
       cancer_synonyms        : {TCGA_CODE: [synonym, ...]}
@@ -556,6 +560,7 @@ def _load_cancer_synonyms() -> dict:
     Falls back to empty structures if the file is not found.
     """
     candidates = [
+        Path(__file__).parent.parent / "skills" / "geo_search" / "synonyms.yaml",
         Path(__file__).parent.parent / "config" / "cancer_synonyms.yaml",
         Path("config") / "cancer_synonyms.yaml",
         Path("cancer_synonyms.yaml"),

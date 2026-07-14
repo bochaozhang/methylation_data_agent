@@ -24,7 +24,7 @@
 5. 样本类型：是不是请求的样本类型（plasma/血清 = cfDNA）？是否有病例 + 对照？
 6. 证据充分性：GSM 字段不够时，靠关联文章（abstract/Methods/Data availability）确认。
 
-→ 给出 recommended_action，并记录为什么保留/排除（不能只输出 accession）。
+→ 给出 outcome（四态之一），并记录为什么（不能只输出 accession）。
 
 贯穿上述步骤的核心判断原则：
 
@@ -99,7 +99,7 @@
 - 如果 GEO 标签和文章标签冲突，要标记“需人工复核”，不能直接进入可用清单。
 - 如果文章只有标志物结果，没有全量矩阵，也要记录为文章标志物线索，不要误认为有可用 GEO 数据。
 
-**证据不足时**：若 abstract 不足以确认样本类型/对照/治疗状态等关键点 → `recommended_action=manual_review`，并在 reason/notes 写明缺什么。本 skill 到此为止，不再自行取证。
+**证据不足时**：若 abstract 不足以确认样本类型/对照/治疗状态等关键点 → `outcome=manual_review`，并在 reason/notes 写明缺什么。本 skill 到此为止，不再自行取证。
 
 > **边界说明（给 orchestrator / 人工，不在本 skill 内）**：自适应取证（abstract 不够 → 取全文/补充表 → 重新判定）属于 orchestrator 的职责，不在本 skill。现实边界：全文仅 PMC Open Access 可得；补充表在期刊网站或 GEO supplementary；无 PMID 时可用 GSE 编号/标题在 PubMed（E-utilities）搜，仍找不到 → `manual_review`；Google Scholar、期刊网站无可靠 API，仅人工兜底。
 
@@ -108,10 +108,15 @@
 结构化 JSON 的 schema 定义在代码（`skills/geo_filter/skill.py` 的 `_OUTPUT_CONTRACT`），本文件不重复。
 语义约定：
 
-- recommended_action: `keep`（可用，进审批）/ `exclude`（不进）/ `article_only`（文章提到但 GEO 没公开）/ `manual_review`（存疑/冲突/无法确认）。
-- usable: `yes` / `partial` / `no` / `unclear`。
+- outcome（四态）：
+  - `download`：符合请求 **且** 元数据表明有可下载的 A 级甲基化值矩阵（β/M 值、甲基化比例、配对计数）。
+  - `lead`：相关（癌种/样本类型对）但**无 A 级矩阵**（只有 IDAT / fastq/BAM / marker list / signal intensity），或样本受限；作参考/线索，不自动下载。
+  - `exclude`：细胞系/类器官/动物/体外/治疗后/转移灶-only/非目标癌种不可拆/非甲基化。
+  - `manual_review`：存疑、GEO 与文章冲突、或无法确认样本类型/对照。
+- `files[]`：按 GEO summary/页面声明的文件做**元数据级**推断（Phase 1 不打开文件）；标 `is_A_level`/`download`/`data_form`。`lead_type`/`exclude_reason`/`flags` 按结果填。
+- usable 由 outcome 派生（download=yes / lead=partial / exclude=no / manual_review=unclear）。
 - plasma / 血清样本即 cell-free DNA（cfDNA）。
-- 不要只输出“找到了 GSEXXXX”；必须说明样本是什么、为什么可用或不可用（写在 reason + reasoning）。
+- 不要只输出“找到了 GSEXXXX”；必须说明样本是什么、为什么这个 outcome（写在 reason + reasoning）。
 
 ## Reference（非 procedure — 仅存疑时查阅；可裁剪 / RAG）
 

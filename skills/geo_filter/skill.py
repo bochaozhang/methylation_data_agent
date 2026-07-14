@@ -59,46 +59,61 @@ MUST have exactly these keys:
 
 {
   "reasoning": "<REQUIRED: step-by-step logic chain — see below>",
-  "usable": "yes" | "no" | "partial" | "unclear",
-  "recommended_action": "keep" | "exclude" | "article_only" | "manual_review",
+  "outcome": "download" | "lead" | "exclude" | "manual_review",
   "confirmed_sample_type": "plasma|tumor|adjacent|normal|wbc|cfdna|serum|whole_blood|cell_line|other|unknown",
   "confirmed_cancer_type": "canonical English cancer name, or null",
+  "technology": "450K|850K/EPIC|RRBS|WGBS|MCTA|MeDIP|panel|qMSP|null",
+  "platform": "GPL id(s) or null",
+  "sample_size": "case N, control M, ... or null",
+  "stage_or_treatment_status": "staging / treatment status, or null",
+  "disease_groups": "case/control/precursor breakdown, or null",
+  "sample_level_annotation": "yes|no|unclear",
+  "annotation_source": "GSM_characteristics|sample_title|paper_table|mixed|unclear|null",
+  "files": [
+    {"name": "declared supplementary file name/type from summary", "is_A_level": true|false, "download": true|false, "data_form": "merged_beta_matrix|per_sample_calls|region_matrix|paired_counts|unknown", "reason": "why download or not"}
+  ],
+  "lead_type": "no_A_file|article_only|sample_limited|raw_only|locked|null",
+  "exclude_reason": "cell_line|animal_model|non_target_unsplittable|no_reference_value|non_methylation|null",
+  "flags": "case_only|pooled|cross_platform|tissue_only|no_control|pan_cancer_needs_split|...|empty string",
   "sample_count_in_paper": <integer or null>,
-  "stage_treatment": "staging / treatment status from the data or article, or null",
-  "consistency": "consistent" | "minor_discrepancy" | "major_discrepancy" | "unknown",
-  "sample_level_annotation": "yes" | "no" | "unclear",
-  "available_file_type": "best-guess of the usable file type, or null",
-  "disease_groups": "case/control breakdown as free text, or null",
-  "reason": "one sentence: what the samples are and why keep/exclude/review",
-  "notes": "any discrepancy or caveat (sample count mismatch, pooled cfDNA, ...); empty string if none",
+  "consistency": "consistent|minor_discrepancy|major_discrepancy|unknown",
+  "reason": "one sentence: what the samples are and why this outcome",
+  "notes": "caveats (sample count mismatch, pooled cfDNA, ...); empty string if none",
   "gsm_includes": [
     {"gsm": "<gsm id>", "include": true|false, "reason": null | "one sentence if excluded"}
   ]
 }
 
 Field guidance:
-- reasoning (REQUIRED, fill FIRST): a short step-by-step logic chain that walks through, in order:
-    1. What biological samples this dataset actually contains (use GSM details + summary + abstract).
-    2. Human / target cancer type? (per SPEC)
-    3. Sample type vs request — note that plasma / serum ARE cell-free DNA (cfDNA).
-    4. Are there non-cancer / control samples as the request needs?
-    5. File type / data type (is it methylation? downloadable?)
-    6. Therefore → the verdict.
-  This chain is logged for human audit, so it MUST make your logic explicit and
-  internally consistent. If your chain shows the requested samples ARE present,
-  the verdict MUST follow that — do not contradict your own reasoning.
-- recommended_action values:
-    keep           → usable data matching the request; queue for approval
-    exclude        → cell line / organoid / animal / in-vitro / treated / non-target /
-                     only marker list / not downloadable — do NOT queue
-    article_only   → the article mentions data but GEO does not actually provide it
-                     (e.g. validation by qPCR/panel in paper only)
-    manual_review  → genuinely ambiguous, conflicting metadata, or cannot confirm
-- usable: yes when the dataset provides downloadable sample-level methylation data
-  matching the request; partial when only a subset is usable; no when excluded.
+- reasoning (REQUIRED, fill FIRST): step-by-step chain, in order:
+    1. What biological samples this dataset actually contains (GSM details + summary + abstract).
+    2. Human / target cancer type?
+    3. Sample type vs request — plasma / serum ARE cell-free DNA (cfDNA).
+    4. Are there non-cancer / control samples?
+    5. File/data type: is there an A-level methylation VALUE matrix (β-value / M-value /
+       methylation ratio / paired methylated-unmethylated counts) that is downloadable?
+       (Phase 1: infer from the summary and declared supplementary files — do NOT open files.)
+    6. → outcome.
+  Must be internally consistent: if the chain shows the requested samples AND an A-level
+  matrix are present, outcome MUST be download.
+- outcome (the four states):
+    download      → matches the request AND an A-level methylation value matrix appears
+                    downloadable from the metadata.
+    lead          → relevant (right cancer / sample type) BUT no A-level matrix apparent
+                    (only IDAT / raw fastq|BAM / marker list / signal intensity), or
+                    sample-limited; useful as a reference/lead, NOT auto-downloaded.
+    exclude       → cell line / organoid / animal / in-vitro / treated / metastasis-only /
+                    non-target-unsplittable / non-methylation.
+    manual_review → ambiguous, GEO-vs-article metadata conflict, or cannot confirm
+                    sample type / controls.
+- files[]: list supplementary files identifiable from the GEO summary/page; mark
+  is_A_level / download by metadata-level inference (Phase 1, not file content).
+  data_form is a best-guess. Empty list if no files are identifiable.
+- lead_type / exclude_reason: fill when outcome is lead / exclude respectively (else null).
+- flags: free-text caveats (case_only, pooled, cross_platform, tissue_only, no_control,
+  pan_cancer_needs_split, ...); empty string if none.
 - gsm_includes: classify ONLY the representative GSM samples you were given.
-  include=true when the sample matches the requested sample type; reason MUST be null.
-  include=false when it does not; reason MUST be a short explanation.
+  include=true → reason MUST be null; include=false → reason MUST be a short explanation.
 - Apply the SPEC's qualitative rules. Do NOT invent numeric thresholds.
 """
 
@@ -280,8 +295,8 @@ def filter_dataset(
             "geo_sample_count": ds.get("sample_count"),
         }
         logger.info(
-            f"geo_filter {acc}: action={verdict.get('recommended_action')} "
-            f"usable={verdict.get('usable')} sample={verdict.get('confirmed_sample_type')} "
+            f"geo_filter {acc}: outcome={verdict.get('outcome')} "
+            f"sample={verdict.get('confirmed_sample_type')} "
             f"reason={(verdict.get('reason') or '')[:80]}"
         )
         return verdict
@@ -289,16 +304,20 @@ def filter_dataset(
     except Exception as e:
         logger.warning(f"geo_filter {acc}: LLM/parse error — {e} — manual_review (conservative)")
         return {
-            "usable": "unclear",
+            "outcome": "manual_review",
             "recommended_action": "manual_review",
+            "usable": "unclear",
             "confirmed_sample_type": ds.get("sample_type", "unknown"),
             "confirmed_cancer_type": None,
             "sample_count_in_paper": None,
-            "stage_treatment": None,
+            "stage_or_treatment_status": None,
             "consistency": "unknown",
             "sample_level_annotation": "unclear",
-            "available_file_type": None,
             "disease_groups": None,
+            "files": [],
+            "flags": "",
+            "lead_type": None,
+            "exclude_reason": None,
             "reason": f"filter_error: {e}",
             "notes": f"filter_error: {e}",
             "reasoning": f"filter_error: {e}",
@@ -344,26 +363,54 @@ def _extract_usage(response: Any) -> Dict[str, Any]:
     }
 
 
-# Enum normalisation so downstream code never sees an unexpected value.
-_ACTION_VALUES = {"keep", "exclude", "article_only", "manual_review"}
-_USABLE_VALUES = {"yes", "no", "partial", "unclear"}
+# Four-state outcome (Phase 1: metadata-level inference, no per-file A-level verification).
+_OUTCOME_VALUES = {"download", "lead", "exclude", "manual_review"}
+
+# outcome → (legacy recommended_action, usable label) for backward compat with the
+# old DatabaseAgent path and the registry's recommended_action/usable columns.
+_OUTCOME_TO_LEGACY: Dict[str, tuple] = {
+    "download": ("keep", "yes"),
+    "lead": ("manual_review", "partial"),
+    "exclude": ("exclude", "no"),
+    "manual_review": ("manual_review", "unclear"),
+}
 
 
 def _normalise_verdict(verdict: Dict[str, Any], gsm_details: List[Dict[str, Any]]) -> Dict[str, Any]:
-    action = verdict.get("recommended_action")
-    if action not in _ACTION_VALUES:
-        verdict["recommended_action"] = "manual_review"
+    outcome = verdict.get("outcome")
+    if outcome not in _OUTCOME_VALUES:
+        outcome = "manual_review"
+    verdict["outcome"] = outcome
 
-    usable = verdict.get("usable")
-    if usable not in _USABLE_VALUES:
-        verdict["usable"] = "unclear"
+    # Derive legacy recommended_action + usable so old consumers keep working.
+    rec_action, usable = _OUTCOME_TO_LEGACY.get(outcome, ("manual_review", "unclear"))
+    verdict["recommended_action"] = rec_action
+    verdict["usable"] = usable
 
-    # Ensure the reasoning chain is a non-empty string (default "" so the CSV
-    # column always exists; an empty value signals the model skipped it).
+    # Reasoning chain (non-empty string; "" signals the model skipped it).
     if not isinstance(verdict.get("reasoning"), str):
         verdict["reasoning"] = ""
 
-    # Ensure gsm_includes is a list of well-formed dicts covering the representatives.
+    # files[] — list of well-formed dicts (Phase 1: metadata-inferred, not verified).
+    raw_files = verdict.get("files") or []
+    files: List[Dict[str, Any]] = []
+    for f in raw_files:
+        if isinstance(f, dict):
+            files.append({
+                "name": str(f.get("name", "")),
+                "is_A_level": bool(f.get("is_A_level", False)),
+                "download": bool(f.get("download", False)),
+                "data_form": f.get("data_form", "unknown"),
+                "reason": f.get("reason", ""),
+            })
+    verdict["files"] = files
+
+    if not isinstance(verdict.get("flags"), str):
+        verdict["flags"] = ""
+    verdict.setdefault("lead_type", None)
+    verdict.setdefault("exclude_reason", None)
+
+    # gsm_includes — list of well-formed dicts covering the representatives.
     raw_inc = verdict.get("gsm_includes") or []
     norm: List[Dict[str, Any]] = []
     for item in raw_inc:
@@ -383,8 +430,9 @@ def _normalise_verdict(verdict: Dict[str, Any], gsm_details: List[Dict[str, Any]
 
 def apply_verdict(ds: Dict[str, Any], verdict: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Return a copy of `ds` with verdict fields mapped onto registry columns.
-    The output is ready for Registry.upsert_dataset(...) (interface unchanged).
+    Return a copy of `ds` with verdict fields mapped onto registry columns +
+    the four-state record fields attached for the pipeline. Ready for
+    Registry.upsert_dataset(...) (interface unchanged) and for split_by_outcome().
     """
     action = verdict.get("recommended_action", "manual_review")
     # usable column is INTEGER 0/1: yes/partial → 1 (benefit of the doubt for unclear).
@@ -392,7 +440,8 @@ def apply_verdict(ds: Dict[str, Any], verdict: Dict[str, Any]) -> Dict[str, Any]
     usable_int = usable_map.get(verdict.get("usable", "unclear"), 1)
 
     updated = dict(ds)
-    updated["recommended_action"] = action
+    updated["outcome"] = verdict.get("outcome", "manual_review")
+    updated["recommended_action"] = action  # legacy compat (derived from outcome)
     updated["usable"] = usable_int
     updated["reason"] = verdict.get("reason", "")
     updated["consistency"] = verdict.get("consistency", "unknown")
@@ -401,14 +450,35 @@ def apply_verdict(ds: Dict[str, Any], verdict: Dict[str, Any]) -> Dict[str, Any]
         updated["sample_type"] = verdict["confirmed_sample_type"]
     if verdict.get("confirmed_cancer_type"):
         updated["cancer_type"] = verdict["confirmed_cancer_type"]
-    if verdict.get("stage_treatment"):
-        updated["stage_treatment"] = verdict["stage_treatment"]
-    if verdict.get("available_file_type"):
-        updated["available_file_type"] = verdict["available_file_type"]
+    # accept both the new and the legacy key name
+    stage = verdict.get("stage_or_treatment_status") or verdict.get("stage_treatment")
+    if stage:
+        updated["stage_treatment"] = stage
+
+    # Derive available_file_type from the first A-level/downloadable file (Phase 1).
+    files = verdict.get("files") or []
+    a_file = next((f for f in files if f.get("download") and f.get("is_A_level")), None)
+    if a_file:
+        updated["available_file_type"] = a_file.get("data_form") or a_file.get("name")
+    elif files:
+        updated["available_file_type"] = files[0].get("name")
+
+    if verdict.get("technology"):
+        updated["technology"] = verdict["technology"]
+    if verdict.get("platform"):
+        updated["platform_filter_hint"] = verdict["platform"]
     if verdict.get("sample_level_annotation"):
         updated["sample_level_annotation"] = verdict["sample_level_annotation"]
     if verdict.get("disease_groups"):
         updated["disease_groups"] = verdict["disease_groups"]
+
+    # Attach the full four-state record fields (used by split_by_outcome / pipeline).
+    updated["files"] = files
+    updated["flags"] = verdict.get("flags", "")
+    if verdict.get("lead_type"):
+        updated["lead_type"] = verdict["lead_type"]
+    if verdict.get("exclude_reason"):
+        updated["exclude_reason"] = verdict["exclude_reason"]
 
     # Correct sample count if the paper states a materially different n.
     paper_n = verdict.get("sample_count_in_paper")
@@ -427,6 +497,27 @@ def apply_verdict(ds: Dict[str, Any], verdict: Dict[str, Any]) -> Dict[str, Any]
 
     updated["_verdict"] = verdict  # full verdict retained for reporting/debug
     return updated
+
+
+def split_by_outcome(records: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Split enriched dataset records (from apply_verdict) into the four-state lists
+    consumed by the pipeline: download_list / lead_list / exclude_list /
+    manual_review_list. Each record carries its full four-state fields (outcome,
+    files[], flags, lead_type, exclude_reason, reason, ...).
+    """
+    buckets: Dict[str, List[Dict[str, Any]]] = {
+        "download_list": [],
+        "lead_list": [],
+        "exclude_list": [],
+        "manual_review_list": [],
+    }
+    _key = {"download": "download_list", "lead": "lead_list",
+            "exclude": "exclude_list", "manual_review": "manual_review_list"}
+    for r in records:
+        outcome = r.get("outcome", "manual_review")
+        buckets[_key.get(outcome, "manual_review_list")].append(r)
+    return buckets
 
 
 # ---------------------------------------------------------------------- #

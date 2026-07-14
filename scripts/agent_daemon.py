@@ -153,21 +153,58 @@ def _build_initial_state(query: str, config: dict) -> dict:
 
 def run_database_agent(query: str, registry: Registry) -> dict:
     """
-    Run DatabaseAgent for the given query.
+    Run the database (agent1) path for the given query.
     Returns a summary dict written to task_queue.result_json.
+
+    config.agent1.pipeline selects the implementation:
+      "skills" (default) → deterministic skill pipeline (geo-search → geo-filter
+                            → geo-download // tcga-direct → register)
+      "legacy"            → original DatabaseAgent fixed pipeline (rollback)
     """
     try:
-        from agents.database_agent import DatabaseAgent
         config = load_config()
+        pipeline_mode = (config.get("agent1") or {}).get("pipeline", "skills")
+
+        if pipeline_mode == "skills":
+            from agents.agent1_pipeline import run_agent1_pipeline
+            logger.info(f"[agent1] Running skill pipeline for query: {query!r}")
+            state = run_agent1_pipeline(query, config, registry)
+
+            dl = state.get("download_results") or []
+            tcga = state.get("tcga_results") or []
+            review = (state.get("lead_list") or []) + (state.get("manual_review_list") or [])
+            geo_ok = [r.get("accession") for r in dl if r.get("outcome_final") == "download_success"]
+            geo_fail = [r.get("accession") for r in dl if r.get("outcome_final") != "download_success"]
+            tcga_ok = [r.get("accession") for r in tcga if r.get("outcome_final") == "download_success"]
+            summary = {
+                "agent": "database",
+                "pipeline": "skills",
+                "query": query,
+                "datasets_downloaded": geo_ok + tcga_ok,
+                "datasets_failed": geo_fail,
+                "datasets_review": [r.get("accession") for r in review],
+                "datasets_excluded": len(state.get("exclude_list") or []),
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+            }
+            logger.info(
+                f"[agent1 pipeline] Done — GEO {len(geo_ok)} ok / {len(geo_fail)} fail, "
+                f"TCGA {len(tcga_ok)} ok, {len(review)} review, "
+                f"{summary['datasets_excluded']} excluded."
+            )
+            return summary
+
+        # ---- legacy DatabaseAgent path (rollback) ----
+        from agents.database_agent import DatabaseAgent
         agent = DatabaseAgent(config=config, registry=registry)
         state = _build_initial_state(query, config)
-        logger.info(f"[agent1] Running DatabaseAgent for query: {query!r}")
+        logger.info(f"[agent1] Running legacy DatabaseAgent for query: {query!r}")
         result_state = agent.run(state)
         downloaded = result_state.get("db_downloaded", [])
         failed = result_state.get("db_failed", [])
         skipped = result_state.get("db_skipped", [])
         summary = {
             "agent": "database",
+            "pipeline": "legacy",
             "query": query,
             "datasets_found": len(downloaded),
             "datasets_downloaded": downloaded,

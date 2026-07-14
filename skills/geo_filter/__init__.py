@@ -5,6 +5,7 @@ from skills.geo_filter.skill import (
     SYSTEM_PROMPT,
     filter_dataset,
     apply_verdict,
+    split_by_outcome,
     GeoFilterSkill,
 )
 
@@ -14,5 +15,6 @@ __all__ = [
     "SYSTEM_PROMPT",
     "filter_dataset",
     "apply_verdict",
+    "split_by_outcome",
     "GeoFilterSkill",
 ]
