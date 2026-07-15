@@ -23,8 +23,9 @@ from typing import Any, Callable, Dict, List
 from langgraph.graph import END, START, StateGraph
 
 from agents.tcga_direct import run_tcga_direct
-from skills.geo_download import DownloadSkill
 from skills.geo_filter import apply_verdict, filter_dataset, split_by_outcome
+from skills.geo_filter.file_inspect import verify_a_level_files
+from skills.geo_filter.skill import _OUTCOME_TO_LEGACY
 from skills.geo_search import SearchSkill
 from state.agent1_state import Agent1State, normalize_intent
 from tools.geo_tools import GEOClient
@@ -87,7 +88,6 @@ def build_agent1_pipeline(config: Dict[str, Any], registry: Any = None):
     geo_client = GEOClient(api_key=ncbi_key or None, proxy=ncbi_proxy or None)
 
     search_skill = SearchSkill(config)
-    download_skill = DownloadSkill(config)
 
     # ---- parse ----
     def parse_node(state: Agent1State) -> Dict[str, Any]:
@@ -122,6 +122,35 @@ def build_agent1_pipeline(config: Dict[str, Any], registry: Any = None):
             except Exception as e:
                 logger.debug(f"agent1 filter abstract {acc}: {e}")
         verdict = filter_dataset(llm, ds, intent, gsm, abstract=abstract)
+
+        # Phase 2a: file-form A-level preview (核验前置). For download/lead
+        # candidates, inspect the REAL supplementary file heads and override the
+        # LLM's metadata-predicted files[] with file-head evidence. If a
+        # download candidate has no A-level file on inspection → downgrade to lead.
+        if verdict.get("outcome") in ("download", "lead"):
+            supp = ds.get("supplementary_files") or []
+            if supp:
+                try:
+                    has_A, inspected, a_form = verify_a_level_files(supp, geo_client)
+                except Exception as e:
+                    logger.debug(f"agent1 file verify {acc} failed: {e}")
+                    has_A, inspected, a_form = None, None, None
+                if inspected is not None:
+                    verdict["files"] = inspected
+                    if a_form:
+                        verdict["available_file_type"] = a_form
+                    if verdict["outcome"] == "download" and has_A is False:
+                        verdict["outcome"] = "lead"
+                        verdict["lead_type"] = "no_A_file"
+                        verdict["reason"] = (
+                            (verdict.get("reason") or "")
+                            + "; downgraded: no A-level file on head inspection"
+                        ).strip()
+                        rec, usable = _OUTCOME_TO_LEGACY["lead"]
+                        verdict["recommended_action"] = rec
+                        verdict["usable"] = usable
+                        logger.info(f"agent1 file verify {acc}: downgraded download→lead (no A-level file)")
+
         return apply_verdict(ds, verdict)
 
     def filter_node(state: Agent1State) -> Dict[str, Any]:
@@ -143,11 +172,7 @@ def build_agent1_pipeline(config: Dict[str, Any], registry: Any = None):
         logger.info(log)
         return {**buckets, "filter_log": log}
 
-    # ---- geo-download ----
-    def download_node(state: Agent1State) -> Dict[str, Any]:
-        return download_skill.run(dict(state))
-
-    # ---- tcga-direct ----
+    # ---- tcga-direct (search-only; no download here) ----
     def tcga_node(state: Agent1State) -> Dict[str, Any]:
         return run_tcga_direct(dict(state), config)
 
@@ -159,30 +184,25 @@ def build_agent1_pipeline(config: Dict[str, Any], registry: Any = None):
             return {}
         n = register_state_to_registry(state, reg)
         logger.info(
-            f"agent1 register: GEO done={n['downloaded']} failed={n['failed']} "
-            f"review={n['review']} excluded={n['excluded']} tcga={n['tcga']}"
+            f"agent1 register: bucket(review0)={n['bucket']} review_queue(review1)={n['review']} "
+            f"excluded={n['excluded']}"
         )
         return {"register_log": str(n)}
 
     # ---- graph ----
+    # No inline download: pipeline only registers. Downloads happen later in the
+    # daemon after the user's bulk "待下载" confirm.
     graph = StateGraph(Agent1State)
     graph.add_node("parse", parse_node)
     graph.add_node("search", search_node)
     graph.add_node("filter", filter_node)
-    graph.add_node("download", download_node)
     graph.add_node("tcga", tcga_node)
     graph.add_node("register", register_node)
 
     graph.add_edge(START, "parse")
-    # Sequential topology (Phase 1): parse → search → filter → download → tcga → register.
-    # NOTE: a parallel fork (parse → {search-chain, tcga} → register) mis-fired register
-    # early in LangGraph (the short tcga branch tripped the join before the long GEO
-    # branch finished). Sequential guarantees register runs last with full state.
-    # Re-introduce parallelism later via an internal asyncio recall node, not a graph fork.
     graph.add_edge("parse", "search")
     graph.add_edge("search", "filter")
-    graph.add_edge("filter", "download")
-    graph.add_edge("download", "tcga")
+    graph.add_edge("filter", "tcga")
     graph.add_edge("tcga", "register")
     graph.add_edge("register", END)
 
@@ -195,46 +215,30 @@ def build_agent1_pipeline(config: Dict[str, Any], registry: Any = None):
 
 def register_state_to_registry(state: Dict[str, Any], reg: Any) -> Dict[str, int]:
     """
-    Map pipeline State onto the SQLite registry. Returns counts.
+    Register filter/tcga outcomes into the registry. No downloads here.
 
-    - download_results (success/failed) → drive download_list record status
-    - lead_list / manual_review_list → awaiting_approval (human review)
-    - exclude_list → log only
-    - tcga_results → done/failed
+    - download_list + lead_list + tcga_candidates → awaiting_approval (needs_review=0,
+      the bulk "待下载" bucket).
+    - manual_review_list → awaiting_approval (needs_review=1, the Review Queue).
+    - exclude_list → skipped.
+    Returns counts.
     """
-    n = {"downloaded": 0, "failed": 0, "review": 0, "excluded": 0, "tcga": 0}
+    n = {"bucket": 0, "review": 0, "excluded": 0}
 
-    dl_results = state.get("download_results") or []
-    dl_outcome = {r.get("accession"): r.get("outcome_final") for r in dl_results}
-    dl_files = {r.get("accession"): r.get("files_downloaded") or [] for r in dl_results}
+    # Bulk "待下载" bucket (needs_review=0): download + lead + TCGA.
+    for rec in (state.get("download_list") or []) + (state.get("lead_list") or []):
+        _upsert(reg, rec, "awaiting_approval", needs_review=False)
+        n["bucket"] += 1
+    for rec in state.get("tcga_candidates") or []:
+        _upsert(reg, {**rec, "source": "TCGA"}, "awaiting_approval", needs_review=False)
+        n["bucket"] += 1
 
-    for rec in state.get("download_list") or []:
-        acc = rec.get("accession")
-        ok = dl_outcome.get(acc) == "download_success"
-        files = dl_files.get(acc) or []
-        local_path = files[0].get("local_path") if files else None
-        size = sum(f.get("size_bytes") or 0 for f in files)
-        _upsert(reg, rec, "done" if ok else "failed",
-                local_path=local_path, file_size_bytes=size or None)
-        n["downloaded" if ok else "failed"] += 1
-
-    for rec in state.get("lead_list") or []:
-        _upsert(reg, rec, "awaiting_approval", needs_review=True)
-        n["review"] += 1
+    # Review Queue (needs_review=1): manual_review.
     for rec in state.get("manual_review_list") or []:
         _upsert(reg, rec, "awaiting_approval", needs_review=True)
         n["review"] += 1
 
     n["excluded"] = len(state.get("exclude_list") or [])
-
-    for rec in state.get("tcga_results") or []:
-        ok = rec.get("outcome_final") == "download_success"
-        files = rec.get("files_downloaded") or []
-        local_path = files[0].get("local_path") if files else None
-        size = sum(f.get("size_bytes") or 0 for f in files)
-        _upsert(reg, {**rec, "source": "TCGA"}, "done" if ok else "failed",
-                local_path=local_path, file_size_bytes=size or None)
-        n["tcga"] += 1
 
     return n
 

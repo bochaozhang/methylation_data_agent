@@ -366,11 +366,12 @@ def _extract_usage(response: Any) -> Dict[str, Any]:
 # Four-state outcome (Phase 1: metadata-level inference, no per-file A-level verification).
 _OUTCOME_VALUES = {"download", "lead", "exclude", "manual_review"}
 
-# outcome → (legacy recommended_action, usable label) for backward compat with the
-# old DatabaseAgent path and the registry's recommended_action/usable columns.
+# outcome → (recommended_action stored in registry, usable label).
+# recommended_action mirrors the true 4-state outcome so the Web UI "Outcome"
+# column shows download/lead/exclude/manual_review (not a collapsed legacy value).
 _OUTCOME_TO_LEGACY: Dict[str, tuple] = {
-    "download": ("keep", "yes"),
-    "lead": ("manual_review", "partial"),
+    "download": ("download", "yes"),
+    "lead": ("lead", "partial"),
     "exclude": ("exclude", "no"),
     "manual_review": ("manual_review", "unclear"),
 }

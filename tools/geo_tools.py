@@ -1216,7 +1216,37 @@ class GEOClient:
             logger.warning(f"fetch_pubmed_abstract({pmid}) failed: {e}")
             return ""
 
-        # ------------------------------------------------------------------ #
+    def fetch_file_head(self, url: str, max_bytes: int = 65536) -> bytes:
+        """
+        Fetch the first `max_bytes` of a remote file via HTTP Range — for header
+        inspection / A-level preview WITHOUT downloading the whole file.
+
+        GEO supplementary files are served over HTTPS and support Range requests.
+        Returns the raw (still-compressed, e.g. gzip) bytes of the file head, or
+        b"" on any failure (caller treats empty as "could not inspect").
+        """
+        try:
+            time.sleep(self._rate_limit_delay)
+            resp = self.session.get(
+                url,
+                headers={"Range": f"bytes=0-{max_bytes - 1}"},
+                timeout=30,
+                stream=True,
+            )
+            resp.raise_for_status()
+            chunks = []
+            read = 0
+            for chunk in resp.iter_content(chunk_size=8192):
+                if read >= max_bytes:
+                    break
+                chunks.append(chunk)
+                read += len(chunk)
+            head = b"".join(chunks)[:max_bytes]
+            logger.debug(f"fetch_file_head({url}): {len(head)} bytes")
+            return head
+        except Exception as e:
+            logger.debug(f"fetch_file_head({url}) failed: {e}")
+            return b""
     #  Accession verification (LLM hallucination filter)                  #
     # ------------------------------------------------------------------ #
 

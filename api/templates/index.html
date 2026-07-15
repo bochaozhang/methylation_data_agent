@@ -307,7 +307,7 @@
   <button onclick="showTab('tasks')">&#128203; Tasks</button>
   <button onclick="showTab('datasets')">&#128190; Datasets</button>
   <button onclick="showTab('review')">&#9989; Review Queue <span id="reviewBadge"></span></button>
-  <button onclick="showTab('approval')">&#9660; 审批下载 <span id="approvalBadge"></span></button>
+  <button onclick="showTab('approval')">&#9660; 待下载 <span id="approvalBadge"></span></button>
 </nav>
 
 <main>
@@ -452,17 +452,15 @@
   <!-- ===== APPROVAL TAB ===== -->
   <div id="tab-approval" class="section">
     <div class="card">
-      <h2>&#9660; 审批下载队列</h2>
+      <h2>&#9660; 待下载队列</h2>
       <p style="font-size:.85rem;color:#636e72;margin-bottom:16px">
-        以下数据集由 Agent 搜索发现，等待人工确认后才会开始下载。
-        默认全部勾选，取消勾选不需要的数据集，然后点击"确认下载"。
+        Agent 发现、待下载的数据集（download / lead / TCGA，以及 Review Queue 已通过的 manual_review）。
+        点"确认开始下载"全部进入下载；点"取消"清空（设为 skipped，不下载）。
+        存疑的 manual_review 请到 <b>Review Queue</b> 逐条审，通过后自动进入这里。
       </p>
       <div class="approval-toolbar">
-        <button class="btn sm" onclick="selectAllApproval(true)">全选</button>
-        <button class="btn sm" style="background:#636e72" onclick="selectAllApproval(false)">取消全选</button>
-        <button class="btn success" id="confirmApprovalBtn" onclick="confirmApproval()">
-          &#10003; 确认下载选中项
-        </button>
+        <button class="btn success" id="confirmDownloadBtn" onclick="confirmDownload()">&#10003; 确认开始下载</button>
+        <button class="btn sm" style="background:#d63031;margin-left:4px" id="cancelDownloadBtn" onclick="cancelDownload()">&#10007; 取消（清空）</button>
         <button class="btn sm" style="background:#636e72;margin-left:4px" onclick="loadApproval()">&#8635; Refresh</button>
         <span class="count-label" id="approvalCountLabel"></span>
       </div>
@@ -471,20 +469,19 @@
         <table id="approvalTable">
           <thead>
             <tr>
-              <th><input type="checkbox" id="approvalSelectAll" onchange="selectAllApproval(this.checked)" title="全选/取消全选"></th>
               <th>Accession</th>
               <th>Source</th>
+              <th>Outcome</th>
               <th>Title</th>
               <th>Cancer Type</th>
               <th>Platform</th>
               <th>Samples</th>
-              <th>Year</th>
               <th>Sample Type</th>
-              <th>Paper</th>
+              <th>Reason</th>
             </tr>
           </thead>
           <tbody id="approvalBody">
-            <tr><td colspan="10" class="empty">Loading...</td></tr>
+            <tr><td colspan="9" class="empty">Loading...</td></tr>
           </tbody>
         </table>
       </div>
@@ -765,13 +762,15 @@ function autoRefresh() {
   if (active && active.id === 'tab-approval')  loadApproval();
 }
 
-// Lightweight badge-only refresh (runs even when approval tab is not active)
+// Lightweight badge-only refresh (runs even when approval tab is not active).
+// Counts only the bulk "待下载" bucket (needs_review=0); manual_review is in Review Queue.
 async function updateApprovalBadge() {
   try {
     const r = await fetch('/datasets/awaiting-approval');
     const d = await r.json();
+    const bucket = (d.items || []).filter(it => !it.needs_review);
     const el = document.getElementById('approvalBadge');
-    el.textContent = d.total > 0 ? ` (${d.total})` : '';
+    el.textContent = bucket.length > 0 ? ` (${bucket.length})` : '';
   } catch(e) {}
 }
 
@@ -814,102 +813,68 @@ async function loadApproval() {
     const d = await r.json();
     document.getElementById('approvalRefreshInfo').textContent = nowStr();
 
-    // Update nav badge
+    // Bulk "待下载" bucket = awaiting with needs_review=0 (download/lead/TCGA/approved-manual_review)
+    const bucket = (d.items || []).filter(it => !it.needs_review);
     const badge_el = document.getElementById('approvalBadge');
-    badge_el.textContent = d.total > 0 ? ` (${d.total})` : '';
+    badge_el.textContent = bucket.length > 0 ? ` (${bucket.length})` : '';
 
     const tbody = document.getElementById('approvalBody');
     const countLabel = document.getElementById('approvalCountLabel');
 
-    if (!d.items.length) {
-      tbody.innerHTML = '<tr><td colspan="10" class="empty">暂无待审批数据集。Agent 搜索完成后会自动出现在这里。</td></tr>';
+    if (!bucket.length) {
+      tbody.innerHTML = '<tr><td colspan="9" class="empty">暂无待下载数据集。Agent 搜索完成后会自动出现在这里。</td></tr>';
       countLabel.textContent = '';
-      document.getElementById('approvalSelectAll').checked = false;
       return;
     }
+    countLabel.textContent = `${bucket.length} 个样本待下载`;
 
-    tbody.innerHTML = d.items.map(item => {
-      const paperCell = item.no_pubmed_link
-        ? '<span class="badge no-pubmed" title="No linked publication">No Paper</span>'
-        : (item.paper_pmid ? `<a href="https://pubmed.ncbi.nlm.nih.gov/${item.paper_pmid}" target="_blank" style="color:#0984e3">PMID:${item.paper_pmid}</a>` : '<span style="color:#b2bec3">—</span>');
-      return `<tr id="arow-${item.accession}">
-        <td><input type="checkbox" class="approval-cb" data-acc="${item.accession}" checked onchange="onApprovalCheck(this)"></td>
+    tbody.innerHTML = bucket.map(item => `<tr>
         <td><a href="https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=${item.accession}" target="_blank" style="color:#0984e3"><code>${item.accession}</code></a></td>
         <td>${item.source}</td>
-        <td class="truncate" title="${item.title||''}">${item.title || '—'}</td>
+        <td>${item.recommended_action || '—'}</td>
+        <td class="truncate" title="${(item.title||'').replace(/"/g,'&quot;')}">${item.title || '—'}</td>
         <td>${item.cancer_type || '—'}</td>
         <td>${item.platform || '—'}</td>
         <td>${item.sample_count ?? '—'}</td>
-        <td>${item.year ?? '—'}</td>
         <td>${item.sample_type || '—'}</td>
-        <td>${paperCell}</td>
-      </tr>`;
-    }).join('');
-
-    updateApprovalCount();
-    document.getElementById('approvalSelectAll').checked = true;
+        <td class="truncate" title="${(item.reason||'').replace(/"/g,'&quot;')}">${item.reason || '—'}</td>
+      </tr>`).join('');
   } catch(e) { console.error('loadApproval error:', e); }
 }
 
-function onApprovalCheck(cb) {
-  const row = document.getElementById('arow-' + cb.dataset.acc);
-  if (row) row.classList.toggle('unchecked', !cb.checked);
-  updateApprovalCount();
-  // Sync header checkbox
-  const all = [...document.querySelectorAll('.approval-cb')];
-  document.getElementById('approvalSelectAll').checked = all.length > 0 && all.every(c => c.checked);
+function _bucketCount() {
+  const rows = document.querySelectorAll('#approvalBody tr');
+  if (!rows.length || document.querySelector('#approvalBody .empty')) return 0;
+  return rows.length;
 }
 
-function selectAllApproval(checked) {
-  document.querySelectorAll('.approval-cb').forEach(cb => {
-    cb.checked = checked;
-    const row = document.getElementById('arow-' + cb.dataset.acc);
-    if (row) row.classList.toggle('unchecked', !checked);
-  });
-  document.getElementById('approvalSelectAll').checked = checked;
-  updateApprovalCount();
+async function confirmDownload() {
+  const n = _bucketCount();
+  if (!n) { alert('暂无待下载数据集。'); return; }
+  if (!confirm(`确认开始下载 ${n} 个数据集？`)) return;
+  await _postBulk('/datasets/confirm-download', 'confirmDownloadBtn', '✓ 确认开始下载');
 }
 
-function updateApprovalCount() {
-  const all = [...document.querySelectorAll('.approval-cb')];
-  const checked = all.filter(c => c.checked).length;
-  document.getElementById('approvalCountLabel').textContent =
-    `已选 ${checked} / ${all.length} 个数据集`;
+async function cancelDownload() {
+  const n = _bucketCount();
+  if (!n) { alert('暂无待下载数据集。'); return; }
+  if (!confirm(`确认取消（清空）全部 ${n} 个待下载数据集？将设为 skipped，不下载。`)) return;
+  await _postBulk('/datasets/cancel-download', 'cancelDownloadBtn', '✗ 取消（清空）');
 }
 
-async function confirmApproval() {
-  const checked = [...document.querySelectorAll('.approval-cb:checked')].map(c => c.dataset.acc);
-  const total = document.querySelectorAll('.approval-cb').length;
-
-  if (total === 0) { alert('暂无待审批数据集。'); return; }
-
-  const skipped = total - checked.length;
-  const msg = checked.length === 0
-    ? `确认跳过全部 ${total} 个数据集（不下载任何数据）？`
-    : `确认下载 ${checked.length} 个数据集${skipped > 0 ? `，跳过 ${skipped} 个` : ''}？`;
-  if (!confirm(msg)) return;
-
-  const btn = document.getElementById('confirmApprovalBtn');
-  btn.disabled = true;
-  btn.textContent = '提交中...';
-
+async function _postBulk(url, btnId, btnLabel) {
+  const btn = document.getElementById(btnId);
+  btn.disabled = true; const old = btn.innerHTML; btn.textContent = '提交中...';
   try {
-    const r = await fetch('/datasets/approve', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ approved: checked }),
-    });
+    const r = await fetch(url, { method: 'POST' });
     const ct = r.headers.get('content-type') || '';
     if (!ct.includes('application/json')) {
-      const txt = await r.text();
-      showAlert('approvalAlert', '服务器错误: ' + txt.slice(0, 200), 'error');
-      return;
+      showAlert('approvalAlert', '服务器错误', 'error'); return;
     }
     const d = await r.json();
     if (r.ok) {
       showAlert('approvalAlert', d.message, 'ok');
       setTimeout(loadApproval, 800);
-      // Refresh datasets tab stats
       if (document.getElementById('tab-datasets').classList.contains('active')) loadDatasets();
     } else {
       showAlert('approvalAlert', d.detail || '请求失败', 'error');
@@ -917,8 +882,7 @@ async function confirmApproval() {
   } catch(e) {
     showAlert('approvalAlert', '网络错误: ' + e.message, 'error');
   } finally {
-    btn.disabled = false;
-    btn.textContent = '&#10003; 确认下载选中项';
+    btn.disabled = false; btn.innerHTML = old;
   }
 }
 

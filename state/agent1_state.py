@@ -160,12 +160,11 @@ class Agent1State(TypedDict, total=False):
     manual_review_list: List[Dict[str, Any]]
     filter_log: str
 
-    # ---- geo-download node ----
-    download_results: List[Dict[str, Any]]
-    download_log: str
+    # ---- geo-download node (removed: no inline download; downloads happen in
+    #      the daemon after the bulk "待下载" confirm) ----
 
-    # ---- tcga-direct node ----
-    tcga_results: List[Dict[str, Any]]
+    # ---- tcga-direct node (search-only; returns candidates, no download) ----
+    tcga_candidates: List[Dict[str, Any]]
 
     # ---- global ----
     error_log: List[str]

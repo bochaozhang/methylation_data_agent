@@ -243,6 +243,9 @@ async def list_awaiting_approval():
                 no_pubmed_link=bool(d.get("no_pubmed_link", 0)),
                 notes=d.get("notes"),
                 sample_metadata_path=d.get("sample_metadata_path"),
+                needs_review=bool(d.get("needs_review", 0)),
+                recommended_action=d.get("recommended_action"),
+                reason=d.get("reason"),
                 created_at=d["created_at"],
             )
             for d in items
@@ -251,25 +254,30 @@ async def list_awaiting_approval():
     )
 
 
-@app.post("/datasets/approve", response_model=ApprovalResponse)
-async def approve_downloads(body: ApprovalRequest):
+@app.post("/datasets/confirm-download")
+async def confirm_bulk_download():
     """
-    Confirm download for the selected datasets.
-
-    - Accessions in `approved` → download_status = 'pending' (daemon picks up)
-    - All other awaiting_approval datasets NOT in the list → 'skipped'
+    Bulk-confirm the "待下载" bucket: move every awaiting_approval dataset with
+    needs_review=0 (download / lead / TCGA / approved manual_review) to 'pending'
+    so the daemon downloads them. Un-reviewed manual_review (needs_review=1) in
+    the Review Queue is NOT touched.
     """
     registry = get_registry()
-    result = registry.approve_downloads(body.approved)
-    return ApprovalResponse(
-        approved_count=result["approved"],
-        skipped_count=result["skipped"],
-        message=(
-            f"Approved {result['approved']} dataset(s) for download. "
-            f"Skipped {result['skipped']} dataset(s). "
-            f"The agent daemon will start downloading shortly."
-        ),
-    )
+    n = registry.confirm_bulk_download()
+    return {"confirmed": n,
+            "message": f"Confirmed {n} dataset(s) for download. Daemon will start shortly."}
+
+
+@app.post("/datasets/cancel-download")
+async def cancel_bulk_download():
+    """
+    Bulk-cancel the "待下载" bucket: mark every awaiting_approval dataset with
+    needs_review=0 as 'skipped'. Un-reviewed manual_review is NOT touched.
+    """
+    registry = get_registry()
+    n = registry.cancel_bulk_download()
+    return {"cancelled": n,
+            "message": f"Cancelled {n} dataset(s) (set to skipped)."}
 
 
 @app.post("/datasets/retry-failed", response_model=RetryFailedResponse)

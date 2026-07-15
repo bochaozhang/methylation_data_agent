@@ -102,8 +102,8 @@ class TestFilterDatasetParsing(unittest.TestCase):
         }
         verdict = filter_dataset(make_mock_llm_json(payload), DS, INTENT, GSM_DETAILS)
         self.assertEqual(verdict["outcome"], "download")
-        # legacy fields derived from outcome
-        self.assertEqual(verdict["recommended_action"], "keep")
+        # recommended_action now mirrors the true outcome (download/lead/exclude/manual_review)
+        self.assertEqual(verdict["recommended_action"], "download")
         self.assertEqual(verdict["usable"], "yes")
         self.assertEqual(len(verdict["gsm_includes"]), 2)
         self.assertEqual(len(verdict["files"]), 1)
