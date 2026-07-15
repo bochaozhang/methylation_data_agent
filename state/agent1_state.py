@@ -147,6 +147,7 @@ class Agent1State(TypedDict, total=False):
 
     # ---- parse node ----
     parsed_intent: SearchIntent
+    query_logger: Any  # QueryLogger instance (created in parse, used in filter, finalized in run)
 
     # ---- geo-search node ----
     candidate_gse_list: List[Dict[str, Any]]
