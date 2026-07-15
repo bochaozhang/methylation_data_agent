@@ -27,6 +27,13 @@ download:
   chunk_size_mb: 10
   timeout: 300             # seconds per request
 
+agent1:
+  # agent1 (database path) implementation:
+  #   skills (default) → deterministic skill pipeline
+  #                      (geo-search → geo-filter → geo-download // tcga-direct → register)
+  #   legacy           → original DatabaseAgent fixed pipeline (rollback)
+  pipeline: skills
+
 orchestrator:
   # v1 → agents/orchestrator.py (fixed sequential pipeline; production default).
   # v2 → agents/orchestrator_v2.py (agentic tool-calling graph; new/experimental).

@@ -153,21 +153,58 @@ def _build_initial_state(query: str, config: dict) -> dict:
 
 def run_database_agent(query: str, registry: Registry) -> dict:
     """
-    Run DatabaseAgent for the given query.
+    Run the database (agent1) path for the given query.
     Returns a summary dict written to task_queue.result_json.
+
+    config.agent1.pipeline selects the implementation:
+      "skills" (default) → deterministic skill pipeline (geo-search → geo-filter
+                            → geo-download // tcga-direct → register)
+      "legacy"            → original DatabaseAgent fixed pipeline (rollback)
     """
     try:
-        from agents.database_agent import DatabaseAgent
         config = load_config()
+        pipeline_mode = (config.get("agent1") or {}).get("pipeline", "skills")
+
+        if pipeline_mode == "skills":
+            from agents.agent1_pipeline import run_agent1_pipeline
+            logger.info(f"[agent1] Running skill pipeline for query: {query!r}")
+            state = run_agent1_pipeline(query, config, registry)
+
+            dl = state.get("download_results") or []
+            tcga = state.get("tcga_results") or []
+            review = (state.get("lead_list") or []) + (state.get("manual_review_list") or [])
+            geo_ok = [r.get("accession") for r in dl if r.get("outcome_final") == "download_success"]
+            geo_fail = [r.get("accession") for r in dl if r.get("outcome_final") != "download_success"]
+            tcga_ok = [r.get("accession") for r in tcga if r.get("outcome_final") == "download_success"]
+            summary = {
+                "agent": "database",
+                "pipeline": "skills",
+                "query": query,
+                "datasets_downloaded": geo_ok + tcga_ok,
+                "datasets_failed": geo_fail,
+                "datasets_review": [r.get("accession") for r in review],
+                "datasets_excluded": len(state.get("exclude_list") or []),
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+            }
+            logger.info(
+                f"[agent1 pipeline] Done — GEO {len(geo_ok)} ok / {len(geo_fail)} fail, "
+                f"TCGA {len(tcga_ok)} ok, {len(review)} review, "
+                f"{summary['datasets_excluded']} excluded."
+            )
+            return summary
+
+        # ---- legacy DatabaseAgent path (rollback) ----
+        from agents.database_agent import DatabaseAgent
         agent = DatabaseAgent(config=config, registry=registry)
         state = _build_initial_state(query, config)
-        logger.info(f"[agent1] Running DatabaseAgent for query: {query!r}")
+        logger.info(f"[agent1] Running legacy DatabaseAgent for query: {query!r}")
         result_state = agent.run(state)
         downloaded = result_state.get("db_downloaded", [])
         failed = result_state.get("db_failed", [])
         skipped = result_state.get("db_skipped", [])
         summary = {
             "agent": "database",
+            "pipeline": "legacy",
             "query": query,
             "datasets_found": len(downloaded),
             "datasets_downloaded": downloaded,
@@ -228,87 +265,145 @@ def run_literature_agent(query: str, registry: Registry) -> dict:
 
 def run_pending_downloads(registry: Registry) -> None:
     """
-    Scan the registry for datasets with download_status='pending' and
-    execute their downloads.  Called at the end of every daemon poll cycle
-    (database agent only).
+    Download datasets with download_status='pending' (human-approved via Web UI,
+    or reset via retry-failed). Called every daemon poll cycle (database agent).
 
-    This handles two cases:
-      1. Datasets approved by the user via POST /datasets/approve
-      2. Failed datasets reset to 'pending' via POST /datasets/retry-failed
+    GEO pending → DownloadSkill (cancer labeling + subset, unified with the
+    pipeline path so human-approved downloads get the same per-GSM cancer
+    treatment as auto-downloads). TCGA pending → direct download (no subset).
     """
     pending = registry.get_all(status="pending")
     if not pending:
         return
 
     logger.info(f"[download] Found {len(pending)} pending dataset(s) — starting downloads")
-
     try:
-        from tools.download_tools import DownloadEngine, build_geo_download_tasks, build_tcga_download_tasks
         config = load_config()
-        dl_cfg = config["download"]
-        downloader = DownloadEngine(
-            output_dir=dl_cfg["output_dir"],
-            max_concurrent=dl_cfg["max_concurrent"],
-            retry_attempts=dl_cfg["retry_attempts"],
-            retry_delay=dl_cfg["retry_delay"],
-            chunk_size_mb=dl_cfg["chunk_size_mb"],
-            timeout=dl_cfg["timeout"],
-        )
     except Exception as exc:
-        logger.error(f"[download] Failed to initialise DownloadEngine: {exc}")
+        logger.error(f"[download] load_config failed: {exc}")
         return
 
-    # Build download tasks for all pending datasets
-    download_tasks = []
-    for ds in pending:
+    output_dir = config["download"]["output_dir"]
+    geo_pending = [d for d in pending if d.get("source") != "TCGA"]
+    tcga_pending = [d for d in pending if d.get("source") == "TCGA"]
+
+    # ---- GEO pending -> DownloadSkill (cancer labeling + subset), dataset-level
+    #      concurrency (so back-to-back datasets don't block each other). ----
+    if geo_pending:
+        try:
+            from skills.geo_download import DownloadSkill
+            from skills.geo_download.cancer_label import query_terms_from_label
+            from agents.agent1_pipeline import _run_concurrent
+            skill = DownloadSkill(config)
+        except Exception as exc:
+            logger.error(f"[download] DownloadSkill init failed: {exc}")
+            geo_pending = []
+
+        def _download_one(ds):
+            acc = ds["accession"]
+            registry.update_status(acc, "downloading")
+            # Re-fetch metadata to recover supplementary_files (best-effort).
+            try:
+                meta = skill.geo_client.get_series_metadata(acc) or {}
+            except Exception as exc:
+                logger.debug(f"[download] metadata re-fetch {acc} failed: {exc}")
+                meta = {}
+            rec = {
+                "accession": acc,
+                "source": "GEO",
+                "supplementary_files": meta.get("supplementary_files")
+                    or ds.get("supplementary_files") or [],
+                "title": ds.get("title") or meta.get("title"),
+                "data_type": ds.get("data_type") or meta.get("data_type"),
+                "cancer_type": ds.get("cancer_type") or meta.get("cancer_type"),
+                "flags": ds.get("notes") or "",
+                "available_file_type": ds.get("available_file_type"),
+            }
+            query_terms = query_terms_from_label(ds.get("cancer_type") or "")
+            try:
+                result = skill.process_dataset(rec, query_terms, output_dir)
+            except Exception as exc:
+                logger.error(f"[download] {acc} DownloadSkill failed: {exc}")
+                result = {"outcome_final": "failed", "files_downloaded": [],
+                          "notes": f"DownloadSkill error: {exc}"}
+            _apply_skill_download_result(registry, acc, result)
+
+        _run_concurrent(_download_one, geo_pending, max_concurrent=3)
+
+    # ---- TCGA pending -> direct download (no filter / no subset). ----
+    if tcga_pending:
+        _download_tcga_pending(registry, tcga_pending, config)
+
+
+def _apply_skill_download_result(registry: Registry, acc: str, result: dict) -> None:
+    """Map a DownloadSkill.process_dataset() result onto the registry."""
+    outcome = result.get("outcome_final")
+    files = result.get("files_downloaded") or []
+    local_path = files[0].get("local_path") if files else None
+    size = sum(f.get("size_bytes") or 0 for f in files) or None
+    subset = result.get("subset_path")
+    extra = (f"; subset={subset}" if subset else "") + (
+        f"; {result['notes']}" if result.get("notes") else "")
+    if outcome == "download_success":
+        registry.update_status(acc, "done", local_path=local_path, file_size_bytes=size)
+        registry.log_event(acc, "done", f"DownloadSkill ok{extra}")
+        logger.info(f"[download] {acc} done{extra}")
+    elif outcome and "manual_review" in outcome:
+        # File downloaded but cancer labels unclear - keep the file, flag for review.
+        registry.update_status(acc, "done", local_path=local_path, file_size_bytes=size)
+        registry.log_event(acc, "review", f"cancer unclear (file kept){extra}")
+        logger.info(f"[download] {acc} downloaded, cancer unclear -> review{extra}")
+    else:
+        registry.update_status(acc, "failed")
+        registry.log_event(acc, "error", result.get("notes", "download failed"))
+        logger.warning(f"[download] {acc} failed: {result.get('notes', '')}")
+
+
+def _download_tcga_pending(registry: Registry, tcga_pending: list, config: dict) -> None:
+    """TCGA direct download (no subset) for human-approved TCGA datasets."""
+    from tools.download_tools import DownloadEngine, build_tcga_download_tasks
+    dl_cfg = config["download"]
+    try:
+        downloader = DownloadEngine(
+            output_dir=dl_cfg["output_dir"], max_concurrent=dl_cfg["max_concurrent"],
+            retry_attempts=dl_cfg["retry_attempts"], retry_delay=dl_cfg["retry_delay"],
+            chunk_size_mb=dl_cfg["chunk_size_mb"], timeout=dl_cfg["timeout"],
+        )
+    except Exception as exc:
+        logger.error(f"[download] TCGA DownloadEngine init failed: {exc}")
+        return
+    tasks = []
+    for ds in tcga_pending:
         acc = ds["accession"]
         registry.update_status(acc, "downloading")
         try:
-            if ds.get("source") == "TCGA":
-                tasks = build_tcga_download_tasks(
-                    ds,
-                    config["download"]["output_dir"],
-                    config["tcga"]["gdc_api_base"],
-                )
-            else:
-                tasks = build_geo_download_tasks(ds, config["download"]["output_dir"])
-            download_tasks.extend(tasks)
+            tasks.extend(build_tcga_download_tasks(
+                ds, dl_cfg["output_dir"], config["tcga"]["gdc_api_base"]))
         except Exception as exc:
-            logger.error(f"[download] Failed to build tasks for {acc}: {exc}")
+            logger.error(f"[download] TCGA build tasks {acc}: {exc}")
             registry.update_status(acc, "failed")
-            registry.log_event(acc, "error", f"Task build failed: {exc}")
-
-    if not download_tasks:
+    if not tasks:
         return
-
-    # Execute downloads
     try:
-        results = downloader.download_many_sync(download_tasks)
+        results = downloader.download_many_sync(tasks)
     except Exception as exc:
-        logger.error(f"[download] download_many_sync raised: {exc}")
-        for ds in pending:
+        logger.error(f"[download] TCGA download_many_sync: {exc}")
+        for ds in tcga_pending:
             registry.update_status(ds["accession"], "failed")
-            registry.log_event(ds["accession"], "error", f"Download engine error: {exc}")
         return
-
-    # Aggregate results by accession
     acc_results: dict = {}
     for r in results:
         acc_results.setdefault(r["accession"], []).append(r)
-
     for acc, acc_res in acc_results.items():
-        all_done = all(r["status"] == "done" for r in acc_res)
-        if all_done:
-            local_path = acc_res[0]["local_path"]
-            file_size = sum(r.get("file_size_bytes", 0) for r in acc_res)
-            registry.update_status(acc, "done", local_path=str(local_path), file_size_bytes=file_size)
-            registry.log_event(acc, "done", f"Downloaded {len(acc_res)} file(s)")
-            logger.info(f"[download] {acc} — done ({file_size} bytes)")
+        if all(r["status"] == "done" for r in acc_res):
+            size = sum(r.get("file_size_bytes", 0) for r in acc_res)
+            registry.update_status(acc, "done",
+                                    local_path=str(acc_res[0]["local_path"]), file_size_bytes=size)
+            registry.log_event(acc, "done", f"TCGA downloaded {len(acc_res)} file(s)")
         else:
-            error_msgs = [r.get("error", "") for r in acc_res if r["status"] == "failed"]
             registry.update_status(acc, "failed")
-            registry.log_event(acc, "error", "; ".join(error_msgs))
-            logger.warning(f"[download] {acc} — failed: {error_msgs}")
+            registry.log_event(acc, "error", "; ".join(
+                r.get("error", "") for r in acc_res if r["status"] != "done"))
 
 
 # ---------------------------------------------------------------------------

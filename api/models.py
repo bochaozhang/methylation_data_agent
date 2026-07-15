@@ -161,6 +161,9 @@ class ApprovalItem(BaseModel):
     no_pubmed_link: bool = False
     notes: Optional[str] = None
     sample_metadata_path: Optional[str] = None
+    needs_review: bool = False  # True → Review Queue (manual_review); False → bulk 待下载 bucket
+    recommended_action: Optional[str] = None  # filter outcome: download/lead/manual_review/exclude
+    reason: Optional[str] = None
     created_at: str
 
 

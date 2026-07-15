@@ -359,7 +359,12 @@ class Registry:
                 )
 
     def approve_review(self, accession: str):
-        """Approve a pending_review dataset for download."""
+        """
+        Approve a manual_review dataset: clear needs_review and MOVE it into the
+        bulk "待下载" bucket (download_status stays awaiting_approval, needs_review
+        becomes 0). It is then downloaded together with download/lead/TCGA when the
+        user triggers the bulk confirm — NOT downloaded immediately.
+        """
         now = datetime.now(timezone.utc).isoformat()
         with self._lock:
             with self._get_conn() as conn:
@@ -367,7 +372,7 @@ class Registry:
                     """
                     UPDATE datasets SET
                         needs_review    = 0,
-                        download_status = 'pending',
+                        download_status = 'awaiting_approval',
                         updated_at      = ?
                     WHERE accession = ? AND needs_review = 1
                     """,
@@ -389,6 +394,44 @@ class Registry:
                     """,
                     (now, accession),
                 )
+
+    def confirm_bulk_download(self) -> int:
+        """
+        Bulk-confirm the "待下载" bucket: move every awaiting_approval dataset
+        with needs_review=0 (download / lead / TCGA / approved manual_review) to
+        'pending' so the daemon downloads them. Untouched: un-reviewed
+        manual_review (needs_review=1) stays in the Review Queue.
+        Returns the number moved to pending.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            with self._get_conn() as conn:
+                cur = conn.execute(
+                    """
+                    UPDATE datasets SET download_status = 'pending', updated_at = ?
+                    WHERE download_status = 'awaiting_approval' AND needs_review = 0
+                    """,
+                    (now,),
+                )
+                return cur.rowcount
+
+    def cancel_bulk_download(self) -> int:
+        """
+        Bulk-cancel the "待下载" bucket: mark every awaiting_approval dataset with
+        needs_review=0 as 'skipped'. Un-reviewed manual_review (needs_review=1) is
+        left untouched in the Review Queue.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            with self._get_conn() as conn:
+                cur = conn.execute(
+                    """
+                    UPDATE datasets SET download_status = 'skipped', updated_at = ?
+                    WHERE download_status = 'awaiting_approval' AND needs_review = 0
+                    """,
+                    (now,),
+                )
+                return cur.rowcount
 
     def log_event(self, accession: str, event: str, message: str = ""):
         """Append an event to the download log."""
