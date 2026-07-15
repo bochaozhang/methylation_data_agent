@@ -57,6 +57,12 @@ geo:
   #                     Edit filtering behaviour by editing that SPEC.md.
   skill_filter: true
 
+review:
+  # Toggles orchestrator_v2's second-pass QC reviewers (tools/extraction_reviewer.py):
+  # review_extraction (paper-level AUC/sample_type/reference-accession checks) and
+  # review_geo_verdict (GEO dataset verdict checks). Off = faster/cheaper, no re-check.
+  enabled: true
+
 tcga:
   gdc_api_base: https://api.gdc.cancer.gov
   gdc_token_env: GDC_TOKEN   # optional, only needed for controlled-access data

@@ -18,7 +18,15 @@ Tools exposed to the agent:
                                  (Stage 1/2 extraction + LLM reviewer, see
                                  tools/extraction_reviewer.py)
     evaluate_geo_dataset_tool -> tools/query_clarifier.py:evaluate_geo_dataset()
+                                 followed by tools/extraction_reviewer.py:
+                                 review_geo_verdict() (second-pass QC on the
+                                 verdict itself: species / methylation-data-type
+                                 / tissue-vs-cfDNA sample type)
     write_to_registry         -> registry/registry.py:Registry.upsert_dataset()
+
+Both reviewer passes (review_extraction inside search_papers, review_geo_verdict
+inside evaluate_geo_dataset_tool) are toggled together by config["review"]["enabled"]
+(default True) — see config/settings.yaml's `review:` section.
 
 This chain mirrors scripts/pipeline_prototype.py (search -> evaluate -> write),
 but there the order/branching is hardcoded by the script; here the LLM decides.
@@ -41,6 +49,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMe
 from langchain_core.tools import tool
 
 from registry.registry import Registry
+from tools.extraction_reviewer import review_geo_verdict
 from tools.geo_tools import GEOClient
 from tools.ncbi_search import search_and_extract
 from tools.parser_tools import parse_query_rules
@@ -113,6 +122,8 @@ def build_tools(config: Dict[str, Any], registry: Registry, llm: BaseChatModel):
     ncbi_proxy = os.environ.get("NCBI_PROXY", "") or config.get("geo", {}).get("proxy", "")
     geo_client = GEOClient(api_key=ncbi_key or None, proxy=ncbi_proxy or None)
 
+    review_enabled = config.get("review", {}).get("enabled", True)
+
     run_trace: Dict[str, Any] = {
         "papers": [],
         "evaluations": [],
@@ -127,7 +138,7 @@ def build_tools(config: Dict[str, Any], registry: Registry, llm: BaseChatModel):
         with a second-pass LLM review for AUC/sample_type and dataset_id consistency.
         Returns a JSON array of structured paper records."""
         intent = parse_query_rules(query)
-        papers = search_and_extract(intent, llm, top_n=5)
+        papers = search_and_extract(intent, llm, top_n=5, review=review_enabled)
         run_trace["papers"].extend(papers)
         return json.dumps(papers, ensure_ascii=False, default=str)
 
@@ -145,6 +156,15 @@ def build_tools(config: Dict[str, Any], registry: Registry, llm: BaseChatModel):
         dataset_info = _build_dataset_info(accession, meta)
         types = [t.strip() for t in sample_types.split(",") if t.strip()]
         judgment = evaluate_geo_dataset(dataset_info, cancer_type, types, llm)
+
+        if review_enabled:
+            review_report = review_geo_verdict(judgment, meta, llm)
+            judgment["review_report"] = review_report
+            if review_report.get("needs_human_review"):
+                judgment["recommended_action"] = review_report["corrected_fields"].get(
+                    "recommended_action", "manual_review"
+                )
+
         run_trace["evaluations"].append({"accession": accession, **judgment})
         return json.dumps(judgment, ensure_ascii=False)
 

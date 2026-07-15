@@ -734,7 +734,7 @@ _SAMPLE_TYPE_SYNONYMS: Dict[str, tuple] = {
 # panel rather than the study's primary experimental data.
 _REFERENCE_DATASET_KEYWORDS = (
     "reference", "background", "normalization", "normalisation",
-    "control panel", "filter",
+    "control panel", "filter", "deconvolution", "atlas",
 )
 
 
