@@ -23,7 +23,7 @@ from typing import Any, Callable, Dict, List
 from langgraph.graph import END, START, StateGraph
 
 from agents.tcga_direct import run_tcga_direct
-from skills.geo_filter import apply_verdict, filter_dataset, split_by_outcome
+from skills.geo_filter import SPEC_NAME, apply_verdict, filter_dataset, split_by_outcome
 from skills.geo_filter.file_inspect import verify_a_level_files
 from skills.geo_filter.skill import _OUTCOME_TO_LEGACY
 from skills.geo_search import SearchSkill
@@ -32,6 +32,7 @@ from tools.geo_tools import GEOClient
 from tools.parser_tools import parse_query_rules, parse_query_with_llm
 from utils.llm_factory import get_llm
 from utils.logger import get_logger
+from utils.query_logger import QueryLogger
 
 logger = get_logger(__name__)
 
@@ -103,14 +104,28 @@ def build_agent1_pipeline(config: Dict[str, Any], registry: Any = None):
             f"cancer={(intent.get('cancer_type') or {}).get('tcga_code')} "
             f"sample={intent.get('sample_type')}"
         )
-        return {"parsed_intent": intent}
+        # Per-query CSV logger (best-effort; captures filter verdicts + reasoning).
+        qlog = None
+        if config.get("logging", {}).get("query_csv", True):
+            model_name = (
+                getattr(llm, "model_name", None)
+                or getattr(llm, "model", None)
+                or "unknown"
+            )
+            qlog = QueryLogger(
+                query=raw,
+                model_name=model_name,
+                spec_name=SPEC_NAME,
+                output_dir=state.get("output_dir") or config.get("download", {}).get("output_dir", "./data"),
+            )
+        return {"parsed_intent": intent, "query_logger": qlog}
 
     # ---- geo-search ----
     def search_node(state: Agent1State) -> Dict[str, Any]:
         return search_skill.run(dict(state))
 
     # ---- geo-filter ----
-    def _filter_one(ds: Dict[str, Any], intent: Dict[str, Any]) -> Dict[str, Any]:
+    def _filter_one(ds: Dict[str, Any], intent: Dict[str, Any], qlog=None) -> Dict[str, Any]:
         acc = ds.get("accession", "?")
         wanted = intent.get("sample_type", "") or ""
         gsm = geo_client.get_representative_gsm_details(acc, wanted_sample_type=wanted)
@@ -122,6 +137,10 @@ def build_agent1_pipeline(config: Dict[str, Any], registry: Any = None):
             except Exception as e:
                 logger.debug(f"agent1 filter abstract {acc}: {e}")
         verdict = filter_dataset(llm, ds, intent, gsm, abstract=abstract)
+
+        # Log the verdict (reasoning + outcome + tokens) to the per-query CSV.
+        if qlog is not None:
+            qlog.log_dataset(ds, verdict)
 
         # Phase 2a: file-form A-level preview (核验前置). For download/lead
         # candidates, inspect the REAL supplementary file heads and override the
@@ -156,11 +175,12 @@ def build_agent1_pipeline(config: Dict[str, Any], registry: Any = None):
     def filter_node(state: Agent1State) -> Dict[str, Any]:
         intent = state.get("parsed_intent") or {}
         candidates = state.get("candidate_gse_list") or []
+        qlog = state.get("query_logger")
         if not candidates:
             empty = {"download_list": [], "lead_list": [], "exclude_list": [],
                      "manual_review_list": []}
             return {**empty, "filter_log": "geo-filter: no candidates"}
-        judged = _run_concurrent(_filter_one, candidates, intent, max_concurrent=3)
+        judged = _run_concurrent(_filter_one, candidates, intent, qlog, max_concurrent=3)
         buckets = split_by_outcome(judged)
         log = (
             f"geo-filter: {len(candidates)} candidates → "
@@ -304,5 +324,9 @@ def run_agent1_pipeline(query: str, config: Dict[str, Any], registry: Any,
     }
     logger.info(f"agent1 pipeline start | query='{query}'")
     final = app.invoke(initial)
+    # Finalize the per-query CSV log (writes the file).
+    qlog = final.get("query_logger") if isinstance(final, dict) else None
+    if qlog is not None:
+        qlog.finalize()
     logger.info("agent1 pipeline done.")
     return final
