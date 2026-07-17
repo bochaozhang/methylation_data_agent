@@ -43,6 +43,7 @@ _LLM_MODEL_ENV = {
     "zhipu": "ZHIPU_MODEL",
     "openai": "OPENAI_MODEL",
     "anthropic": "ANTHROPIC_MODEL",
+    "qwen": "QWEN_MODEL",
 }
 
 

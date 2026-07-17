@@ -249,8 +249,43 @@ def get_llm(config: Dict[str, Any]) -> BaseChatModel:
 
         return ChatOpenAI(**kwargs)
 
+    # ------------------------------------------------------------------ #
+    #  Qwen (Alibaba DashScope, OpenAI-compatible)                        #
+    # ------------------------------------------------------------------ #
+    elif backend == "qwen":
+        from langchain_openai import ChatOpenAI
+
+        _QWEN_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        api_key = (
+            os.environ.get("QWEN_API_KEY")
+            or os.environ.get("QWEN_ZPI_KEY")  # typo fallback (user had this in .env)
+            or os.environ.get(api_key_env)
+            or ""
+        )
+        if not api_key:
+            raise ValueError(
+                "Qwen API key not found. "
+                "Set QWEN_API_KEY in your .env file. "
+                "Get a key at: https://dashscope.console.aliyun.com"
+            )
+
+        model = (
+            os.environ.get("QWEN_MODEL")
+            or os.environ.get("OPENAI_MODEL")
+            or config.get("model")
+            or "qwen-plus"
+        )
+
+        return ChatOpenAI(
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            api_key=api_key,
+            base_url=_QWEN_BASE_URL,
+        )
+
     else:
         raise ValueError(
             f"Unsupported LLM backend: '{backend}'. "
-            "Choose from: openai, zhipu, anthropic, ollama, deepseek"
+            "Choose from: openai, zhipu, anthropic, ollama, deepseek, qwen"
         )
