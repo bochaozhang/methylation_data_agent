@@ -410,16 +410,21 @@ def _download_tcga_pending(registry: Registry, tcga_pending: list, config: dict)
 # Main daemon loop
 # ---------------------------------------------------------------------------
 
-def daemon_loop(agent_type: str, registry: Registry):
+def daemon_loop(agent_type: str, registry: Registry, mode: str = "both"):
     """
-    Poll the task_queue for pending tasks matching agent_type.
+    Poll the task_queue / pending downloads depending on mode.
     Runs indefinitely until SIGTERM/SIGINT.
+
+    Modes:
+      query    — claim + run query tasks only (no downloads).
+      download — poll for pending downloads only (no task claiming).
+      both     — claim tasks + run downloads (backward compat, single-process).
     """
     runner = run_database_agent if agent_type == "database" else run_literature_agent
     last_heartbeat = 0.0
 
     logger.info(
-        f"MethyAgent daemon started — agent_type={agent_type!r}, "
+        f"MethyAgent daemon started — agent_type={agent_type!r}, mode={mode!r}, "
         f"poll_interval={POLL_INTERVAL}s, heartbeat_interval={HEARTBEAT_INTERVAL}s"
     )
 
@@ -434,7 +439,17 @@ def daemon_loop(agent_type: str, registry: Registry):
                 logger.warning(f"Heartbeat write failed: {hb_exc}")
             last_heartbeat = now
 
-        # ---- Claim a task ----
+        # ---- Download-only worker ----
+        if mode == "download":
+            if agent_type == "database":
+                try:
+                    run_pending_downloads(registry)
+                except Exception as dl_exc:
+                    logger.error(f"[download] Error: {dl_exc}")
+            time.sleep(POLL_INTERVAL)
+            continue
+
+        # ---- Query / both: claim a task ----
         try:
             task = registry.claim_task(agent_type)
         except Exception as claim_exc:
@@ -443,8 +458,8 @@ def daemon_loop(agent_type: str, registry: Registry):
             continue
 
         if task is None:
-            # No pending tasks — check for approved downloads, then sleep
-            if agent_type == "database":
+            # No pending tasks
+            if mode == "both" and agent_type == "database":
                 try:
                     run_pending_downloads(registry)
                 except Exception as dl_exc:
@@ -466,9 +481,8 @@ def daemon_loop(agent_type: str, registry: Registry):
             registry.fail_task(task_id, error=error_msg)
             logger.error(f"Task {task_id} failed: {exc}")
 
-        # ---- Download pending datasets (database agent only) ----
-        # Picks up datasets approved via Web UI or reset via retry-failed.
-        if agent_type == "database":
+        # ---- Post-task download (both mode only) ----
+        if mode == "both" and agent_type == "database":
             try:
                 run_pending_downloads(registry)
             except Exception as dl_exc:
@@ -510,6 +524,13 @@ def main():
         default=POLL_INTERVAL,
         help=f"Seconds between task queue polls (default: {POLL_INTERVAL}).",
     )
+    parser.add_argument(
+        "--mode",
+        choices=["query", "download", "both"],
+        default="both",
+        help="Worker mode: 'query' (claim tasks only), 'download' (downloads only), "
+             "'both' (default, backward compat).",
+    )
     args = parser.parse_args()
 
     # Override globals from CLI args
@@ -520,7 +541,7 @@ def main():
     Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
 
     registry = Registry(db_path=args.registry)
-    daemon_loop(agent_type=args.agent, registry=registry)
+    daemon_loop(agent_type=args.agent, registry=registry, mode=args.mode)
 
 
 if __name__ == "__main__":
