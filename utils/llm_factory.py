@@ -284,8 +284,49 @@ def get_llm(config: Dict[str, Any]) -> BaseChatModel:
             base_url=_QWEN_BASE_URL,
         )
 
+    # ------------------------------------------------------------------ #
+    #  Kimi (Moonshot AI, OpenAI-compatible)                              #
+    # ------------------------------------------------------------------ #
+    elif backend == "kimi":
+        from langchain_openai import ChatOpenAI
+
+        _KIMI_BASE_URL = "https://api.moonshot.cn/v1"
+        api_key = (
+            os.environ.get("KIMI_API_KEY")
+            or os.environ.get(api_key_env)
+            or ""
+        )
+        if not api_key:
+            raise ValueError(
+                "Kimi API key not found. "
+                "Set KIMI_API_KEY in your .env file. "
+                "Get a key at: https://platform.moonshot.cn"
+            )
+
+        model = (
+            os.environ.get("KIMI_MODEL")
+            or config.get("model")
+            or "moonshot-v1-8k"
+        )
+
+        # kimi-k3 is a reasoning model: requires temperature=1 + max_completion_tokens.
+        is_reasoner = "k3" in model.lower()
+        effective_temperature = 1 if is_reasoner else temperature
+        kwargs: Dict[str, Any] = dict(
+            model=model,
+            temperature=effective_temperature,
+            api_key=api_key,
+            base_url=_KIMI_BASE_URL,
+        )
+        if is_reasoner:
+            kwargs["model_kwargs"] = {"max_completion_tokens": max_tokens}
+        else:
+            kwargs["max_tokens"] = max_tokens
+
+        return ChatOpenAI(**kwargs)
+
     else:
         raise ValueError(
             f"Unsupported LLM backend: '{backend}'. "
-            "Choose from: openai, zhipu, anthropic, ollama, deepseek, qwen"
+            "Choose from: openai, zhipu, anthropic, ollama, deepseek, qwen, kimi"
         )

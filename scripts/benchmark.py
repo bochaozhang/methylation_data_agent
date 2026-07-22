@@ -44,6 +44,7 @@ _LLM_MODEL_ENV = {
     "openai": "OPENAI_MODEL",
     "anthropic": "ANTHROPIC_MODEL",
     "qwen": "QWEN_MODEL",
+    "kimi": "KIMI_MODEL",
 }
 
 
