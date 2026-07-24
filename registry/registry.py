@@ -188,6 +188,9 @@ class Registry:
             "ALTER TABLE datasets ADD COLUMN no_pubmed_link INTEGER DEFAULT 0",
             # v6 columns
             "ALTER TABLE datasets ADD COLUMN sample_metadata_path TEXT",
+            # query mapping columns
+            "ALTER TABLE datasets ADD COLUMN task_id TEXT",
+            "ALTER TABLE datasets ADD COLUMN raw_query TEXT",
         ]
         with self._get_conn() as conn:
             for sql in migrations:
@@ -244,6 +247,8 @@ class Registry:
         notes: Optional[str] = None,
         no_pubmed_link: bool = False,
         sample_metadata_path: Optional[str] = None,
+        task_id: Optional[str] = None,
+        raw_query: Optional[str] = None,
     ) -> bool:
         """
         Insert a new dataset or update metadata if it already exists.
@@ -284,6 +289,8 @@ class Registry:
                             notes                   = COALESCE(?, notes),
                             no_pubmed_link          = COALESCE(?, no_pubmed_link),
                             sample_metadata_path    = COALESCE(?, sample_metadata_path),
+                            task_id                 = COALESCE(?, task_id),
+                            raw_query               = COALESCE(?, raw_query),
                             download_status         = ?,
                             updated_at              = ?
                         WHERE accession = ?
@@ -297,6 +304,7 @@ class Registry:
                             reason, notes,
                             int(no_pubmed_link),
                             sample_metadata_path,
+                            task_id, raw_query,
                             download_status,
                             now, accession,
                         ),
@@ -313,10 +321,10 @@ class Registry:
                             disease_groups, stage_treatment, available_file_type,
                             sample_level_annotation, usable, recommended_action,
                             reason, notes, no_pubmed_link,
-                            sample_metadata_path,
+                            sample_metadata_path, task_id, raw_query,
                             created_at, updated_at
                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                                  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             accession, source, data_type, cancer_type, platform,
@@ -327,7 +335,7 @@ class Registry:
                             sample_level_annotation, usable, recommended_action,
                             reason, notes,
                             int(no_pubmed_link),
-                            sample_metadata_path,
+                            sample_metadata_path, task_id, raw_query,
                             now, now,
                         ),
                     )
@@ -360,10 +368,8 @@ class Registry:
 
     def approve_review(self, accession: str):
         """
-        Approve a manual_review dataset: clear needs_review and MOVE it into the
-        bulk "待下载" bucket (download_status stays awaiting_approval, needs_review
-        becomes 0). It is then downloaded together with download/lead/TCGA when the
-        user triggers the bulk confirm — NOT downloaded immediately.
+        Approve a review item: clear needs_review and set download_status='pending'
+        so the download worker picks it up immediately.
         """
         now = datetime.now(timezone.utc).isoformat()
         with self._lock:
@@ -372,7 +378,7 @@ class Registry:
                     """
                     UPDATE datasets SET
                         needs_review    = 0,
-                        download_status = 'awaiting_approval',
+                        download_status = 'pending',
                         updated_at      = ?
                     WHERE accession = ? AND needs_review = 1
                     """,
@@ -521,6 +527,55 @@ class Registry:
         with self._get_conn() as conn:
             rows = conn.execute("SELECT accession FROM datasets").fetchall()
             return {r["accession"] for r in rows}
+
+    def get_query_datasets(self) -> List[Dict]:
+        """Return datasets with task_id/raw_query, ordered by query then date."""
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT raw_query, task_id, accession, source, download_status,
+                       local_path, title, cancer_type, platform, sample_count,
+                       recommended_action, created_at
+                FROM datasets
+                WHERE task_id IS NOT NULL
+                ORDER BY raw_query, created_at DESC
+                """
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_query_list(self) -> List[Dict]:
+        """Return distinct queries with dataset counts."""
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT task_id, raw_query,
+                       MIN(created_at) as created_at,
+                       COUNT(*) as dataset_count,
+                       SUM(CASE WHEN download_status='done' THEN 1 ELSE 0 END) as done_count,
+                       SUM(CASE WHEN download_status='awaiting_approval' THEN 1 ELSE 0 END) as awaiting_count
+                FROM datasets
+                WHERE task_id IS NOT NULL
+                GROUP BY task_id
+                ORDER BY created_at DESC
+                """
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_datasets_by_task_id(self, task_id: str) -> List[Dict]:
+        """Return all datasets for a given task_id."""
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT accession, source, download_status, local_path,
+                       title, cancer_type, platform, sample_count,
+                       recommended_action, created_at
+                FROM datasets
+                WHERE task_id = ?
+                ORDER BY recommended_action, accession
+                """,
+                (task_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
 
     def get_summary(self) -> Dict:
         """Return a summary dict for the final report."""

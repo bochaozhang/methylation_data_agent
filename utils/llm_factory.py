@@ -21,7 +21,7 @@ from typing import Any, Dict
 from langchain_core.language_models import BaseChatModel
 
 # ZhipuAI base URL constant
-_ZHIPU_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
+_ZHIPU_BASE_URL = "https://open.bigmodel.cn/api/coding/paas/v4"
 
 
 def _is_zhipu_url(url: str) -> bool:
