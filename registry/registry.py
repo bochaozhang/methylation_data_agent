@@ -153,6 +153,7 @@ class Registry:
         # Step 2: Migrate existing databases BEFORE creating indexes
         # (indexes on new columns will fail if the column doesn't exist yet)
         self._migrate_schema()
+        self._ensure_query_dataset_map()
 
         # Step 3: Create indexes (safe after migration ensures columns exist)
         with self._get_conn() as conn:
@@ -168,6 +169,21 @@ class Registry:
                 CREATE INDEX IF NOT EXISTS idx_task_status
                     ON task_queue(status, agent_type);
             """)
+
+    def _ensure_query_dataset_map(self):
+        """Create the query_dataset_map table if it doesn't exist (many-to-many)."""
+        with self._get_conn() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS query_dataset_map (
+                    task_id TEXT NOT NULL,
+                    accession TEXT NOT NULL,
+                    raw_query TEXT,
+                    created_at TEXT,
+                    PRIMARY KEY (task_id, accession)
+                )
+                """
+            )
 
     def _migrate_schema(self):
         """Add new columns to existing databases (safe no-op if already present)."""
@@ -289,8 +305,8 @@ class Registry:
                             notes                   = COALESCE(?, notes),
                             no_pubmed_link          = COALESCE(?, no_pubmed_link),
                             sample_metadata_path    = COALESCE(?, sample_metadata_path),
-                            task_id                 = COALESCE(?, task_id),
-                            raw_query               = COALESCE(?, raw_query),
+                            task_id                 = COALESCE(task_id, ?),
+                            raw_query               = COALESCE(raw_query, ?),
                             download_status         = ?,
                             updated_at              = ?
                         WHERE accession = ?
@@ -309,6 +325,11 @@ class Registry:
                             now, accession,
                         ),
                     )
+                    if task_id:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO query_dataset_map (task_id, accession, raw_query, created_at) VALUES (?, ?, ?, ?)",
+                            (task_id, accession, raw_query, now),
+                        )
                     return False
                 else:
                     conn.execute(
@@ -339,6 +360,11 @@ class Registry:
                             now, now,
                         ),
                     )
+                    if task_id:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO query_dataset_map (task_id, accession, raw_query, created_at) VALUES (?, ?, ?, ?)",
+                            (task_id, accession, raw_query, now),
+                        )
                     return True
 
     def update_status(
@@ -544,38 +570,54 @@ class Registry:
             return [dict(r) for r in rows]
 
     def get_query_list(self) -> List[Dict]:
-        """Return distinct queries with dataset counts."""
+        """Return distinct queries with dataset counts (from query_dataset_map)."""
         with self._get_conn() as conn:
             rows = conn.execute(
                 """
-                SELECT task_id, raw_query,
-                       MIN(created_at) as created_at,
+                SELECT m.task_id, m.raw_query,
+                       MIN(m.created_at) as created_at,
                        COUNT(*) as dataset_count,
-                       SUM(CASE WHEN download_status='done' THEN 1 ELSE 0 END) as done_count,
-                       SUM(CASE WHEN download_status='awaiting_approval' THEN 1 ELSE 0 END) as awaiting_count
-                FROM datasets
-                WHERE task_id IS NOT NULL
-                GROUP BY task_id
-                ORDER BY created_at DESC
+                       SUM(CASE WHEN d.download_status='done' THEN 1 ELSE 0 END) as done_count,
+                       SUM(CASE WHEN d.download_status='awaiting_approval' THEN 1 ELSE 0 END) as awaiting_count
+                FROM query_dataset_map m
+                LEFT JOIN datasets d ON m.accession = d.accession
+                GROUP BY m.task_id
+                ORDER BY m.created_at DESC
                 """
             ).fetchall()
             return [dict(r) for r in rows]
 
     def get_datasets_by_task_id(self, task_id: str) -> List[Dict]:
-        """Return all datasets for a given task_id."""
+        """Return all datasets for a given task_id (via query_dataset_map)."""
         with self._get_conn() as conn:
             rows = conn.execute(
                 """
-                SELECT accession, source, download_status, local_path,
-                       title, cancer_type, platform, sample_count,
-                       recommended_action, created_at
-                FROM datasets
-                WHERE task_id = ?
-                ORDER BY recommended_action, accession
+                SELECT d.accession, d.source, d.download_status, d.local_path,
+                       d.title, d.cancer_type, d.platform, d.sample_count,
+                       d.recommended_action, d.created_at
+                FROM query_dataset_map m
+                JOIN datasets d ON m.accession = d.accession
+                WHERE m.task_id = ?
+                ORDER BY d.recommended_action, d.accession
                 """,
                 (task_id,),
             ).fetchall()
             return [dict(r) for r in rows]
+
+    def add_query_dataset(self, task_id: str, accession: str,
+                          raw_query: str = None) -> None:
+        """Insert a query→dataset mapping (many-to-many). Ignores duplicates."""
+        import datetime as _dt
+        now = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        with self._lock:
+            with self._get_conn() as conn:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO query_dataset_map (task_id, accession, raw_query, created_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (task_id, accession, raw_query, now),
+                )
 
     def get_summary(self) -> Dict:
         """Return a summary dict for the final report."""
