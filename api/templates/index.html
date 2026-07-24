@@ -307,7 +307,7 @@
   <button onclick="showTab('tasks')">&#128203; Tasks</button>
   <button onclick="showTab('datasets')">&#128190; Datasets</button>
   <button onclick="showTab('review')">&#9989; Review Queue <span id="reviewBadge"></span></button>
-  <button onclick="showTab('approval')">&#9660; 待下载 <span id="approvalBadge"></span></button>
+  <button onclick="showTab('querydatasets')">&#128269; Query Results</button>
 </nav>
 
 <main>
@@ -437,36 +437,18 @@
   <!-- ===== REVIEW TAB ===== -->
   <div id="tab-review" class="section">
     <div class="card">
-      <h2>Pending Review Queue</h2>
+      <h2>Review Queue</h2>
       <p style="font-size:.85rem;color:#636e72;margin-bottom:16px">
-        These datasets were extracted by the LLM with <strong>medium confidence</strong>.
-        Review the evidence and approve or reject each one.
-      </p>
-      <div class="refresh-info" id="reviewRefreshInfo"></div>
-      <div id="reviewList">
-        <div class="empty">Loading...</div>
-      </div>
-    </div>
-  </div>
-
-  <!-- ===== APPROVAL TAB ===== -->
-  <div id="tab-approval" class="section">
-    <div class="card">
-      <h2>&#9660; 待下载队列</h2>
-      <p style="font-size:.85rem;color:#636e72;margin-bottom:16px">
-        Agent 发现、待下载的数据集（download / lead / TCGA，以及 Review Queue 已通过的 manual_review）。
-        点"确认开始下载"全部进入下载；点"取消"清空（设为 skipped，不下载）。
-        存疑的 manual_review 请到 <b>Review Queue</b> 逐条审，通过后自动进入这里。
+        lead / manual_review 数据集，逐条审。Approve → 自动下载；Reject → 跳过。
+        download outcome 已自动下载，不在此列表。
       </p>
       <div class="approval-toolbar">
-        <button class="btn success" id="confirmDownloadBtn" onclick="confirmDownload()">&#10003; 确认开始下载</button>
-        <button class="btn sm" style="background:#d63031;margin-left:4px" id="cancelDownloadBtn" onclick="cancelDownload()">&#10007; 取消（清空）</button>
-        <button class="btn sm" style="background:#636e72;margin-left:4px" onclick="loadApproval()">&#8635; Refresh</button>
-        <span class="count-label" id="approvalCountLabel"></span>
+        <button class="btn sm" style="background:#636e72" onclick="loadReview()">&#8635; Refresh</button>
+        <span class="count-label" id="reviewCountLabel"></span>
       </div>
-      <div class="refresh-info" id="approvalRefreshInfo"></div>
+      <div class="refresh-info" id="reviewRefreshInfo"></div>
       <div class="table-wrap">
-        <table id="approvalTable">
+        <table id="reviewTable">
           <thead>
             <tr>
               <th>Accession</th>
@@ -478,16 +460,77 @@
               <th>Samples</th>
               <th>Sample Type</th>
               <th>Reason</th>
+              <th>Action</th>
             </tr>
           </thead>
-          <tbody id="approvalBody">
-            <tr><td colspan="9" class="empty">Loading...</td></tr>
+          <tbody id="reviewBody">
+            <tr><td colspan="10" class="empty">Loading...</td></tr>
           </tbody>
         </table>
       </div>
-      <div class="alert" id="approvalAlert" style="margin-top:14px"></div>
+      <div class="alert" id="reviewAlert" style="margin-top:14px"></div>
     </div>
   </div>
+
+  <!-- ===== QUERY DATASETS TAB ===== -->
+  <div id="tab-querydatasets" class="section">
+    <div class="card">
+
+      <!-- List view -->
+      <div id="qdListView">
+        <h2>&#128269; Query Results</h2>
+        <div class="approval-toolbar">
+          <button class="btn sm" style="background:#636e72" onclick="loadQueryList()">&#8635; Refresh</button>
+        </div>
+        <div class="refresh-info" id="qdRefreshInfo"></div>
+        <div class="table-wrap">
+          <table id="qdListTable">
+            <thead>
+              <tr>
+                <th>Query</th>
+                <th>Task ID</th>
+                <th>Created</th>
+                <th>Datasets</th>
+                <th>Done</th>
+                <th>Awaiting</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody id="qdListBody">
+              <tr><td colspan="6" class="empty">Click Refresh.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- Detail view (hidden by default) -->
+      <div id="qdDetailView" style="display:none">
+        <button class="btn sm" style="background:#636e72;margin-bottom:12px" onclick="showQueryList()">&#8592; Back</button>
+        <h2 id="qdDetailTitle">Datasets</h2>
+        <div class="table-wrap">
+          <table id="qdDetailTable">
+            <thead>
+              <tr>
+                <th>Accession</th>
+                <th>Source</th>
+                <th>Outcome</th>
+                <th>Status</th>
+                <th>Title</th>
+                <th>Cancer</th>
+                <th>Platform</th>
+                <th>Samples</th>
+                <th>Local Path</th>
+              </tr>
+            </thead>
+            <tbody id="qdDetailBody">
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
 
 </main>
 
@@ -542,12 +585,11 @@ function showTab(name) {
   document.querySelectorAll('.section').forEach(s => s.classList.remove('active'));
   document.querySelectorAll('nav button').forEach(b => b.classList.remove('active'));
   document.getElementById('tab-' + name).classList.add('active');
-  const idx = ['query','tasks','datasets','review','approval'].indexOf(name);
+  const idx = ['query','tasks','datasets','review','querydatasets'].indexOf(name);
   document.querySelectorAll('nav button')[idx].classList.add('active');
   if (name === 'tasks')    loadTasks();
   if (name === 'datasets') loadDatasets();
   if (name === 'review')   loadReview();
-  if (name === 'approval') loadApproval();
 }
 
 // ============================================================
@@ -699,31 +741,35 @@ async function loadReview() {
     const d = await r.json();
     document.getElementById('reviewRefreshInfo').textContent = nowStr();
 
-    // Update nav badge
     const badge_el = document.getElementById('reviewBadge');
     badge_el.textContent = d.total > 0 ? ` (${d.total})` : '';
 
-    const container = document.getElementById('reviewList');
+    const tbody = document.getElementById('reviewBody');
+    const countLabel = document.getElementById('reviewCountLabel');
+
     if (!d.items.length) {
-      container.innerHTML = '<div class="empty">No items pending review. &#127881;</div>';
+      tbody.innerHTML = '<tr><td colspan="10" class="empty">No items pending review. &#127881;</td></tr>';
+      countLabel.textContent = '';
       return;
     }
-    container.innerHTML = d.items.map(item => `
-      <div class="review-card" id="rc-${item.accession}">
-        <h3><code>${item.accession}</code> &mdash; ${item.source}</h3>
-        <div class="meta">
-          ${item.title ? `<strong>${item.title}</strong><br>` : ''}
-          ${item.paper_doi ? `DOI: <a href="https://doi.org/${item.paper_doi}" target="_blank">${item.paper_doi}</a> &nbsp;` : ''}
-          ${item.paper_pmid ? `PMID: ${item.paper_pmid}` : ''}
-          &nbsp;| Added: ${fmtDate(item.created_at)}
-        </div>
-        ${item.llm_evidence ? `<div class="evidence">${item.llm_evidence}</div>` : ''}
-        <div class="review-actions">
-          <button class="btn success sm" onclick="reviewAction('${item.accession}','approve')">&#10003; Approve</button>
-          <button class="btn danger sm" onclick="reviewAction('${item.accession}','reject')">&#10007; Reject</button>
-        </div>
-      </div>`).join('');
-  } catch(e) { console.error(e); }
+    countLabel.textContent = `${d.total} 个待审`;
+
+    tbody.innerHTML = d.items.map(item => `<tr id="rrow-${item.accession}">
+      <td><a href="https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=${item.accession}" target="_blank" style="color:#0984e3"><code>${item.accession}</code></a></td>
+      <td>${item.source || '—'}</td>
+      <td>${item.outcome || '—'}</td>
+      <td class="truncate" title="${(item.title||'').replace(/"/g,'&quot;')}">${item.title || '—'}</td>
+      <td>${item.cancer_type || '—'}</td>
+      <td>${item.platform || '—'}</td>
+      <td>${item.sample_count ?? '—'}</td>
+      <td>${item.sample_type || '—'}</td>
+      <td class="truncate" title="${(item.reason||'').replace(/"/g,'&quot;')}">${item.reason || '—'}</td>
+      <td style="white-space:nowrap">
+        <button class="btn success sm" onclick="reviewAction('${item.accession}','approve')">&#10003;</button>
+        <button class="btn danger sm" onclick="reviewAction('${item.accession}','reject')">&#10007;</button>
+      </td>
+    </tr>`).join('');
+  } catch(e) { console.error('loadReview error:', e); }
 }
 
 async function reviewAction(accession, action) {
@@ -735,17 +781,73 @@ async function reviewAction(accession, action) {
     });
     const d = await r.json();
     if (!r.ok) { alert(d.detail || 'Error'); return; }
-    // Remove card from DOM
-    const card = document.getElementById('rc-' + accession);
-    if (card) card.remove();
-    // Update badge
-    const remaining = document.querySelectorAll('[id^="rc-"]').length;
+    const row = document.getElementById('rrow-' + accession);
+    if (row) row.remove();
+    const remaining = document.querySelectorAll('[id^="rrow-"]').length;
     document.getElementById('reviewBadge').textContent = remaining > 0 ? ` (${remaining})` : '';
+    document.getElementById('reviewCountLabel').textContent = remaining > 0 ? `${remaining} 个待审` : '';
     if (remaining === 0) {
-      document.getElementById('reviewList').innerHTML =
-        '<div class="empty">No items pending review. &#127881;</div>';
+      document.getElementById('reviewBody').innerHTML =
+        '<tr><td colspan="10" class="empty">No items pending review. &#127881;</td></tr>';
     }
   } catch(e) { alert('Network error: ' + e.message); }
+}
+
+// ============================================================
+// Query Datasets tab (master-detail)
+// ============================================================
+async function loadQueryList() {
+  try {
+    const r = await fetch('/query-datasets');
+    const d = await r.json();
+    document.getElementById('qdRefreshInfo').textContent = nowStr();
+    const tbody = document.getElementById('qdListBody');
+    if (!d.items || !d.items.length) {
+      tbody.innerHTML = '<tr><td colspan="7" class="empty">暂无数据。提交 query 后点 Refresh。</td></tr>';
+      return;
+    }
+    tbody.innerHTML = d.items.map(item => `<tr style="cursor:pointer">
+      <td class="truncate" style="max-width:300px" title="${(item.raw_query||'').replace(/"/g,'&quot;')}">${item.raw_query || '—'}</td>
+      <td><code>${(item.task_id||'').slice(0,8)}</code></td>
+      <td>${fmtDate(item.created_at)}</td>
+      <td>${item.dataset_count ?? 0}</td>
+      <td>${item.done_count ?? 0}</td>
+      <td>${item.awaiting_count ?? 0}</td>
+      <td><button class="btn sm" onclick="event.stopPropagation();loadQueryDetail('${item.task_id}')">&#128065; Show Datasets</button></td>
+    </tr>`).join('');
+  } catch(e) { console.error('loadQueryList error:', e); }
+}
+
+async function loadQueryDetail(taskId) {
+  try {
+    const r = await fetch(`/query-datasets/${taskId}`);
+    const d = await r.json();
+    document.getElementById('qdListView').style.display = 'none';
+    document.getElementById('qdDetailView').style.display = '';
+    document.getElementById('qdDetailTitle').textContent = `Datasets (${d.total})`;
+
+    const tbody = document.getElementById('qdDetailBody');
+    if (!d.items || !d.items.length) {
+      tbody.innerHTML = '<tr><td colspan="9" class="empty">No datasets.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = d.items.map(item => `<tr>
+      <td><a href="https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=${item.accession}" target="_blank" style="color:#0984e3"><code>${item.accession}</code></a></td>
+      <td>${item.source || '—'}</td>
+      <td>${item.recommended_action || '—'}</td>
+      <td>${item.download_status || '—'}</td>
+      <td class="truncate" style="max-width:200px" title="${(item.title||'').replace(/"/g,'&quot;')}">${item.title || '—'}</td>
+      <td>${item.cancer_type || '—'}</td>
+      <td>${item.platform || '—'}</td>
+      <td>${item.sample_count ?? '—'}</td>
+      <td class="truncate" style="max-width:250px" title="${(item.local_path||'').replace(/"/g,'&quot;')}">${item.local_path || '—'}</td>
+    </tr>`).join('');
+  } catch(e) { console.error('loadQueryDetail error:', e); }
+}
+
+function showQueryList() {
+  document.getElementById('qdDetailView').style.display = 'none';
+  document.getElementById('qdListView').style.display = '';
 }
 
 // ============================================================
@@ -759,27 +861,13 @@ function autoRefresh() {
   if (active && active.id === 'tab-tasks')    loadTasks();
   if (active && active.id === 'tab-datasets') loadDatasets();
   if (active && active.id === 'tab-review')    loadReview();
-  if (active && active.id === 'tab-approval')  loadApproval();
 }
 
-// Lightweight badge-only refresh (runs even when approval tab is not active).
-// Counts only the bulk "待下载" bucket (needs_review=0); manual_review is in Review Queue.
-async function updateApprovalBadge() {
-  try {
-    const r = await fetch('/datasets/awaiting-approval');
-    const d = await r.json();
-    const bucket = (d.items || []).filter(it => !it.needs_review);
-    const el = document.getElementById('approvalBadge');
-    el.textContent = bucket.length > 0 ? ` (${bucket.length})` : '';
-  } catch(e) {}
-}
 
 // Initial load
 autoRefresh();
-updateApprovalBadge();
 // Refresh every 15 seconds
 setInterval(autoRefresh, 15000);
-setInterval(updateApprovalBadge, 15000);
 
 // Submit on Enter key in query input
 document.getElementById('queryInput').addEventListener('keydown', e => {
@@ -803,88 +891,6 @@ function closeStopModal() {
 document.getElementById('stopModal').addEventListener('click', function(e) {
   if (e.target === this) closeStopModal();
 });
-
-// ============================================================
-// Approval tab
-// ============================================================
-async function loadApproval() {
-  try {
-    const r = await fetch('/datasets/awaiting-approval');
-    const d = await r.json();
-    document.getElementById('approvalRefreshInfo').textContent = nowStr();
-
-    // Bulk "待下载" bucket = awaiting with needs_review=0 (download/lead/TCGA/approved-manual_review)
-    const bucket = (d.items || []).filter(it => !it.needs_review);
-    const badge_el = document.getElementById('approvalBadge');
-    badge_el.textContent = bucket.length > 0 ? ` (${bucket.length})` : '';
-
-    const tbody = document.getElementById('approvalBody');
-    const countLabel = document.getElementById('approvalCountLabel');
-
-    if (!bucket.length) {
-      tbody.innerHTML = '<tr><td colspan="9" class="empty">暂无待下载数据集。Agent 搜索完成后会自动出现在这里。</td></tr>';
-      countLabel.textContent = '';
-      return;
-    }
-    countLabel.textContent = `${bucket.length} 个样本待下载`;
-
-    tbody.innerHTML = bucket.map(item => `<tr>
-        <td><a href="https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=${item.accession}" target="_blank" style="color:#0984e3"><code>${item.accession}</code></a></td>
-        <td>${item.source}</td>
-        <td>${item.recommended_action || '—'}</td>
-        <td class="truncate" title="${(item.title||'').replace(/"/g,'&quot;')}">${item.title || '—'}</td>
-        <td>${item.cancer_type || '—'}</td>
-        <td>${item.platform || '—'}</td>
-        <td>${item.sample_count ?? '—'}</td>
-        <td>${item.sample_type || '—'}</td>
-        <td class="truncate" title="${(item.reason||'').replace(/"/g,'&quot;')}">${item.reason || '—'}</td>
-      </tr>`).join('');
-  } catch(e) { console.error('loadApproval error:', e); }
-}
-
-function _bucketCount() {
-  const rows = document.querySelectorAll('#approvalBody tr');
-  if (!rows.length || document.querySelector('#approvalBody .empty')) return 0;
-  return rows.length;
-}
-
-async function confirmDownload() {
-  const n = _bucketCount();
-  if (!n) { alert('暂无待下载数据集。'); return; }
-  if (!confirm(`确认开始下载 ${n} 个数据集？`)) return;
-  await _postBulk('/datasets/confirm-download', 'confirmDownloadBtn', '✓ 确认开始下载');
-}
-
-async function cancelDownload() {
-  const n = _bucketCount();
-  if (!n) { alert('暂无待下载数据集。'); return; }
-  if (!confirm(`确认取消（清空）全部 ${n} 个待下载数据集？将设为 skipped，不下载。`)) return;
-  await _postBulk('/datasets/cancel-download', 'cancelDownloadBtn', '✗ 取消（清空）');
-}
-
-async function _postBulk(url, btnId, btnLabel) {
-  const btn = document.getElementById(btnId);
-  btn.disabled = true; const old = btn.innerHTML; btn.textContent = '提交中...';
-  try {
-    const r = await fetch(url, { method: 'POST' });
-    const ct = r.headers.get('content-type') || '';
-    if (!ct.includes('application/json')) {
-      showAlert('approvalAlert', '服务器错误', 'error'); return;
-    }
-    const d = await r.json();
-    if (r.ok) {
-      showAlert('approvalAlert', d.message, 'ok');
-      setTimeout(loadApproval, 800);
-      if (document.getElementById('tab-datasets').classList.contains('active')) loadDatasets();
-    } else {
-      showAlert('approvalAlert', d.detail || '请求失败', 'error');
-    }
-  } catch(e) {
-    showAlert('approvalAlert', '网络错误: ' + e.message, 'error');
-  } finally {
-    btn.disabled = false; btn.innerHTML = old;
-  }
-}
 
 // ============================================================
 // Retry failed downloads

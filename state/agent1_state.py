@@ -148,6 +148,8 @@ class Agent1State(TypedDict, total=False):
     # ---- parse node ----
     parsed_intent: SearchIntent
     query_logger: Any  # QueryLogger instance (created in parse, used in filter, finalized in run)
+    task_id: Any       # task_queue ID (for query-dataset mapping)
+    raw_query: str     # redundant with raw_query above, but LangGraph needs it declared if set post-init
 
     # ---- geo-search node ----
     candidate_gse_list: List[Dict[str, Any]]

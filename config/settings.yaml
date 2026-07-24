@@ -14,9 +14,9 @@ llm:
   #   OPENAI_BASE_URL=https://open.bigmodel.cn/api/paas/v4
   #   OPENAI_MODEL=glm-4-flash
   # (the factory auto-detects bigmodel.cn and applies correct auth)
-  backend: deepseek
-  # model read from DEEPSEEK_MODEL env (deepseek-chat); temperature auto-selected
-  api_key_env: DEEPSEEK_API_KEY
+  backend: zhipu
+  # Pipeline testing: glm-4-flash (free tier). Switch to deepseek for production quality.
+  api_key_env: ZHIPU_API_KEY
   max_tokens: 4096
 
 download:

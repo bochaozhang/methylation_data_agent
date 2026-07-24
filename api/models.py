@@ -88,10 +88,16 @@ class DatasetListResponse(BaseModel):
 
 
 class ReviewItemResponse(BaseModel):
-    """Single pending-review item with LLM evidence."""
+    """Single pending-review item with full details for the Review Queue."""
     accession: str
     source: str
     title: Optional[str] = None
+    cancer_type: Optional[str] = None
+    platform: Optional[str] = None
+    sample_count: Optional[int] = None
+    sample_type: Optional[str] = None
+    outcome: Optional[str] = None  # recommended_action: download/lead/exclude/manual_review
+    reason: Optional[str] = None
     paper_doi: Optional[str] = None
     paper_pmid: Optional[str] = None
     llm_evidence: Optional[str] = None

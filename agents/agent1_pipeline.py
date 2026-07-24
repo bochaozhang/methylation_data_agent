@@ -204,7 +204,7 @@ def build_agent1_pipeline(config: Dict[str, Any], registry: Any = None):
             return {}
         n = register_state_to_registry(state, reg)
         logger.info(
-            f"agent1 register: bucket(review0)={n['bucket']} review_queue(review1)={n['review']} "
+            f"agent1 register: auto_download={n['auto_download']} review={n['review']} "
             f"excluded={n['excluded']}"
         )
         return {"register_log": str(n)}
@@ -237,25 +237,26 @@ def register_state_to_registry(state: Dict[str, Any], reg: Any) -> Dict[str, int
     """
     Register filter/tcga outcomes into the registry. No downloads here.
 
-    - download_list + lead_list + tcga_candidates → awaiting_approval (needs_review=0,
-      the bulk "待下载" bucket).
-    - manual_review_list → awaiting_approval (needs_review=1, the Review Queue).
+    - download_list + tcga_candidates → **pending** (auto-download via download worker).
+    - lead_list + manual_review_list → awaiting_approval (needs_review=1, Review Queue).
     - exclude_list → skipped.
     Returns counts.
     """
-    n = {"bucket": 0, "review": 0, "excluded": 0}
+    n = {"auto_download": 0, "review": 0, "excluded": 0}
+    task_id = state.get("task_id")
+    raw_query = state.get("raw_query")
 
-    # Bulk "待下载" bucket (needs_review=0): download + lead + TCGA.
-    for rec in (state.get("download_list") or []) + (state.get("lead_list") or []):
-        _upsert(reg, rec, "awaiting_approval", needs_review=False)
-        n["bucket"] += 1
+    # download + TCGA → pending (download worker auto-downloads, no approval needed).
+    for rec in state.get("download_list") or []:
+        _upsert(reg, rec, "pending", needs_review=False, task_id=task_id, raw_query=raw_query)
+        n["auto_download"] += 1
     for rec in state.get("tcga_candidates") or []:
-        _upsert(reg, {**rec, "source": "TCGA"}, "awaiting_approval", needs_review=False)
-        n["bucket"] += 1
+        _upsert(reg, {**rec, "source": "TCGA"}, "pending", needs_review=False, task_id=task_id, raw_query=raw_query)
+        n["auto_download"] += 1
 
-    # Review Queue (needs_review=1): manual_review.
-    for rec in state.get("manual_review_list") or []:
-        _upsert(reg, rec, "awaiting_approval", needs_review=True)
+    # Review Queue (needs_review=1): lead + manual_review.
+    for rec in (state.get("lead_list") or []) + (state.get("manual_review_list") or []):
+        _upsert(reg, rec, "awaiting_approval", needs_review=True, task_id=task_id, raw_query=raw_query)
         n["review"] += 1
 
     n["excluded"] = len(state.get("exclude_list") or [])
@@ -265,7 +266,8 @@ def register_state_to_registry(state: Dict[str, Any], reg: Any) -> Dict[str, int
 
 def _upsert(reg: Any, rec: Dict[str, Any], status: str,
             local_path: str = None, file_size_bytes: int = None,
-            needs_review: bool = False) -> None:
+            needs_review: bool = False,
+            task_id: str = None, raw_query: str = None) -> None:
     """Map a skill record onto Registry.upsert_dataset(...) + status update."""
     acc = rec.get("accession")
     if not acc:
@@ -297,6 +299,8 @@ def _upsert(reg: Any, rec: Dict[str, Any], status: str,
             disease_groups=rec.get("disease_groups"),
             needs_review=needs_review,
             download_status=status,
+            task_id=task_id,
+            raw_query=raw_query,
         )
         # For completed downloads, also set local_path/size.
         if local_path and status in ("done", "failed"):
@@ -312,7 +316,7 @@ def _upsert(reg: Any, rec: Dict[str, Any], status: str,
 # ---------------------------------------------------------------------- #
 
 def run_agent1_pipeline(query: str, config: Dict[str, Any], registry: Any,
-                        output_dir: str = None) -> Dict[str, Any]:
+                        output_dir: str = None, task_id: str = None) -> Dict[str, Any]:
     """Compile + invoke the pipeline for one query. Returns the final state."""
     app = build_agent1_pipeline(config, registry)
     initial: Agent1State = {
@@ -320,6 +324,7 @@ def run_agent1_pipeline(query: str, config: Dict[str, Any], registry: Any,
         "config": config,
         "registry": registry,
         "output_dir": output_dir or config.get("download", {}).get("output_dir", "./data/methylation"),
+        "task_id": task_id,
         "error_log": [],
     }
     logger.info(f"agent1 pipeline start | query='{query}'")

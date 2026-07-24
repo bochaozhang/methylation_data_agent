@@ -254,32 +254,6 @@ async def list_awaiting_approval():
     )
 
 
-@app.post("/datasets/confirm-download")
-async def confirm_bulk_download():
-    """
-    Bulk-confirm the "待下载" bucket: move every awaiting_approval dataset with
-    needs_review=0 (download / lead / TCGA / approved manual_review) to 'pending'
-    so the daemon downloads them. Un-reviewed manual_review (needs_review=1) in
-    the Review Queue is NOT touched.
-    """
-    registry = get_registry()
-    n = registry.confirm_bulk_download()
-    return {"confirmed": n,
-            "message": f"Confirmed {n} dataset(s) for download. Daemon will start shortly."}
-
-
-@app.post("/datasets/cancel-download")
-async def cancel_bulk_download():
-    """
-    Bulk-cancel the "待下载" bucket: mark every awaiting_approval dataset with
-    needs_review=0 as 'skipped'. Un-reviewed manual_review is NOT touched.
-    """
-    registry = get_registry()
-    n = registry.cancel_bulk_download()
-    return {"cancelled": n,
-            "message": f"Cancelled {n} dataset(s) (set to skipped)."}
-
-
 @app.post("/datasets/retry-failed", response_model=RetryFailedResponse)
 async def retry_failed_datasets():
     """
@@ -306,6 +280,22 @@ async def get_dataset(accession: str):
     return _dataset_to_response(d)
 
 
+@app.get("/query-datasets")
+async def list_query_datasets():
+    """List distinct queries with dataset counts (master view)."""
+    registry = get_registry()
+    items = registry.get_query_list()
+    return {"items": items, "total": len(items)}
+
+
+@app.get("/query-datasets/{task_id}")
+async def get_query_detail(task_id: str):
+    """Get all datasets for a specific task_id (detail view)."""
+    registry = get_registry()
+    items = registry.get_datasets_by_task_id(task_id)
+    return {"task_id": task_id, "items": items, "total": len(items)}
+
+
 @app.get("/review", response_model=ReviewListResponse)
 async def list_pending_review():
     """List all datasets flagged for human review (medium-confidence LLM extractions)."""
@@ -315,8 +305,14 @@ async def list_pending_review():
         items=[
             ReviewItemResponse(
                 accession=d["accession"],
-                source=d["source"],
+                source=d.get("source", ""),
                 title=d.get("title"),
+                cancer_type=d.get("cancer_type"),
+                platform=d.get("platform"),
+                sample_count=d.get("sample_count"),
+                sample_type=d.get("sample_type"),
+                outcome=d.get("recommended_action"),
+                reason=d.get("reason"),
                 paper_doi=d.get("paper_doi"),
                 paper_pmid=d.get("paper_pmid"),
                 llm_evidence=d.get("llm_evidence"),
