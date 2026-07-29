@@ -70,6 +70,7 @@ class QueryLogger:
         spec_name: str,
         output_dir: str,
         query_id: Optional[str] = None,
+        task_id: Optional[str] = None,
     ) -> None:
         self.query = query or ""
         self.model_name = model_name or "unknown"
@@ -78,8 +79,9 @@ class QueryLogger:
 
         self._started = datetime.datetime.now()
         ts = self._started.strftime("%Y%m%d_%H%M%S")
-        qh = hashlib.md5(self.query.encode("utf-8")).hexdigest()[:6]
-        self.query_id = query_id or f"{ts}_{qh}"
+        # Use task_id (short) if available; fallback to md5 hash of query.
+        suffix = task_id[:8] if task_id else hashlib.md5(self.query.encode("utf-8")).hexdigest()[:6]
+        self.query_id = f"{ts}_{suffix}"
 
         self.path = Path(output_dir) / "query_logs" / f"query_{self.query_id}.csv"
 

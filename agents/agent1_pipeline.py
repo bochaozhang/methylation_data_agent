@@ -117,6 +117,7 @@ def build_agent1_pipeline(config: Dict[str, Any], registry: Any = None):
                 model_name=model_name,
                 spec_name=SPEC_NAME,
                 output_dir=state.get("output_dir") or config.get("download", {}).get("output_dir", "./data"),
+                task_id=state.get("task_id"),
             )
         return {"parsed_intent": intent, "query_logger": qlog}
 
