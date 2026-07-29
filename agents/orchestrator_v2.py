@@ -47,6 +47,7 @@ import yaml
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, ToolMessage
 from langchain_core.tools import tool
+from langgraph.errors import GraphRecursionError
 
 from registry.registry import Registry
 from tools.extraction_reviewer import review_geo_verdict
@@ -96,6 +97,23 @@ Guidance:
     concise natural-language summary of what you found, evaluated, and wrote."""
 
 
+# Convergence guards. A real run let the ReAct loop call search_papers ~10x with
+# the same query: LangGraph's default recursion_limit is 25 steps (~12 tool rounds)
+# and nothing stopped it earlier. That burst also tripped NCBI's rate limiter.
+_DEFAULT_MAX_TOOL_CALLS = 12
+_DEFAULT_RECURSION_LIMIT = 25
+
+_BUDGET_MSG = (
+    "Tool-call budget for this run is exhausted. Do not call any more tools — "
+    "reply now with your final summary based on what you already have."
+)
+
+
+def _normalize_query(query: str) -> str:
+    """Collapse whitespace/case so trivially-reworded repeat searches share a cache key."""
+    return " ".join((query or "").lower().split())
+
+
 def _build_dataset_info(accession: str, meta: Dict[str, Any]) -> str:
     """Format GEOClient.get_series_metadata() output as free text for evaluate_geo_dataset()."""
     lines = [f"{accession} — Title: {meta.get('title', '(no title)')}"]
@@ -123,13 +141,40 @@ def build_tools(config: Dict[str, Any], registry: Registry, llm: BaseChatModel):
     geo_client = GEOClient(api_key=ncbi_key or None, proxy=ncbi_proxy or None)
 
     review_enabled = config.get("review", {}).get("enabled", True)
+    max_tool_calls = int(
+        config.get("orchestrator", {}).get("max_tool_calls", _DEFAULT_MAX_TOOL_CALLS)
+    )
 
     run_trace: Dict[str, Any] = {
         "papers": [],
         "evaluations": [],
         "registry_writes": [],
         "_geo_meta_cache": {},
+        # Convergence bookkeeping (see _budget_exhausted / _normalize_query).
+        # Without these the ReAct loop re-ran search_papers with the same query
+        # ~10x in a real run, which also burst NCBI's rate limit.
+        "tool_calls": 0,
+        "refused_calls": 0,
+        "_search_cache": {},
+        "_eval_cache": {},
+        "skipped_duplicate_calls": [],
     }
+
+    def _budget_exhausted(tool_name: str) -> bool:
+        """
+        Count this attempt; True once the per-run cap is hit, after which tools
+        refuse to do real work (no further NCBI/LLM/registry calls). A cooperative
+        model stops here; an uncooperative one is stopped by recursion_limit.
+        """
+        run_trace["tool_calls"] += 1
+        if run_trace["tool_calls"] > max_tool_calls:
+            run_trace["refused_calls"] += 1
+            logger.warning(
+                f"[orchestrator_v2] tool-call budget exhausted "
+                f"({max_tool_calls}) — refusing {tool_name}"
+            )
+            return True
+        return False
 
     @tool
     def search_papers(query: str) -> str:
@@ -137,10 +182,22 @@ def build_tools(config: Dict[str, Any], registry: Registry, llm: BaseChatModel):
         (cancer type, sample type, AUC, dataset accessions, markers, etc) from each,
         with a second-pass LLM review for AUC/sample_type and dataset_id consistency.
         Returns a JSON array of structured paper records."""
+        if _budget_exhausted("search_papers"):
+            return _BUDGET_MSG
+        key = _normalize_query(query)
+        if key in run_trace["_search_cache"]:
+            # Same search already ran this session — hand back the identical
+            # result rather than re-hitting PubMed. Return shape is unchanged.
+            logger.info(f"[orchestrator_v2] search_papers cache hit: {key!r}")
+            run_trace["skipped_duplicate_calls"].append(f"search_papers({key!r})")
+            return run_trace["_search_cache"][key]
+
         intent = parse_query_rules(query)
         papers = search_and_extract(intent, llm, top_n=5, review=review_enabled)
         run_trace["papers"].extend(papers)
-        return json.dumps(papers, ensure_ascii=False, default=str)
+        payload = json.dumps(papers, ensure_ascii=False, default=str)
+        run_trace["_search_cache"][key] = payload
+        return payload
 
     @tool
     def evaluate_geo_dataset_tool(accession: str, cancer_type: str, sample_types: str) -> str:
@@ -148,6 +205,16 @@ def build_tools(config: Dict[str, Any], registry: Registry, llm: BaseChatModel):
         it is usable for this project given the target cancer type and desired sample
         types (comma-separated, e.g. "plasma,cfdna"). Returns a JSON verdict with
         usable/recommended_action/reason."""
+        if _budget_exhausted("evaluate_geo_dataset_tool"):
+            return _BUDGET_MSG
+        eval_key = (accession or "").strip().upper()
+        if eval_key in run_trace["_eval_cache"]:
+            logger.info(f"[orchestrator_v2] evaluate cache hit: {eval_key}")
+            run_trace["skipped_duplicate_calls"].append(
+                f"evaluate_geo_dataset_tool({eval_key})"
+            )
+            return run_trace["_eval_cache"][eval_key]
+
         meta = geo_client.get_series_metadata(accession)
         if meta.get("error"):
             return json.dumps({"accession": accession, "error": meta["error"]})
@@ -166,7 +233,9 @@ def build_tools(config: Dict[str, Any], registry: Registry, llm: BaseChatModel):
                 )
 
         run_trace["evaluations"].append({"accession": accession, **judgment})
-        return json.dumps(judgment, ensure_ascii=False)
+        payload = json.dumps(judgment, ensure_ascii=False)
+        run_trace["_eval_cache"][eval_key] = payload
+        return payload
 
     @tool
     def write_to_registry(
@@ -179,6 +248,12 @@ def build_tools(config: Dict[str, Any], registry: Registry, llm: BaseChatModel):
     ) -> str:
         """Persist an evaluated dataset's verdict to the registry. Call only after
         evaluate_geo_dataset_tool has judged this accession."""
+        if _budget_exhausted("write_to_registry"):
+            return _BUDGET_MSG
+        if accession in run_trace["registry_writes"]:
+            run_trace["skipped_duplicate_calls"].append(f"write_to_registry({accession})")
+            return f"{accession} was already written to the registry this session."
+
         meta = run_trace["_geo_meta_cache"].get(accession, {})
         registry.upsert_dataset(
             accession=accession,
@@ -257,10 +332,34 @@ def run_methyagent_v2(
 
     app, run_trace = build_orchestrator_v2(config, registry, llm=llm)
 
-    logger.info(f"[orchestrator_v2] Starting agentic run | query='{query}'")
-    result = app.invoke({"messages": [HumanMessage(content=query)]})
-    messages: List[BaseMessage] = result.get("messages", [])
-    logger.info(f"[orchestrator_v2] Completed | {len(messages)} messages in trace")
+    recursion_limit = int(
+        config.get("orchestrator", {}).get("recursion_limit", _DEFAULT_RECURSION_LIMIT)
+    )
+
+    logger.info(
+        f"[orchestrator_v2] Starting agentic run | query='{query}' "
+        f"| recursion_limit={recursion_limit}"
+    )
+    try:
+        result = app.invoke(
+            {"messages": [HumanMessage(content=query)]},
+            config={"recursion_limit": recursion_limit},
+        )
+        messages: List[BaseMessage] = result.get("messages", [])
+    except GraphRecursionError:
+        # Hard backstop: the per-tool budget should normally stop the loop first.
+        # Preserve whatever the tools already accomplished rather than losing the run.
+        logger.error(
+            f"[orchestrator_v2] Hit recursion_limit={recursion_limit} without converging; "
+            f"reporting partial results ({run_trace['tool_calls']} tool calls made)."
+        )
+        messages = []
+
+    logger.info(
+        f"[orchestrator_v2] Completed | {len(messages)} messages | "
+        f"{run_trace['tool_calls']} tool calls | "
+        f"{len(run_trace['skipped_duplicate_calls'])} duplicates skipped"
+    )
 
     report = {
         "query": query,
@@ -269,6 +368,9 @@ def run_methyagent_v2(
         "papers": run_trace["papers"],
         "gse_evaluated": run_trace["evaluations"],
         "registry_writes": run_trace["registry_writes"],
+        "tool_calls": run_trace["tool_calls"],
+        "refused_calls": run_trace["refused_calls"],
+        "skipped_duplicate_calls": run_trace["skipped_duplicate_calls"],
         "agent_summary": _final_ai_text(messages),
         "messages": [_message_to_dict(m) for m in messages],
     }

@@ -135,6 +135,11 @@ def main() -> None:
         base_config = yaml.safe_load(open(Path(__file__).parent.parent / "config" / "settings.yaml"))
         base_config["registry"]["db_path"] = tmp_db
         base_config["download"]["output_dir"] = tmp_output
+        # Reviewers off: review_extraction/review_geo_verdict each make their own
+        # llm.invoke(), which would consume entries from the scripted response list
+        # below and desynchronise the agent's tool sequence. This test covers the
+        # agentic wiring; reviewer behaviour is covered by tools/extraction_reviewer.py.
+        base_config["review"] = {"enabled": False}
         tmp_config_path = str(Path(tmpdir) / "settings.yaml")
         with open(tmp_config_path, "w") as f:
             yaml.safe_dump(base_config, f)
@@ -165,10 +170,79 @@ def main() -> None:
     assert report["agent_summary"], "agent should produce a final natural-language summary"
     assert len(rows) == 1 and rows[0]["accession"] == "GSE50132"
     assert rows[0]["recommended_action"] == "exclude"
+    assert report["tool_calls"] == 3, f"expected 3 tool calls, got {report['tool_calls']}"
+    assert report["skipped_duplicate_calls"] == [], "no duplicates expected on a converging run"
     print("\nAll assertions passed: agent called search_papers -> evaluate_geo_dataset_tool "
           "-> write_to_registry in order, and the registry write is real (tmp db).")
     print(f"Run log saved at: {report.get('log_path')} (inside tmpdir, printed above; see also copy under docs/07_03/)")
 
 
+def test_convergence_guards() -> None:
+    """
+    Regression test for the runaway ReAct loop observed in a real run: the agent
+    called search_papers ~10x with the same query, never converging, which also
+    burst NCBI's rate limit and made every PMC full-text fetch fail.
+
+    Scripts an LLM that ALWAYS asks for the same search, and asserts that:
+      (a) the underlying search_and_extract() runs exactly once (cache hit after),
+      (b) the tool-call budget stops the loop at max_tool_calls,
+      (c) the run still returns a report instead of blowing up.
+    """
+    query = "breast cancer plasma cfDNA methylation EPIC early detection"
+    max_tool_calls = 4
+
+    # Never emits a final answer — always requests the same search again.
+    scripted_responses = [
+        AIMessage(content="", tool_calls=[{
+            "name": "search_papers", "args": {"query": query}, "id": f"call_{i}",
+        }])
+        for i in range(30)
+    ]
+    llm = ScriptedToolCallingLLM(responses=scripted_responses)
+
+    real_search_calls = {"n": 0}
+
+    def _counting_search(intent, llm_, top_n=5, review=True):
+        real_search_calls["n"] += 1
+        return [_CANNED_PAPER]
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        base_config = yaml.safe_load(open(Path(__file__).parent.parent / "config" / "settings.yaml"))
+        base_config["registry"]["db_path"] = str(Path(tmpdir) / "test_registry.db")
+        base_config["download"]["output_dir"] = str(Path(tmpdir) / "output")
+        base_config["review"] = {"enabled": False}
+        base_config.setdefault("orchestrator", {})["max_tool_calls"] = max_tool_calls
+        base_config["orchestrator"]["recursion_limit"] = 25
+        tmp_config_path = str(Path(tmpdir) / "settings.yaml")
+        with open(tmp_config_path, "w") as f:
+            yaml.safe_dump(base_config, f)
+
+        with patch("agents.orchestrator_v2.search_and_extract", _counting_search):
+            report = run_methyagent_v2(query, config_path=tmp_config_path, llm=llm, save_log=False)
+
+    print("\n=== convergence guard test ===")
+    print(f"  real search_and_extract() invocations : {real_search_calls['n']}")
+    print(f"  tool call attempts                    : {report['tool_calls']}")
+    print(f"  refused (over budget)                 : {report['refused_calls']}")
+    print(f"  duplicate calls skipped               : {len(report['skipped_duplicate_calls'])}")
+
+    # The load-bearing guarantee: NCBI/LLM work is done once, no matter how many
+    # times a non-converging model asks for it. This is what stopped the ~10x
+    # request burst that tripped NCBI's rate limiter.
+    assert real_search_calls["n"] == 1, (
+        f"search_and_extract should run once despite repeated tool calls, "
+        f"ran {real_search_calls['n']}x"
+    )
+    # This scripted model deliberately never stops, so it exhausts the budget and
+    # is then terminated by recursion_limit. A cooperative model stops at _BUDGET_MSG.
+    assert report["refused_calls"] > 0, "over-budget calls should be refused, not executed"
+    assert len(report["skipped_duplicate_calls"]) >= 1, "repeat searches should be recorded as skipped"
+    # GraphRecursionError must be caught, not propagated — partial results survive.
+    assert isinstance(report, dict) and report["query"] == query
+    print("  PASS — real work ran once, over-budget calls refused, "
+          "recursion backstop caught, report still returned.")
+
+
 if __name__ == "__main__":
     main()
+    test_convergence_guards()

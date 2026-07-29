@@ -40,6 +40,15 @@ orchestrator:
   # Override at deploy time with the ORCHESTRATOR_VERSION env var (takes priority).
   version: v1
 
+  # --- v2 convergence guards (ignored by v1) ---
+  # Total tool calls allowed per run. Once hit, tools refuse to execute and tell
+  # the LLM to produce its final answer. Primary stop; keep below the number of
+  # rounds recursion_limit permits so it trips first.
+  max_tool_calls: 12
+  # LangGraph step cap (default 25). A ReAct round costs 2 steps, so 25 ≈ 12
+  # rounds. Hard backstop if max_tool_calls somehow doesn't trip.
+  recursion_limit: 25
+
 registry:
   db_path: ./registry/methyagent.db
 

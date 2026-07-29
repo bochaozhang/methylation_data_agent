@@ -10,6 +10,7 @@ Includes PDFSupplementaryParser with three-layer LLM-assisted extraction:
   Layer 2: LLM extraction with confidence levels + DOI cache
   Layer 3: GEO API verification (hallucination filter)
 """
+import os
 import re
 import time
 import xml.etree.ElementTree as ET
@@ -28,6 +29,45 @@ EUTILS_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 BIORXIV_API = "https://api.biorxiv.org/details/biorxiv"
 PMC_OA_BASE = "https://www.ncbi.nlm.nih.gov/pmc/articles"
 
+# Retry policy for NCBI's abuse/rate-limit redirect. 3 attempts with 2s/4s waits
+# rides out a short burst without stalling a run when the IP is genuinely blocked.
+_NCBI_MAX_ATTEMPTS = 3
+_NCBI_BACKOFF_BASE = 2.0
+
+
+class NCBIRateLimitError(RuntimeError):
+    """NCBI served its abuse/misuse page (or other non-JSON) instead of real data."""
+
+
+def _is_abuse_redirect(resp: requests.Response) -> bool:
+    """
+    True if NCBI bounced this request to its abuse page. The redirect lands on a
+    200-OK HTML page, so status code alone never reveals it — check the final URL,
+    then fall back to sniffing an HTML content-type on a request that asked for JSON.
+    """
+    url = resp.url or ""
+    if "misuse.ncbi.nlm.nih.gov" in url or "abuse.shtml" in url:
+        return True
+    if resp.request is not None and "retmode=json" in (resp.request.url or ""):
+        if "html" in resp.headers.get("Content-Type", "").lower():
+            return True
+    return False
+
+
+def _resolve_ncbi_proxy() -> str:
+    """
+    Resolve an NCBI proxy from the environment, matching the precedence used by
+    tools/ncbi_search.py. NCBI_PROXY first because it is the project-specific
+    override; the standard vars are already honoured by requests' trust_env, but
+    are read here too so session.proxies is set explicitly and predictably.
+    """
+    return (
+        os.environ.get("NCBI_PROXY", "")
+        or os.environ.get("HTTPS_PROXY", "")
+        or os.environ.get("HTTP_PROXY", "")
+        or os.environ.get("ALL_PROXY", "")
+    )
+
 
 class LiteratureClient:
     """
@@ -38,21 +78,41 @@ class LiteratureClient:
         ncbi_api_key: Optional NCBI API key for higher rate limits.
     """
 
-    def __init__(self, ncbi_api_key: Optional[str] = None, geo_email: Optional[str] = None):
+    def __init__(
+        self,
+        ncbi_api_key: Optional[str] = None,
+        geo_email: Optional[str] = None,
+        proxy: Optional[str] = None,
+    ):
         self.ncbi_api_key = ncbi_api_key
         self.geo_email = geo_email
         self.session = requests.Session()
         self.session.headers.update({
             "User-Agent": "MethyAgent/1.0 (methylation literature miner)"
         })
+        # Proxy resolution mirrors GEOClient. Without this, a host that reaches
+        # NCBI only via NCBI_PROXY (a non-standard var `requests` does not read
+        # from the environment) sent every PMC call out unproxied while GEO and
+        # PubMed search traffic went through the tunnel — which showed up as a
+        # 100% PMC full-text failure rate behind an abuse-redirect page.
+        proxy = proxy or _resolve_ncbi_proxy()
+        if proxy:
+            self.session.proxies = {"http": proxy, "https": proxy}
+            logger.info(f"LiteratureClient using proxy: {proxy}")
         self._rate_delay = 0.11 if ncbi_api_key else 0.34
 
     def _ncbi_get(self, endpoint: str, params: Dict) -> requests.Response:
         """
-        Rate-limited GET to NCBI E-utilities.
+        Rate-limited GET to NCBI E-utilities with bounded exponential backoff.
 
-        Detects NCBI abuse redirect (302 → misuse.ncbi.nlm.nih.gov) and
-        automatically retries without the API key after a short delay.
+        NCBI answers over-rate clients with a 302 to misuse.ncbi.nlm.nih.gov,
+        whose body is HTML served with HTTP 200 — so raise_for_status() does not
+        catch it and the HTML reaches callers that expect JSON. Detect that case
+        explicitly and retry with growing delays (dropping the API key after the
+        first attempt, in case the key itself is flagged) before giving up.
+
+        Raises:
+            NCBIRateLimitError: if every attempt is redirected to the abuse page.
         """
         if self.ncbi_api_key:
             params["api_key"] = self.ncbi_api_key
@@ -62,21 +122,50 @@ class LiteratureClient:
             params["email"] = self.geo_email
         params.setdefault("tool", "MethyAgent")
         url = f"{EUTILS_BASE}/{endpoint}"
-        time.sleep(self._rate_delay)
-        resp = self.session.get(url, params=params, timeout=30, allow_redirects=True)
 
-        # Detect NCBI abuse redirect — key may be flagged or request rate too high
-        if "misuse.ncbi.nlm.nih.gov" in resp.url:
-            logger.warning(
-                f"NCBI abuse redirect detected for {endpoint}. "
-                "Retrying without API key after 5s delay."
-            )
-            time.sleep(5)
-            params_no_key = {k: v for k, v in params.items() if k != "api_key"}
-            resp = self.session.get(url, params=params_no_key, timeout=30)
+        last_url = ""
+        for attempt in range(_NCBI_MAX_ATTEMPTS):
+            # Respect NCBI's cap (10/s with a key, 3/s without) on every attempt.
+            time.sleep(self._rate_delay)
+            attempt_params = params if attempt == 0 else {
+                k: v for k, v in params.items() if k != "api_key"
+            }
+            resp = self.session.get(url, params=attempt_params, timeout=30, allow_redirects=True)
 
-        resp.raise_for_status()
-        return resp
+            if not _is_abuse_redirect(resp):
+                resp.raise_for_status()
+                return resp
+
+            last_url = resp.url
+            if attempt < _NCBI_MAX_ATTEMPTS - 1:
+                delay = _NCBI_BACKOFF_BASE * (2 ** attempt)
+                logger.warning(
+                    f"NCBI abuse redirect for {endpoint} "
+                    f"(attempt {attempt + 1}/{_NCBI_MAX_ATTEMPTS}); "
+                    f"backing off {delay:.1f}s"
+                )
+                time.sleep(delay)
+
+        raise NCBIRateLimitError(
+            f"NCBI abuse redirect for {endpoint} after {_NCBI_MAX_ATTEMPTS} attempts "
+            f"(rate limit or blocked key/IP). Final URL: {last_url}"
+        )
+
+    def _ncbi_get_json(self, endpoint: str, params: Dict) -> Dict:
+        """
+        _ncbi_get() + JSON decode, converting a non-JSON body (an HTML block page
+        that slipped past the redirect check) into NCBIRateLimitError rather than
+        letting a raw JSONDecodeError escape to callers.
+        """
+        resp = self._ncbi_get(endpoint, params)
+        try:
+            return resp.json()
+        except ValueError as exc:
+            snippet = (resp.text or "")[:120].replace("\n", " ")
+            raise NCBIRateLimitError(
+                f"NCBI returned non-JSON for {endpoint} (likely an HTML block page): "
+                f"{snippet!r}"
+            ) from exc
 
     # ------------------------------------------------------------------ #
     #  PubMed search                                                       #
@@ -115,8 +204,8 @@ class LiteratureClient:
             "retmode": "json",
             "sort": "relevance",
         }
-        resp = self._ncbi_get("esearch.fcgi", params)
-        pmids = resp.json().get("esearchresult", {}).get("idlist", [])
+        data = self._ncbi_get_json("esearch.fcgi", params)
+        pmids = data.get("esearchresult", {}).get("idlist", [])
         logger.info(f"PubMed search '{query[:60]}...' → {len(pmids)} papers")
 
         if not pmids:
@@ -160,15 +249,22 @@ class LiteratureClient:
 
         Returns the full text as plain string, or None if not available.
         """
-        # First check if PMC ID exists for this PMID
+        # First check if PMC ID exists for this PMID.
+        # NOTE: this elink JSON decode used to sit outside any try/except — when
+        # NCBI answered with its HTML abuse page the JSONDecodeError propagated
+        # out of get_pmc_fulltext(). _ncbi_get_json() now converts that into
+        # NCBIRateLimitError, which callers treat as "no full text available".
         params = {
             "db": "pmc",
             "linkname": "pubmed_pmc",
             "id": pmid,
             "retmode": "json",
         }
-        resp = self._ncbi_get("elink.fcgi", params)
-        data = resp.json()
+        try:
+            data = self._ncbi_get_json("elink.fcgi", params)
+        except NCBIRateLimitError as exc:
+            logger.warning(f"PMC lookup rate-limited for PMID {pmid}: {exc}")
+            return None
 
         pmc_ids = []
         for linkset in data.get("linksets", []):

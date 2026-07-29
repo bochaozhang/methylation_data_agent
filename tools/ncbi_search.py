@@ -68,9 +68,13 @@ _LIT_CLIENT: Optional["LiteratureClient"] = None
 def _get_lit_client() -> "LiteratureClient":
     global _LIT_CLIENT
     if _LIT_CLIENT is None:
+        # Pass the resolved proxy explicitly: PMC traffic must go through the same
+        # tunnel as the esearch/efetch calls made by _SESSION below, otherwise it
+        # leaves the host unproxied and NCBI blocks it.
         _LIT_CLIENT = LiteratureClient(
             ncbi_api_key=os.environ.get("NCBI_API_KEY", "") or None,
             geo_email=os.environ.get("GEO_EMAIL", "methyagent@research.local"),
+            proxy=_resolve_proxy() or None,
         )
     return _LIT_CLIENT
 
@@ -379,19 +383,38 @@ _SECTION_KEYWORDS = [
 ]
 
 
+# PMID -> full text (or None when unavailable). Populated once per process, so a
+# non-converging orchestrator loop that re-runs the same search cannot re-hit PMC
+# for PMIDs it already looked up — a caching miss here previously multiplied every
+# repeated search into a fresh burst of NCBI requests.
+_FULLTEXT_CACHE: Dict[str, Optional[str]] = {}
+
+
+def reset_fulltext_cache() -> None:
+    """Clear the per-PMID full-text cache (used by tests and long-lived daemons)."""
+    _FULLTEXT_CACHE.clear()
+
+
 def _fetch_fulltext_safe(pmid: str) -> Optional[str]:
     """
-    Best-effort PMC full text fetch. Any failure (no PMC record, network,
-    missing proxy on the fetching host, etc.) falls back to None so callers
-    fall back to the abstract — full text is never required.
+    Best-effort PMC full text fetch, memoised per PMID. Any failure (no PMC
+    record, network, rate limit, missing proxy on the fetching host, etc.) yields
+    None so callers fall back to the abstract — full text is never required.
+    Negative results are cached too, so a blocked PMID is not retried all run.
     """
     if not pmid:
         return None
+    if pmid in _FULLTEXT_CACHE:
+        return _FULLTEXT_CACHE[pmid]
+
     try:
-        return _get_lit_client().get_pmc_fulltext(pmid)
+        text = _get_lit_client().get_pmc_fulltext(pmid)
     except Exception as exc:
         print(f"  [stage2] full text fetch failed for PMID={pmid}: {exc}")
-        return None
+        text = None
+
+    _FULLTEXT_CACHE[pmid] = text
+    return text
 
 
 def _prepare_fulltext_for_extraction(
