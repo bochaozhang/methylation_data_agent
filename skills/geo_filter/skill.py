@@ -181,30 +181,94 @@ def _intent_block(intent: Dict[str, Any]) -> str:
     )
 
 
+def _dedup_gsm_combos(gsm_details: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Deduplicate GSM samples by (source_name, molecule, group, characteristics).
+
+    Returns a list of unique combos, each with a 'count' field showing how many
+    GSMs share this combination. The 'gsm' field shows a representative GSM id.
+    """
+    seen: Dict[tuple, Dict[str, Any]] = {}
+    for g in gsm_details:
+        ch = g.get("characteristics") or {}
+        ch_key = tuple(sorted(ch.items()))
+        key = (g.get("source_name", ""), g.get("molecule", ""), g.get("group", "unknown"), ch_key)
+        if key not in seen:
+            seen[key] = {
+                "gsm": g.get("gsm", ""),
+                "source_name": g.get("source_name", ""),
+                "molecule": g.get("molecule", ""),
+                "group": g.get("group", "unknown"),
+                "characteristics": ch,
+                "count": 1,
+                "gsm_ids": [g.get("gsm", "")],
+            }
+        else:
+            seen[key]["count"] += 1
+            seen[key]["gsm_ids"].append(g.get("gsm", ""))
+    return list(seen.values())
+
+
+def _expand_gsm_includes(verdict: Dict[str, Any], gsm_details: List[Dict[str, Any]]) -> None:
+    """
+    Expand per-combo gsm_includes verdicts back to per-GSM.
+
+    The LLM returns gsm_includes for the deduplicated combos. This function
+    expands each combo's include/exclude verdict to ALL GSMs sharing that combo.
+    Mutates verdict["gsm_includes"] in place.
+    """
+    raw_includes = verdict.get("gsm_includes") or []
+    if not raw_includes:
+        return
+
+    # Build combo verdict map: combo_key → include (bool)
+    combo_verdicts: Dict[str, bool] = {}
+    for item in raw_includes:
+        gsm_id = str(item.get("gsm", ""))
+        combo_verdicts[gsm_id] = bool(item.get("include", True))
+
+    # Expand: for each GSM, find its combo representative and inherit the verdict
+    combos = _dedup_gsm_combos(gsm_details)
+    expanded = []
+    for g in gsm_details:
+        gsm_id = str(g.get("gsm", ""))
+        # Find which combo this GSM belongs to
+        for combo in combos:
+            if gsm_id in combo.get("gsm_ids", []):
+                rep_id = str(combo.get("gsm", ""))
+                include = combo_verdicts.get(rep_id, combo_verdicts.get(gsm_id, False))
+                expanded.append({
+                    "gsm": gsm_id,
+                    "include": include,
+                    "reason": None if include else f"belongs to combo {rep_id} (count={combo['count']})",
+                })
+                break
+        else:
+            expanded.append({"gsm": gsm_id, "include": False, "reason": "no combo match"})
+
+    verdict["gsm_includes"] = expanded
+
+
 def _gsm_block(gsm_details: List[Dict[str, Any]]) -> str:
-    """Render GSM details + group counts as evidence. Caps at 20 individual entries."""
+    """Render deduplicated sample combos + counts as evidence."""
     if not gsm_details:
         return "(no sample details available)"
 
+    combos = _dedup_gsm_combos(gsm_details)
+    n_total = len(gsm_details)
     counts = group_summary(gsm_details)
     counts_line = ", ".join(f"{g}={n}" for g, n in counts.items() if n)
-    n_total = len(gsm_details)
 
-    # Cap individual entries to avoid prompt explosion (series_matrix can give 100+)
-    cap = 20
-    shown = gsm_details[:cap]
-
-    lines = [f"Sample details ({n_total} total, group counts: {counts_line}):"]
-    for g in shown:
-        ch = g.get("characteristics") or {}
+    lines = [f"Sample details ({n_total} total in {len(combos)} unique combos, "
+            f"group counts: {counts_line}):"]
+    for combo in combos:
+        ch = combo.get("characteristics") or {}
         ch_str = "; ".join(f"{k}: {v}" for k, v in ch.items()) if ch else "(none)"
         lines.append(
-            f"  - GSM {g.get('gsm', '?')} [group={g.get('group', '?')}]: "
-            f"source_name={g.get('source_name', '')!r}, "
-            f"molecule={g.get('molecule', '')!r}, characteristics={{{ch_str}}}"
+            f"  - GSM {combo.get('gsm', '?')} [×{combo['count']}, group={combo.get('group', '?')}]: "
+            f"source_name={combo.get('source_name', '')!r}, "
+            f"molecule={combo.get('molecule', '')!r}, characteristics={{{ch_str}}}"
         )
-    if n_total > cap:
-        lines.append(f"  ... ({n_total - cap} more samples, see group counts above for distribution)")
     return "\n".join(lines)
 
 
@@ -291,6 +355,8 @@ def filter_dataset(
         if usage.get("cached_tokens"):
             logger.debug(f"geo_filter {acc}: cached_tokens={usage['cached_tokens']}")
         verdict = _normalise_verdict(verdict, gsm_details)
+        # Expand per-combo gsm_includes back to per-GSM (LLM saw deduped combos)
+        _expand_gsm_includes(verdict, gsm_details)
         verdict["_usage"] = usage
         # Evidence snapshot (logged so a human can see WHAT the model was given
         # alongside HOW it reasoned — e.g. all-unknown GSM groups + no abstract

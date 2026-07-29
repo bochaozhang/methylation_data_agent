@@ -395,11 +395,17 @@ class Registry:
     def approve_review(self, accession: str):
         """
         Approve a review item: clear needs_review and set download_status='pending'
-        so the download worker picks it up immediately.
+        so the download worker picks it up immediately. Also updates the
+        sample_metadata.csv task_id column to "download" for all GSMs.
         """
         now = datetime.now(timezone.utc).isoformat()
         with self._lock:
             with self._get_conn() as conn:
+                # Get task_id + sample_metadata_path before update
+                row = conn.execute(
+                    "SELECT task_id, sample_metadata_path FROM datasets WHERE accession = ? AND needs_review = 1",
+                    (accession,),
+                ).fetchone()
                 conn.execute(
                     """
                     UPDATE datasets SET
@@ -410,6 +416,29 @@ class Registry:
                     """,
                     (now, accession),
                 )
+
+        # Update sample_metadata.csv if it exists
+        if row and row["sample_metadata_path"]:
+            self._update_sample_metadata_csv(row["sample_metadata_path"], row["task_id"])
+
+    def _update_sample_metadata_csv(self, csv_path: str, task_id: Optional[str]) -> None:
+        """Update the task_id column in sample_metadata.csv to 'download' for all rows."""
+        if not task_id:
+            return
+        try:
+            import pandas as pd
+            from pathlib import Path
+            p = Path(csv_path)
+            if not p.exists():
+                return
+            col = task_id[:8]
+            df = pd.read_csv(p)
+            if col in df.columns:
+                df[col] = "download"
+                df.to_csv(p, index=False)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(f"_update_sample_metadata_csv({csv_path}): {e}")
 
     def reject_review(self, accession: str):
         """Reject a pending_review dataset (mark as skipped)."""

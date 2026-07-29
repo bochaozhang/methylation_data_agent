@@ -111,8 +111,9 @@ class DownloadSkill:
         acc = rec.get("accession", "?")
         flags = rec.get("flags", "")
 
-        # Phase 2b: per-GSM cancer labels → sample_metadata.csv (also used for subset).
-        sm = build_sample_metadata_with_cancer(acc, self.geo_client, query_terms, output_dir)
+        # Phase 2b: read existing sample_metadata.csv (written by filter) for cancer subset.
+        # Don't rebuild — filter already wrote it with per-GSM verdicts.
+        sm = _read_sample_metadata(acc, output_dir)
 
         # Phase 1: download.
         try:
@@ -288,3 +289,16 @@ def _dedup_preserve(items: List[str]) -> List[str]:
             seen.add(it)
             out.append(it)
     return out
+
+
+def _read_sample_metadata(accession: str, output_dir: str) -> Optional[pd.DataFrame]:
+    """Read existing sample_metadata.csv (written by filter). Returns None if missing."""
+    from pathlib import Path
+    csv_path = Path(output_dir) / accession / "sample_metadata.csv"
+    if not csv_path.exists():
+        return None
+    try:
+        return pd.read_csv(csv_path)
+    except Exception as e:
+        logger.debug(f"_read_sample_metadata({accession}): {e}")
+        return None

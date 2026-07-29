@@ -126,7 +126,8 @@ def build_agent1_pipeline(config: Dict[str, Any], registry: Any = None):
         return search_skill.run(dict(state))
 
     # ---- geo-filter ----
-    def _filter_one(ds: Dict[str, Any], intent: Dict[str, Any], qlog=None) -> Dict[str, Any]:
+    def _filter_one(ds: Dict[str, Any], intent: Dict[str, Any], qlog=None,
+                    task_id=None, output_dir=None) -> Dict[str, Any]:
         acc = ds.get("accession", "?")
         wanted = intent.get("sample_type", "") or ""
 
@@ -179,17 +180,23 @@ def build_agent1_pipeline(config: Dict[str, Any], registry: Any = None):
                         verdict["usable"] = usable
                         logger.info(f"agent1 file verify {acc}: downgraded download→lead (no A-level file)")
 
+        # Write sample_metadata.csv with per-GSM download verdict
+        _write_sample_metadata_csv(acc, gsm, verdict, task_id,
+                                    output_dir or config.get("download", {}).get("output_dir", "./data"))
+
         return apply_verdict(ds, verdict)
 
     def filter_node(state: Agent1State) -> Dict[str, Any]:
         intent = state.get("parsed_intent") or {}
         candidates = state.get("candidate_gse_list") or []
         qlog = state.get("query_logger")
+        task_id = state.get("task_id")
+        output_dir = state.get("output_dir")
         if not candidates:
             empty = {"download_list": [], "lead_list": [], "exclude_list": [],
                      "manual_review_list": []}
             return {**empty, "filter_log": "geo-filter: no candidates"}
-        judged = _run_concurrent(_filter_one, candidates, intent, qlog, max_concurrent=3)
+        judged = _run_concurrent(_filter_one, candidates, intent, qlog, task_id, output_dir, max_concurrent=3)
         buckets = split_by_outcome(judged)
         log = (
             f"geo-filter: {len(candidates)} candidates → "
@@ -239,6 +246,73 @@ def build_agent1_pipeline(config: Dict[str, Any], registry: Any = None):
 
 
 # ---------------------------------------------------------------------- #
+#  sample_metadata.csv writer (per-GSM download verdict)                #
+# ---------------------------------------------------------------------- #
+
+def _write_sample_metadata_csv(
+    accession: str,
+    gsm_details: List[Dict[str, Any]],
+    verdict: Dict[str, Any],
+    task_id: Optional[str],
+    output_dir: str,
+) -> None:
+    """
+    Write/update sample_metadata.csv with per-GSM download verdict.
+
+    First time: creates CSV with gsm/source_name/molecule/group/cancer + task_id column.
+    Subsequent queries: only ADDS a new task_id column (meta columns untouched).
+    """
+    import pandas as pd
+    from pathlib import Path
+
+    if not gsm_details or not task_id:
+        return
+
+    col_name = task_id[:8]
+    csv_path = Path(output_dir) / accession / "sample_metadata.csv"
+
+    # Build per-GSM verdict map from gsm_includes
+    inc_map = {}
+    for item in (verdict.get("gsm_includes") or []):
+        inc_map[str(item.get("gsm", ""))] = bool(item.get("include", False))
+
+    try:
+        if csv_path.exists():
+            # CSV already exists → only add task_id column
+            df = pd.read_csv(csv_path)
+            if col_name not in df.columns:
+                df[col_name] = df["gsm"].map(
+                    lambda gsm: "download" if inc_map.get(str(gsm), False) else "not download"
+                )
+                df.to_csv(csv_path, index=False)
+            logger.debug(f"_write_sample_metadata_csv({accession}): added col={col_name}")
+        else:
+            # First time → create with all columns
+            from skills.geo_download.cancer_label import label_gsm_cancer, query_cancer_terms
+            qt = query_cancer_terms({"cancer_type": {"display": "colorectal cancer", "tcga_code": "COAD"}})
+            rows = []
+            for g in gsm_details:
+                rows.append({
+                    "gsm": g.get("gsm", ""),
+                    "source_name": g.get("source_name", ""),
+                    "molecule": g.get("molecule", ""),
+                    "group": g.get("group", "unknown"),
+                    "cancer": label_gsm_cancer(g.get("characteristics") or {}, qt),
+                })
+            df_new = pd.DataFrame(rows)
+            df_new[col_name] = df_new["gsm"].map(
+                lambda gsm: "download" if inc_map.get(str(gsm), False) else "not download"
+            )
+            csv_path.parent.mkdir(parents=True, exist_ok=True)
+            df_new.to_csv(csv_path, index=False)
+            logger.debug(f"_write_sample_metadata_csv({accession}): created {len(rows)} rows, col={col_name}")
+    except Exception as e:
+        logger.warning(f"_write_sample_metadata_csv({accession}): failed: {e}")
+    except Exception as e:
+        logger.warning(f"_write_sample_metadata_csv({accession}): failed: {e}")
+
+
+# ---------------------------------------------------------------------- #
 #  Registry bridge helper                                                 #
 # ---------------------------------------------------------------------- #
 
@@ -254,18 +328,19 @@ def register_state_to_registry(state: Dict[str, Any], reg: Any) -> Dict[str, int
     n = {"auto_download": 0, "review": 0, "excluded": 0}
     task_id = state.get("task_id")
     raw_query = state.get("raw_query")
+    output_dir = state.get("output_dir") or "./data"
 
     # download + TCGA → pending (download worker auto-downloads, no approval needed).
     for rec in state.get("download_list") or []:
-        _upsert(reg, rec, "pending", needs_review=False, task_id=task_id, raw_query=raw_query)
+        _upsert(reg, rec, "pending", needs_review=False, task_id=task_id, raw_query=raw_query, output_dir=output_dir)
         n["auto_download"] += 1
     for rec in state.get("tcga_candidates") or []:
-        _upsert(reg, {**rec, "source": "TCGA"}, "pending", needs_review=False, task_id=task_id, raw_query=raw_query)
+        _upsert(reg, {**rec, "source": "TCGA"}, "pending", needs_review=False, task_id=task_id, raw_query=raw_query, output_dir=output_dir)
         n["auto_download"] += 1
 
     # Review Queue (needs_review=1): lead + manual_review.
     for rec in (state.get("lead_list") or []) + (state.get("manual_review_list") or []):
-        _upsert(reg, rec, "awaiting_approval", needs_review=True, task_id=task_id, raw_query=raw_query)
+        _upsert(reg, rec, "awaiting_approval", needs_review=True, task_id=task_id, raw_query=raw_query, output_dir=output_dir)
         n["review"] += 1
 
     n["excluded"] = len(state.get("exclude_list") or [])
@@ -276,13 +351,22 @@ def register_state_to_registry(state: Dict[str, Any], reg: Any) -> Dict[str, int
 def _upsert(reg: Any, rec: Dict[str, Any], status: str,
             local_path: str = None, file_size_bytes: int = None,
             needs_review: bool = False,
-            task_id: str = None, raw_query: str = None) -> None:
+            task_id: str = None, raw_query: str = None,
+            output_dir: str = None) -> None:
     """Map a skill record onto Registry.upsert_dataset(...) + status update."""
     acc = rec.get("accession")
     if not acc:
         return
     notes = rec.get("notes") or ""
     no_pubmed = "no_pubmed_link" in notes
+
+    # Compute sample_metadata path for this accession
+    smp = None
+    if output_dir and acc:
+        from pathlib import Path
+        p = Path(output_dir) / acc / "sample_metadata.csv"
+        if p.exists():
+            smp = str(p)
     try:
         reg.upsert_dataset(
             accession=acc,
@@ -298,7 +382,6 @@ def _upsert(reg: Any, rec: Dict[str, Any], status: str,
             paper_pmid=str((rec.get("pubmed_ids") or [None])[0]) if rec.get("pubmed_ids") else None,
             notes=notes,
             no_pubmed_link=no_pubmed,
-            sample_metadata_path=rec.get("sample_metadata_path"),
             usable=rec.get("usable", 1),
             recommended_action=rec.get("recommended_action"),
             reason=rec.get("reason"),
@@ -310,6 +393,7 @@ def _upsert(reg: Any, rec: Dict[str, Any], status: str,
             download_status=status,
             task_id=task_id,
             raw_query=raw_query,
+            sample_metadata_path=smp,
         )
         # For completed downloads, also set local_path/size.
         if local_path and status in ("done", "failed"):
