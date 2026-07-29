@@ -174,11 +174,17 @@ def run_one(
     print(f"  summary     : {(ds.get('summary') or '')[:160]}...")
     print()
 
-    # 2) representative GSMs
-    gsm_details = geo.get_representative_gsm_details(accession, wanted_sample_type=wanted_sample_type)
+    # 2) series_matrix 优先取证（全量样本注释），fallback 到代表性 GSM
+    sm_info = geo.fetch_series_matrix_sample_info(accession)
+    if sm_info:
+        gsm_details = sm_info
+        print(f"[evidence] series_matrix: {len(gsm_details)} samples")
+    else:
+        gsm_details = geo.get_representative_gsm_details(accession, wanted_sample_type=wanted_sample_type)
+        print(f"[evidence] representative GSMs: {len(gsm_details)} samples")
     groups = group_summary(gsm_details)
     groups_str = ", ".join(f"{g}={n}" for g, n in groups.items() if n) or "(none)"
-    print(f"[evidence] representative GSMs: {len(gsm_details)}  (groups: {groups_str})")
+    print(f"  (groups: {groups_str})")
     for g in gsm_details[:6]:
         ch = g.get("characteristics") or {}
         ch_str = "; ".join(f"{k}={v}" for k, v in list(ch.items())[:4])

@@ -1,4 +1,5 @@
-# =====================================================# docker-compose.override.yml — Development overrides
+# ============================================================
+# docker-compose.override.yml — Development overrides
 #
 # Automatically applied on top of docker-compose.yml when you run:
 #   docker compose up
@@ -11,7 +12,8 @@
 #
 # To use production settings only:
 #   docker compose -f docker-compose.yml up
-# =====================================================services:
+# ============================================================
+services:
 
   agent1-query:
     volumes:

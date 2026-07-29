@@ -182,15 +182,20 @@ def _intent_block(intent: Dict[str, Any]) -> str:
 
 
 def _gsm_block(gsm_details: List[Dict[str, Any]]) -> str:
-    """Render representative GSM details + group counts as evidence."""
+    """Render GSM details + group counts as evidence. Caps at 20 individual entries."""
     if not gsm_details:
-        return "(no representative GSM details available)"
+        return "(no sample details available)"
 
     counts = group_summary(gsm_details)
     counts_line = ", ".join(f"{g}={n}" for g, n in counts.items() if n)
+    n_total = len(gsm_details)
 
-    lines = [f"Representative samples (group counts: {counts_line}):"]
-    for g in gsm_details:
+    # Cap individual entries to avoid prompt explosion (series_matrix can give 100+)
+    cap = 20
+    shown = gsm_details[:cap]
+
+    lines = [f"Sample details ({n_total} total, group counts: {counts_line}):"]
+    for g in shown:
         ch = g.get("characteristics") or {}
         ch_str = "; ".join(f"{k}: {v}" for k, v in ch.items()) if ch else "(none)"
         lines.append(
@@ -198,6 +203,8 @@ def _gsm_block(gsm_details: List[Dict[str, Any]]) -> str:
             f"source_name={g.get('source_name', '')!r}, "
             f"molecule={g.get('molecule', '')!r}, characteristics={{{ch_str}}}"
         )
+    if n_total > cap:
+        lines.append(f"  ... ({n_total - cap} more samples, see group counts above for distribution)")
     return "\n".join(lines)
 
 

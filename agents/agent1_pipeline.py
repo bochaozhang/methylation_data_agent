@@ -128,7 +128,15 @@ def build_agent1_pipeline(config: Dict[str, Any], registry: Any = None):
     def _filter_one(ds: Dict[str, Any], intent: Dict[str, Any], qlog=None) -> Dict[str, Any]:
         acc = ds.get("accession", "?")
         wanted = intent.get("sample_type", "") or ""
-        gsm = geo_client.get_representative_gsm_details(acc, wanted_sample_type=wanted)
+
+        # Phase 2.5: series_matrix 优先取证（全部样本注释 vs 6 个代表）
+        sm_info = geo_client.fetch_series_matrix_sample_info(acc)
+        if sm_info:
+            gsm = sm_info
+            logger.info(f"agent1 filter {acc}: series_matrix {len(gsm)} samples")
+        else:
+            gsm = geo_client.get_representative_gsm_details(acc, wanted_sample_type=wanted)
+            logger.info(f"agent1 filter {acc}: representative GSMs {len(gsm)} samples")
         abstract = None
         pmids = ds.get("pubmed_ids") or []
         if pmids:
