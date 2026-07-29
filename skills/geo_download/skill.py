@@ -103,29 +103,60 @@ class DownloadSkill:
     def process_dataset(self, rec: Dict[str, Any], query_terms: List[str],
                         output_dir: str) -> Dict[str, Any]:
         """
-        Download + cancer-subset ONE dataset record. Public so the daemon's
-        run_pending_downloads (human-approved items) can reuse the same path as
-        the pipeline. `rec` needs at least accession + supplementary_files
-        (re-fetch via get_series_metadata if not available).
+        Download + cancer-subset ONE dataset record. Three-tier fallback:
+          1. series_matrix has data → download series_matrix (all samples in one file)
+          2. supplementary files exist → download those
+          3. neither → scrape GSM pages for per-sample beta tables (only "download" GSMs)
         """
         acc = rec.get("accession", "?")
         flags = rec.get("flags", "")
 
-        # Phase 2b: read existing sample_metadata.csv (written by filter) for cancer subset.
-        # Don't rebuild — filter already wrote it with per-GSM verdicts.
+        # Phase 2b: read existing sample_metadata.csv (written by filter).
         sm = _read_sample_metadata(acc, output_dir)
 
-        # Phase 1: download.
+        # ---- Three-tier download task building ----
+        tier_used = "?"
         try:
-            tasks = build_geo_download_tasks(rec, output_dir)
+            # Tier 1: series_matrix has data?
+            if self.geo_client.series_matrix_has_data(acc):
+                tier_used = "1(series_matrix)"
+                tasks = _build_series_matrix_task(acc, output_dir)
+                logger.info(f"geo-download {acc}: Tier 1 (series_matrix has data)")
+            # Tier 2: supplementary files?
+            elif rec.get("supplementary_files"):
+                tier_used = "2(supplementary)"
+                tasks = build_geo_download_tasks(rec, output_dir)
+                logger.info(f"geo-download {acc}: Tier 2 (supplementary files)")
+            # Tier 3: GSM page scraping (only "download" GSMs)
+            else:
+                tier_used = "3(gsm_scrape)"
+                gsm_list = _read_downloadable_gsms(acc, output_dir)
+                logger.info(f"geo-download {acc}: Tier 3 (scraping {len(gsm_list)} GSM pages)")
+                tasks = []
+                for gsm_id in gsm_list:
+                    info = self.geo_client.fetch_gsm_supplementary_file(gsm_id)
+                    if info:
+                        url = info["url"].replace("ftp://", "https://", 1)
+                        tasks.append({
+                            "accession": acc,
+                            "url": url,
+                            "filename": info["filename"],
+                            "subdir": f"{acc}/{gsm_id}",
+                        })
+                    else:
+                        logger.debug(f"geo-download {acc}: no supp file for {gsm_id}")
+                if not tasks:
+                    logger.warning(f"geo-download {acc}: Tier 3 found no GSM supp files")
         except Exception as e:
             logger.error(f"geo-download: build tasks failed for {acc}: {e}")
             return self._result(acc, [], [], "failed", flags,
-                                notes=f"task build error: {e}", subset_path=None)
+                                notes=f"task build error ({tier_used}): {e}", subset_path=None)
+
+        # ---- Download ----
         dl_results = self.downloader.download_many_sync(tasks) if tasks else []
         done = [r for r in dl_results if r.get("status") == "done"]
 
-        # Phase 2c: cancer subset (or single-cancer fallback / manual_review).
+        # ---- Cancer subset ----
         subset_path, subset_note, forced_outcome = self._subset_by_cancer(
             acc, done, sm, output_dir,
             query_terms=query_terms, cancer_type=rec.get("cancer_type"))
@@ -135,16 +166,21 @@ class DownloadSkill:
                 "name": (r.get("local_path") or "").split("/")[-1],
                 "local_path": r.get("local_path"),
                 "size_bytes": r.get("file_size_bytes"),
-                "qc_passed": bool(r.get("local_path")),  # light landing check
+                "qc_passed": bool(r.get("local_path")),
                 "data_form": rec.get("available_file_type"),
                 "provenance": {"source_url": r.get("url"), "checksum_md5": r.get("checksum_md5")},
             }
             for r in done
         ]
         outcome = forced_outcome or ("download_success" if done else "failed")
-        notes = subset_note
+        notes = subset_note + f" [tier={tier_used}]"
         if not done:
-            notes = "; ".join(r.get("error", "") for r in dl_results if r.get("status") != "done")
+            if not tasks:
+                # No files found in any tier — not a download error, just unavailable
+                outcome = "no_files"
+                notes = f"no downloadable files found [tier={tier_used}]"
+            else:
+                notes = "; ".join(r.get("error", "") for r in dl_results if r.get("status") != "done") + f" [tier={tier_used}]"
         return self._result(acc, files_downloaded, [], outcome, flags,
                             notes=notes, subset_path=subset_path)
 
@@ -302,3 +338,41 @@ def _read_sample_metadata(accession: str, output_dir: str) -> Optional[pd.DataFr
     except Exception as e:
         logger.debug(f"_read_sample_metadata({accession}): {e}")
         return None
+
+
+def _read_downloadable_gsms(accession: str, output_dir: str) -> List[str]:
+    """
+    Read sample_metadata.csv and return GSM IDs marked "download" in the
+    latest task_id column. Only used in Tier 3 (GSM page scraping).
+    """
+    from pathlib import Path
+    csv_path = Path(output_dir) / accession / "sample_metadata.csv"
+    if not csv_path.exists():
+        return []
+    try:
+        df = pd.read_csv(csv_path)
+        # Find the latest task_id column (8-char names, rightmost)
+        base_cols = {"gsm", "source_name", "molecule", "group", "cancer"}
+        tid_cols = [c for c in df.columns if c not in base_cols and len(c) == 8]
+        if not tid_cols:
+            return []
+        col = tid_cols[-1]  # latest = rightmost
+        downloadable = df[df[col] == "download"]["gsm"].tolist()
+        logger.info(f"_read_downloadable_gsms({accession}): {len(downloadable)} GSMs marked download (col={col})")
+        return [str(g) for g in downloadable if pd.notna(g)]
+    except Exception as e:
+        logger.warning(f"_read_downloadable_gsms({accession}): {e}")
+        return []
+
+
+def _build_series_matrix_task(accession: str, output_dir: str) -> List[Dict[str, Any]]:
+    """Build a single download task for the series_matrix (Tier 1)."""
+    prefix = accession[:-3] + "nnn"
+    url = (f"https://ftp.ncbi.nlm.nih.gov/geo/series/{prefix}/{accession}/"
+           f"matrix/{accession}_series_matrix.txt.gz")
+    return [{
+        "accession": accession,
+        "url": url,
+        "filename": f"{accession}_series_matrix.txt.gz",
+        "subdir": accession,
+    }]

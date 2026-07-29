@@ -302,17 +302,25 @@ def run_pending_downloads(registry: Registry) -> None:
         def _download_one(ds):
             acc = ds["accession"]
             registry.update_status(acc, "downloading")
-            # Re-fetch metadata to recover supplementary_files (best-effort).
-            try:
-                meta = skill.geo_client.get_series_metadata(acc) or {}
-            except Exception as exc:
-                logger.debug(f"[download] metadata re-fetch {acc} failed: {exc}")
-                meta = {}
+            # Re-fetch metadata to recover supplementary_files (with retry for transient SSL errors).
+            meta = {}
+            for attempt in range(3):
+                try:
+                    meta = skill.geo_client.get_series_metadata(acc) or {}
+                    if meta.get("supplementary_files"):
+                        break
+                except Exception as exc:
+                    logger.debug(f"[download] metadata re-fetch {acc} attempt {attempt+1} failed: {exc}")
+                    time.sleep(2)
+
+            # Fallback: if metadata still empty, try FTP supplementary directory listing
+            supp = meta.get("supplementary_files") or ds.get("supplementary_files") or []
+            if not supp:
+                supp = _list_gse_supplementary_files(acc)
             rec = {
                 "accession": acc,
                 "source": "GEO",
-                "supplementary_files": meta.get("supplementary_files")
-                    or ds.get("supplementary_files") or [],
+                "supplementary_files": supp,
                 "title": ds.get("title") or meta.get("title"),
                 "data_type": ds.get("data_type") or meta.get("data_type"),
                 "cancer_type": ds.get("cancer_type") or meta.get("cancer_type"),
@@ -335,6 +343,36 @@ def run_pending_downloads(registry: Registry) -> None:
         _download_tcga_pending(registry, tcga_pending, config)
 
 
+def _list_gse_supplementary_files(accession: str) -> list:
+    """
+    Fallback: list supplementary files by scraping the GSE's suppl FTP directory.
+    Uses HTTPS (NCBI FTP is also accessible via https://ftp.ncbi.nlm.nih.gov/...).
+    Returns list of URLs, or [] on failure.
+    """
+    import requests as _requests
+    prefix = accession[:-3] + "nnn"
+    base_url = f"https://ftp.ncbi.nlm.nih.gov/geo/series/{prefix}/{accession}/suppl/"
+    try:
+        resp = _requests.get(base_url, timeout=15, verify=False)
+        if resp.status_code != 200:
+            return []
+        # Parse Apache directory listing for file links
+        import re
+        links = re.findall(r'href="([^"]+)"', resp.text)
+        files = []
+        for link in links:
+            # Skip navigation + external links (hhs.gov etc)
+            if link in ("../", "Parent Directory") or link.endswith("/") or link.startswith("http"):
+                continue
+            files.append(base_url + link)
+        if files:
+            logger.info(f"_list_gse_supplementary_files({accession}): found {len(files)} files via FTP listing")
+        return files
+    except Exception as e:
+        logger.debug(f"_list_gse_supplementary_files({accession}): {e}")
+        return []
+
+
 def _apply_skill_download_result(registry: Registry, acc: str, result: dict) -> None:
     """Map a DownloadSkill.process_dataset() result onto the registry."""
     outcome = result.get("outcome_final")
@@ -348,6 +386,13 @@ def _apply_skill_download_result(registry: Registry, acc: str, result: dict) -> 
         registry.update_status(acc, "done", local_path=local_path, file_size_bytes=size)
         registry.log_event(acc, "done", f"DownloadSkill ok{extra}")
         logger.info(f"[download] {acc} done{extra}")
+    elif outcome == "no_files":
+        # No downloadable files found (series_matrix empty + no supp + GSM pages empty).
+        # NOT a download error — mark no_file so WebUI distinguishes from real failures,
+        # and exclude from retry (only 'failed' gets retried).
+        registry.update_status(acc, "no_file")
+        registry.log_event(acc, "no_file", f"no downloadable files found{extra}")
+        logger.info(f"[download] {acc} no_file (no downloadable files){extra}")
     elif outcome and "manual_review" in outcome:
         # File downloaded but cancer labels unclear - keep the file, flag for review.
         registry.update_status(acc, "done", local_path=local_path, file_size_bytes=size)

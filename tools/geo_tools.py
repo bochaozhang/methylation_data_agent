@@ -1361,7 +1361,92 @@ class GEOClient:
         logger.info(f"fetch_series_matrix_sample_info({accession}): "
                     f"{len(results)} samples from series_matrix")
         return results
-    # ------------------------------------------------------------------ #
+
+    def series_matrix_has_data(self, accession: str) -> bool:
+        """
+        Check if the series_matrix has actual data rows (not just headers).
+
+        Downloads the series_matrix, counts lines between
+        !series_matrix_table_begin and !series_matrix_table_end.
+        >2 lines means there's at least one data row.
+        """
+        prefix = accession[:-3] + "nnn"
+        url = (f"https://ftp.ncbi.nlm.nih.gov/geo/series/{prefix}/{accession}/"
+               f"matrix/{accession}_series_matrix.txt.gz")
+        try:
+            time.sleep(self._rate_limit_delay)
+            resp = self.session.head(url, timeout=10, allow_redirects=True)
+            if resp.status_code != 200:
+                return False
+            time.sleep(self._rate_limit_delay)
+            resp = self.session.get(url, timeout=30)
+            resp.raise_for_status()
+            import gzip
+            text = gzip.decompress(resp.content).decode("utf-8", errors="replace")
+
+            in_table = False
+            data_rows = 0
+            for line in text.splitlines():
+                if "!series_matrix_table_begin" in line:
+                    in_table = True
+                    continue
+                if "!series_matrix_table_end" in line:
+                    break
+                if in_table:
+                    data_rows += 1
+            has = data_rows > 1  # >1 means at least one data row (header + data)
+            logger.debug(f"series_matrix_has_data({accession}): {data_rows} data rows → {has}")
+            return has
+        except Exception as e:
+            logger.debug(f"series_matrix_has_data({accession}): {e}")
+            return False
+
+    def fetch_gsm_supplementary_file(self, gsm_accession: str) -> Optional[Dict[str, Any]]:
+        """
+        Fetch a GSM sample page and find supplementary file download links.
+
+        Scrapes https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={gsm}
+        for supplementary file URLs (e.g., "supplementary file", "download full table").
+        Returns {gsm, url, filename} or None.
+        """
+        url = f"https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={gsm_accession}"
+        try:
+            time.sleep(self._rate_limit_delay)
+            resp = self.session.get(url, timeout=15)
+            resp.raise_for_status()
+            html = resp.text
+        except Exception as e:
+            logger.debug(f"fetch_gsm_supplementary_file({gsm_accession}): {e}")
+            return None
+
+        try:
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(html, "html.parser")
+
+            # Look for supplementary file links in the GSM page
+            # GEO GSM pages have links like:
+            #   <a href="https://ftp.ncbi.nlm.nih.gov/geo/samples/.../suppl/...">...(file).txt</a>
+            # Or "(format full table)" / "supplementary file" sections
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                text = a.get_text().strip().lower()
+                # Match FTP supplementary file links
+                if "ftp.ncbi.nlm.nih.gov" in href and "/suppl/" in href:
+                    filename = href.rsplit("/", 1)[-1] if "/" in href else href
+                    logger.info(f"fetch_gsm_supplementary_file({gsm_accession}): found {filename}")
+                    return {"gsm": gsm_accession, "url": href, "filename": filename}
+                # Match "download full table" style links
+                if "full table" in text or "supplementary" in text:
+                    if href.startswith("http"):
+                        filename = href.rsplit("/", 1)[-1] if "/" in href else gsm_accession
+                        logger.info(f"fetch_gsm_supplementary_file({gsm_accession}): found {filename}")
+                        return {"gsm": gsm_accession, "url": href, "filename": filename}
+
+            logger.debug(f"fetch_gsm_supplementary_file({gsm_accession}): no supp file found")
+            return None
+        except Exception as e:
+            logger.warning(f"fetch_gsm_supplementary_file({gsm_accession}): parse failed: {e}")
+            return None
 
     def verify_accession(self, accession: str) -> bool:
         """
