@@ -324,6 +324,9 @@ def run_pending_downloads(registry: Registry) -> None:
                 "title": ds.get("title") or meta.get("title"),
                 "data_type": ds.get("data_type") or meta.get("data_type"),
                 "cancer_type": ds.get("cancer_type") or meta.get("cancer_type"),
+                # sample-type context for Tier-2 LLM file selection (plasma vs tissue, etc.)
+                "sample_type": ds.get("sample_type"),
+                "raw_query": ds.get("raw_query"),
                 "flags": ds.get("notes") or "",
                 "available_file_type": ds.get("available_file_type"),
             }

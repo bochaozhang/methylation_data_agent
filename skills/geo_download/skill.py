@@ -19,18 +19,25 @@ Output (state): download_results, download_log
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
+from langchain_core.messages import HumanMessage, SystemMessage
+
 from skills.geo_download.cancer_label import (
     build_sample_metadata_with_cancer,
     query_cancer_terms,
 )
+from skills.geo_filter.file_inspect import inspect_matrix_head
 from tools.download_tools import DownloadEngine, build_geo_download_tasks
 from tools.geo_tools import GEOClient
+from utils.llm_factory import get_llm
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -76,6 +83,13 @@ class DownloadSkill:
             or None
         )
         self.geo_client = GEOClient(api_key=ncbi_key or None, proxy=ncbi_proxy or None)
+        # LLM for Tier-2 sample-type-aware file selection (None if unconfigured →
+        # the selector falls back to keeping all non-junk files + manual_review).
+        try:
+            self.llm = get_llm(config.get("llm") or {})
+        except Exception as exc:
+            logger.warning(f"geo-download: LLM unavailable ({exc}); file selection will keep all non-junk")
+            self.llm = None
 
     # ------------------------------------------------------------------ #
 
@@ -125,7 +139,10 @@ class DownloadSkill:
             # Tier 2: supplementary files?
             elif rec.get("supplementary_files"):
                 tier_used = "2(supplementary)"
-                tasks = build_geo_download_tasks(rec, output_dir)
+                # Download ALL non-RAW supp files; content-based keep/discard happens
+                # after download (download_all_non_raw skips the filename keyword gate).
+                tasks = build_geo_download_tasks(
+                    rec, output_dir, download_all_non_raw=True)
                 logger.info(f"geo-download {acc}: Tier 2 (supplementary files)")
             # Tier 3: GSM page scraping (only "download" GSMs)
             else:
@@ -156,10 +173,25 @@ class DownloadSkill:
         dl_results = self.downloader.download_many_sync(tasks) if tasks else []
         done = [r for r in dl_results if r.get("status") == "done"]
 
+        # ---- Tier 2 file selection ----
+        # We downloaded every non-RAW supp file. Now select which to KEEP:
+        #   1. junk-filter (demoted inspect_matrix_head) drops clear non-data files
+        #      (empty/README, p-value/logFC tables) — NOT a value-range A-level gate.
+        #   2. the LLM picks files whose SAMPLE TYPE matches the query (e.g. plasma
+        #      cfDNA vs tissue), using the query + the target-sample set + each file's
+        #      head. Conservative fallback keeps all non-junk + manual_review.
+        discarded: List[Dict[str, Any]] = []
+        selection_note = ""
+        sel_forced: Optional[str] = None
+        if tier_used.startswith("2"):
+            done, discarded, selection_note, sel_forced = self._select_relevant_files(
+                acc, done, rec, sm)
+
         # ---- Cancer subset ----
         subset_path, subset_note, forced_outcome = self._subset_by_cancer(
             acc, done, sm, output_dir,
             query_terms=query_terms, cancer_type=rec.get("cancer_type"))
+        forced_outcome = forced_outcome or sel_forced  # selection fallback may flag review
 
         files_downloaded = [
             {
@@ -167,22 +199,45 @@ class DownloadSkill:
                 "local_path": r.get("local_path"),
                 "size_bytes": r.get("file_size_bytes"),
                 "qc_passed": bool(r.get("local_path")),
-                "data_form": rec.get("available_file_type"),
+                "data_form": r.get("data_form") or rec.get("available_file_type"),
                 "provenance": {"source_url": r.get("url"), "checksum_md5": r.get("checksum_md5")},
             }
             for r in done
         ]
         outcome = forced_outcome or ("download_success" if done else "failed")
         notes = subset_note + f" [tier={tier_used}]"
+        if selection_note:
+            notes += f"; {selection_note}"
+        if discarded:
+            reasons = ", ".join(sorted({
+                f"{d['name']}: {d.get('reason', '')}" for d in discarded}))
+            notes += (f"; tier2 file-select: kept {len(files_downloaded)}, "
+                      f"discarded {len(discarded)} ({reasons})")
         if not done:
+            dl_done = [r for r in dl_results if r.get("status") == "done"]
             if not tasks:
                 # No files found in any tier — not a download error, just unavailable
                 outcome = "no_files"
                 notes = f"no downloadable files found [tier={tier_used}]"
+            elif not dl_done:
+                # Tasks existed but none downloaded successfully
+                outcome = "failed"
+                notes = ("; ".join(r.get("error", "") for r in dl_results
+                                   if r.get("status") != "done")
+                         + f" [tier={tier_used}]")
+            elif discarded:
+                # Files downloaded but every one was discarded
+                outcome = "no_files"
+                notes = (f"downloaded {len(discarded)} supp file(s), all discarded "
+                         f"[tier={tier_used}]")
             else:
-                notes = "; ".join(r.get("error", "") for r in dl_results if r.get("status") != "done") + f" [tier={tier_used}]"
+                outcome = "failed"
+                notes = ("; ".join(r.get("error", "") for r in dl_results
+                                   if r.get("status") != "done")
+                         + f" [tier={tier_used}]")
         return self._result(acc, files_downloaded, [], outcome, flags,
-                            notes=notes, subset_path=subset_path)
+                            notes=notes, subset_path=subset_path,
+                            files_discarded=discarded)
 
     # ------------------------------------------------------------------ #
     #  Cancer subset (Phase 2c)                                          #
@@ -252,14 +307,215 @@ class DownloadSkill:
         return subset_path, (note or "subset ok"), None
 
     # ------------------------------------------------------------------ #
+    #  Tier-2 file selection (junk filter + LLM sample-type selection)   #
+    # ------------------------------------------------------------------ #
+
+    def _select_relevant_files(
+        self, acc: str, done_results: List[Dict[str, Any]], rec: Dict[str, Any],
+        sm: Optional[pd.DataFrame],
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], str, Optional[str]]:
+        """
+        Select which downloaded Tier-2 supp files to keep.
+
+        1. Junk-filter (demoted inspect_matrix_head): auto-drop clear non-data files
+           (empty/README/binary, p-value/logFC statistical tables). NOT a value-range
+           A-level gate — MCTA-Seq counts / unusual matrices pass through.
+        2. LLM picks files whose SAMPLE TYPE matches the query (e.g. plasma cfDNA vs
+           tissue), using the query + the target-sample set + each file's head.
+        3. Conservative fallback: no LLM / parse error / LLM keeps none → keep ALL
+           non-junk files and flag manual_review (never silently delete real data).
+
+        Returns (kept_results, discarded_info, note, forced_outcome).
+        """
+        candidates, junk = self._junk_filter(acc, done_results)
+
+        if not candidates:
+            return [], junk, "all supp files were junk (no data)", None
+
+        if self.llm is None:
+            # No LLM → keep everything that isn't obvious junk, flag for review.
+            return candidates, junk, (
+                f"no LLM → kept all {len(candidates)} non-junk file(s) (manual_review)"
+            ), "manual_review_file_selection"
+
+        try:
+            kept, llm_discarded, llm_note = self._llm_select_files(acc, candidates, rec, sm)
+        except Exception as exc:
+            logger.warning(f"geo-download {acc}: LLM file-selection failed ({exc}) → keep all non-junk")
+            return candidates, junk, (
+                f"LLM selection error ({exc}) → kept all {len(candidates)} non-junk (manual_review)"
+            ), "manual_review_file_selection"
+
+        # Safety: if the LLM kept nothing but candidates existed, don't trust it —
+        # revert to keeping all non-junk + flag review. (Files are NOT deleted yet —
+        # _llm_select_files only classifies; deletion happens below on the commit path.)
+        if not kept:
+            logger.warning(f"geo-download {acc}: LLM kept no files → revert to all non-junk (manual_review)")
+            return candidates, junk, (
+                f"LLM kept none → kept all {len(candidates)} non-junk (manual_review); "
+                f"{llm_note}"
+            ), "manual_review_file_selection"
+
+        # Commit: delete the LLM-discarded files now that we're keeping ≥1.
+        for d in llm_discarded:
+            _delete_file(d.get("local_path"), acc, d.get("name"))
+        # Strip the local_path from the discard records (provenance keeps md5+url).
+        for d in llm_discarded:
+            d.pop("local_path", None)
+        return kept, junk + llm_discarded, llm_note, None
+
+    # -------- junk pre-filter (demoted inspect_matrix_head) ------------- #
+
+    def _junk_filter(self, acc: str, done_results: List[Dict[str, Any]]
+                     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        """
+        Auto-discard ONLY clear non-data files. Returns (kept, junk_discarded).
+        A file is junk iff:
+          - inspect returns unknown with empty/no-lines/no-numeric reason (README/empty/binary), or
+          - inspect returns non_methylation with 'statistical columns' (p-value/logFC diff table).
+        Everything else (beta/M-value/ratio/paired-counts, integer read-counts with sample
+        columns, unknown-with-numeric-range) is kept for the LLM to judge.
+        """
+        kept: List[Dict[str, Any]] = []
+        junk: List[Dict[str, Any]] = []
+        for r in done_results:
+            local_path = r.get("local_path")
+            name = (local_path or "").split("/")[-1]
+            if not local_path or not os.path.exists(local_path):
+                continue
+            # series_matrix → always keep (GEO-compiled), don't even inspect.
+            if "series_matrix" in name.lower():
+                r["data_form"] = "series_matrix"
+                kept.append(r)
+                continue
+            try:
+                with open(local_path, "rb") as f:
+                    info = inspect_matrix_head(f.read(1 << 20))
+            except Exception as e:
+                info = {"value_type": "unknown", "reason": f"inspect error: {e}"}
+            vt, reason = info.get("value_type", "unknown"), info.get("reason", "")
+            is_junk = (
+                (vt == "unknown" and any(s in reason for s in
+                    ("empty", "no lines", "no numeric", "unparseable")))
+                or (vt == "non_methylation" and reason.startswith("statistical columns"))
+            )
+            if is_junk:
+                md5 = _md5_file(local_path)
+                _delete_file(local_path, acc, name)
+                junk.append({"name": name, "value_type": vt, "reason": f"junk: {reason}",
+                             "md5": md5, "source_url": r.get("url")})
+                logger.info(f"geo-download {acc}: junk-drop {name} ({vt}: {reason})")
+            else:
+                kept.append(r)
+        return kept, junk
+
+    # -------- LLM sample-type-aware selection --------------------------- #
+
+    def _llm_select_files(self, acc: str, candidates: List[Dict[str, Any]],
+                          rec: Dict[str, Any], sm: Optional[pd.DataFrame],
+                          ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], str]:
+        """
+        Ask the LLM which candidate files contain samples matching the query sample
+        type. Returns (kept, discarded, note). Raises on parse/error (caller falls back).
+        """
+        # Target-sample summary from sample_metadata (the LLM-selected "download" set).
+        target_summary = self._target_sample_summary(sm)
+
+        file_blocks = []
+        name_to_result: Dict[str, Dict[str, Any]] = {}
+        for r in candidates:
+            name = (r.get("local_path") or "").split("/")[-1]
+            name_to_result[name] = r
+            head = _read_head_text(r.get("local_path"), max_lines=8)
+            file_blocks.append(f"--- FILE: {name} ---\n{head}")
+        files_text = "\n\n".join(file_blocks)
+
+        user_msg = (
+            f"=== USER REQUEST ===\n"
+            f"raw query: {rec.get('raw_query') or '(not recorded)'}\n"
+            f"requested sample type: {rec.get('sample_type') or '(unspecified)'}\n"
+            f"cancer: {rec.get('cancer_type') or '(unspecified)'}\n\n"
+            f"=== DATASET ===\n"
+            f"accession: {acc}\n"
+            f"title: {(rec.get('title') or '')[:200]}\n"
+            f"data type: {rec.get('data_type') or 'unknown'}\n\n"
+            f"=== TARGET SAMPLES (already selected for this query) ===\n"
+            f"{target_summary}\n\n"
+            f"=== CANDIDATE SUPPLEMENTARY FILES (head of each) ===\n"
+            f"{files_text}\n"
+        )
+
+        resp = self.llm.invoke([
+            SystemMessage(content=_FILE_SELECTION_SYSTEM_PROMPT),
+            HumanMessage(content=user_msg),
+        ])
+        raw = resp.content if isinstance(resp.content, str) else str(resp.content)
+        verdict = _safe_json(raw)
+        files_verdict = verdict.get("files") or []
+        keep_set = {
+            str(f.get("name", "")).strip(): f for f in files_verdict
+            if isinstance(f, dict)
+        }
+
+        kept: List[Dict[str, Any]] = []
+        discarded: List[Dict[str, Any]] = []
+        for name, r in name_to_result.items():
+            v = keep_set.get(name)
+            local_path = r.get("local_path")
+            if v and bool(v.get("keep")):
+                r["data_form"] = v.get("sample_type") or v.get("data_form") or "selected"
+                kept.append(r)
+                logger.info(f"geo-download {acc}: LLM keep {name} "
+                            f"({v.get('sample_type', '')}: {v.get('reason', '')})")
+            else:
+                # Classify only — DO NOT delete here. The caller commits deletion only
+                # after the keep-none safety check passes (else we'd lose data on a
+                # bad LLM response that we then revert).
+                reason = (v or {}).get("reason", "not selected by LLM")
+                stype = (v or {}).get("sample_type", "")
+                discarded.append({"name": name, "local_path": local_path,
+                                  "sample_type": stype, "reason": reason,
+                                  "md5": _md5_file(local_path), "source_url": r.get("url")})
+                logger.info(f"geo-download {acc}: LLM discard {name} ({stype}: {reason})")
+
+        reasoning = (verdict.get("reasoning") or "").replace("\n", " ")[:200]
+        note = (f"LLM selected {len(kept)}/{len(candidates)} file(s)"
+                + (f": {reasoning}" if reasoning else ""))
+        return kept, discarded, note
+
+    @staticmethod
+    def _target_sample_summary(sm: Optional[pd.DataFrame]) -> str:
+        """One-line summary of the LLM-selected 'download' sample set for the prompt."""
+        if sm is None or sm.empty or "gsm" not in sm.columns:
+            return "(sample_metadata unavailable)"
+        base = {"gsm", "source_name", "molecule", "group", "cancer"}
+        tid_cols = [c for c in sm.columns if c not in base and len(str(c)) == 8]
+        if not tid_cols:
+            return f"{len(sm)} sample(s) (no per-task download column)"
+        col = tid_cols[-1]
+        dl = sm[sm[col] == "download"]
+        if dl.empty:
+            return f"0 samples marked download (col={col})"
+        parts = [f"{len(dl)} sample(s) marked download"]
+        if "source_name" in dl.columns:
+            dist = dl["source_name"].astype(str).value_counts().head(5)
+            parts.append("source_name: " + ", ".join(f"{k}={v}" for k, v in dist.items()))
+        if "group" in dl.columns:
+            gdist = dl["group"].astype(str).value_counts().head(5)
+            parts.append("group: " + ", ".join(f"{k}={v}" for k, v in gdist.items()))
+        return "; ".join(parts)
+
+    # ------------------------------------------------------------------ #
 
     @staticmethod
     def _result(accession: str, files_downloaded: List[Dict], files_failed_qc: List[Dict],
-                outcome_final: str, flags: str, notes: str, subset_path: Optional[str]) -> Dict[str, Any]:
+                outcome_final: str, flags: str, notes: str, subset_path: Optional[str],
+                files_discarded: Optional[List[Dict]] = None) -> Dict[str, Any]:
         return {
             "accession": accession,
             "files_downloaded": files_downloaded,
             "files_failed_qc": files_failed_qc,
+            "files_discarded": files_discarded or [],
             "outcome_final": outcome_final,
             "flags": flags,
             "subset_path": subset_path,
@@ -316,6 +572,105 @@ def _open_maybe_gz(path: str):
     import gzip
     return gzip.open(path, "rt", encoding="utf-8", errors="replace") \
         if path.endswith(".gz") else open(path, "rt", encoding="utf-8", errors="replace")
+
+
+def _md5_file(path: str, chunk: int = 1 << 20) -> Optional[str]:
+    """Stream-md5 a file; returns None on error (best-effort provenance)."""
+    try:
+        h = hashlib.md5()
+        with open(path, "rb") as f:
+            for block in iter(lambda: f.read(chunk), b""):
+                h.update(block)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+def _delete_file(path: Optional[str], acc: str, name: str) -> None:
+    """Best-effort delete; logs a warning on failure (never raises)."""
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except OSError as e:
+        logger.warning(f"geo-download {acc}: could not delete {name}: {e}")
+
+
+def _read_head_text(path: Optional[str], max_lines: int = 10,
+                    max_bytes: int = 1 << 20) -> str:
+    """
+    Decompress (gzip-tolerant) the head of a local file and return the first
+    max_lines non-empty lines (truncated to ~2 KB) as plain text — for LLM context.
+    """
+    if not path:
+        return "(no file)"
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(max_bytes)
+        from skills.geo_filter.file_inspect import _decompress_head
+        text = _decompress_head(raw)
+    except Exception as e:
+        return f"(could not read head: {e})"
+    lines = [ln for ln in text.splitlines() if ln.strip()][:max_lines]
+    out = "\n".join(lines)
+    return out[:2048] if out else "(empty)"
+
+
+def _strip_fences(raw: str) -> str:
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```[a-zA-Z]*\n?", "", raw)
+        raw = re.sub(r"\n?```$", "", raw)
+    return raw.strip()
+
+
+def _safe_json(raw: str) -> Dict[str, Any]:
+    """Parse JSON, tolerating leading/trailing text and code fences."""
+    raw = _strip_fences(raw)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start != -1 and end > start:
+            return json.loads(raw[start:end + 1])
+        raise
+
+
+# System prompt for Tier-2 sample-type-aware supplementary file selection.
+_FILE_SELECTION_SYSTEM_PROMPT = """\
+You are a bioinformatics curator selecting which GEO supplementary file(s) to KEEP
+for a DNA-methylation analysis.
+
+For each candidate file you are given its decompressed head (header row + first data
+rows). Decide KEEP vs DROP based on whether the file's COLUMNS are samples of the
+type the user requested (e.g. the query wants plasma/cfDNA → keep plasma-sample
+files; DROP tissue-only files even if they are valid methylation matrices).
+
+Reason from:
+- the requested sample type and the TARGET SAMPLES summary (the sample set already
+  selected for this query — its source_name/group tells you what specimen type is
+  wanted);
+- each file's header: column names often encode submitter codes whose prefix/label
+  indicates specimen (e.g. tissue tumor Tcrc/Tnm vs plasma Pcrc/Pn); use the study
+  design + sample counts to map columns → specimen type;
+- value shape only to reject obvious non-data (a marker list, a differential p-value
+  table with no sample columns). Do NOT reject a file just because values are integer
+  read-counts or a non-0–1 methylation score — those are valid methylation matrices.
+
+If multiple files together comprise the requested cohort (e.g. one file per
+processing batch), KEEP all of them. If unsure whether a file matches, prefer KEEP.
+
+Output ONLY valid JSON:
+{
+  "reasoning": "<one or two sentences>",
+  "files": [
+    {"name": "<exact filename>", "keep": true|false,
+     "sample_type": "plasma|tissue|wbc|cell_line|mixed|unknown",
+     "reason": "<short reason>"}
+  ]
+}
+"""
 
 
 def _dedup_preserve(items: List[str]) -> List[str]:
