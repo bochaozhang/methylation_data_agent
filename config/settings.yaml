@@ -41,12 +41,16 @@ orchestrator:
   version: v1
 
   # --- v2 convergence guards (ignored by v1) ---
+  # Max search_papers calls per run. This is the important one: each search runs
+  # the whole Stage 1/2 pipeline (~6 LLM calls), and an unguarded loop re-ran it
+  # 12x for identical results. Capped by count, not query text, because the model
+  # rewords its query each iteration and so slips past any text-keyed cache.
+  max_searches: 2
   # Total tool calls allowed per run. Once hit, tools refuse to execute and tell
-  # the LLM to produce its final answer. Primary stop; keep below the number of
-  # rounds recursion_limit permits so it trips first.
-  max_tool_calls: 12
-  # LangGraph step cap (default 25). A ReAct round costs 2 steps, so 25 ≈ 12
-  # rounds. Hard backstop if max_tool_calls somehow doesn't trip.
+  # the LLM to answer. MUST stay well below the rounds recursion_limit permits
+  # (25 steps ≈ 12 rounds) or the graph dies of recursion before this ever fires.
+  max_tool_calls: 8
+  # LangGraph step cap. Hard backstop only; the two limits above should trip first.
   recursion_limit: 25
 
 registry:

@@ -97,16 +97,41 @@ Guidance:
     concise natural-language summary of what you found, evaluated, and wrote."""
 
 
-# Convergence guards. A real run let the ReAct loop call search_papers ~10x with
-# the same query: LangGraph's default recursion_limit is 25 steps (~12 tool rounds)
-# and nothing stopped it earlier. That burst also tripped NCBI's rate limiter.
-_DEFAULT_MAX_TOOL_CALLS = 12
+# Convergence guards, tuned from an observed 12-round runaway. A ReAct round costs
+# 2 graph steps, so recursion_limit=25 permits ~12 rounds; max_tool_calls must sit
+# well below that or the graph dies of recursion before the budget ever trips (which
+# is exactly what happened at 12/25 — refused_calls stayed 0). max_searches is the
+# real workhorse: search_papers is the expensive tool (~6 LLM calls per invocation).
+_DEFAULT_MAX_TOOL_CALLS = 8
+_DEFAULT_MAX_SEARCHES = 2
 _DEFAULT_RECURSION_LIMIT = 25
 
 _BUDGET_MSG = (
     "Tool-call budget for this run is exhausted. Do not call any more tools — "
     "reply now with your final summary based on what you already have."
 )
+
+# Fields the orchestrator LLM actually needs to decide what to do next. Long
+# free-text fields (reason, review_report, normal_control_description) are
+# deliberately omitted — they are preserved in full in run_trace["papers"].
+_PAPER_DIGEST_FIELDS = (
+    "pmid", "title", "cancer_type", "sample_type", "technology",
+    "dataset_ids", "excluded_reference_datasets", "sample_size_case",
+    "sample_size_control", "data_availability", "confidence_level",
+    "needs_human_review", "source_basis",
+)
+
+
+def _summarize_paper(paper: Dict[str, Any]) -> Dict[str, Any]:
+    """Compact per-paper digest for the agent's context (see search_papers)."""
+    digest = {k: paper.get(k) for k in _PAPER_DIGEST_FIELDS if paper.get(k) is not None}
+    metrics = paper.get("performance_metrics") or {}
+    aucs = {k: v for k, v in metrics.items() if v is not None}
+    if aucs:
+        digest["performance_metrics"] = aucs
+    if paper.get("title"):
+        digest["title"] = str(paper["title"])[:160]
+    return digest
 
 
 def _normalize_query(query: str) -> str:
@@ -141,22 +166,25 @@ def build_tools(config: Dict[str, Any], registry: Registry, llm: BaseChatModel):
     geo_client = GEOClient(api_key=ncbi_key or None, proxy=ncbi_proxy or None)
 
     review_enabled = config.get("review", {}).get("enabled", True)
-    max_tool_calls = int(
-        config.get("orchestrator", {}).get("max_tool_calls", _DEFAULT_MAX_TOOL_CALLS)
-    )
+    orch_cfg = config.get("orchestrator", {})
+    max_tool_calls = int(orch_cfg.get("max_tool_calls", _DEFAULT_MAX_TOOL_CALLS))
+    max_searches = int(orch_cfg.get("max_searches", _DEFAULT_MAX_SEARCHES))
 
     run_trace: Dict[str, Any] = {
         "papers": [],
         "evaluations": [],
         "registry_writes": [],
         "_geo_meta_cache": {},
-        # Convergence bookkeeping (see _budget_exhausted / _normalize_query).
-        # Without these the ReAct loop re-ran search_papers with the same query
-        # ~10x in a real run, which also burst NCBI's rate limit.
+        # Convergence bookkeeping. A real run looped search_papers 12x, re-doing
+        # ~72 LLM calls of identical work: query-string caching alone did not help
+        # because the model rewords its query on every iteration, so every lookup
+        # missed. search_calls is therefore capped by COUNT, not by query text.
         "tool_calls": 0,
         "refused_calls": 0,
+        "search_calls": 0,
         "_search_cache": {},
         "_eval_cache": {},
+        "_last_search_payload": None,
         "skipped_duplicate_calls": [],
     }
 
@@ -184,19 +212,44 @@ def build_tools(config: Dict[str, Any], registry: Registry, llm: BaseChatModel):
         Returns a JSON array of structured paper records."""
         if _budget_exhausted("search_papers"):
             return _BUDGET_MSG
+
         key = _normalize_query(query)
         if key in run_trace["_search_cache"]:
-            # Same search already ran this session — hand back the identical
-            # result rather than re-hitting PubMed. Return shape is unchanged.
             logger.info(f"[orchestrator_v2] search_papers cache hit: {key!r}")
             run_trace["skipped_duplicate_calls"].append(f"search_papers({key!r})")
             return run_trace["_search_cache"][key]
 
+        # Count-based cap. Text-keyed caching is not enough on its own: the model
+        # rewords the query every iteration, so each lookup misses and the whole
+        # Stage 1/2 pipeline (~6 LLM calls) re-runs for no new information.
+        if run_trace["search_calls"] >= max_searches:
+            logger.warning(
+                f"[orchestrator_v2] search budget spent ({max_searches}) — "
+                f"refusing a {run_trace['search_calls'] + 1}th search"
+            )
+            run_trace["skipped_duplicate_calls"].append(f"search_papers[over-limit]({key!r})")
+            return (
+                f"Search limit reached ({max_searches} searches per run). You already have "
+                f"{len(run_trace['papers'])} paper record(s) from earlier search_papers calls — "
+                f"do NOT search again. Use what you have: evaluate any GSE accessions with "
+                f"evaluate_geo_dataset_tool, or write your final summary now."
+            )
+
+        run_trace["search_calls"] += 1
         intent = parse_query_rules(query)
         papers = search_and_extract(intent, llm, top_n=5, review=review_enabled)
         run_trace["papers"].extend(papers)
-        payload = json.dumps(papers, ensure_ascii=False, default=str)
+
+        # Hand the model a compact digest instead of the full extraction blob. The
+        # verbose payload (multi-paragraph `reason` + `review_report` per paper) ran
+        # to tens of KB and, repeated across iterations, crowded the context enough
+        # that the model never progressed to evaluate_geo_dataset_tool. Full records
+        # still go to run_trace, so the saved report and registry writes are unchanged.
+        payload = json.dumps(
+            [_summarize_paper(p) for p in papers], ensure_ascii=False, default=str
+        )
         run_trace["_search_cache"][key] = payload
+        run_trace["_last_search_payload"] = payload
         return payload
 
     @tool
@@ -370,6 +423,7 @@ def run_methyagent_v2(
         "registry_writes": run_trace["registry_writes"],
         "tool_calls": run_trace["tool_calls"],
         "refused_calls": run_trace["refused_calls"],
+        "search_calls": run_trace["search_calls"],
         "skipped_duplicate_calls": run_trace["skipped_duplicate_calls"],
         "agent_summary": _final_ai_text(messages),
         "messages": [_message_to_dict(m) for m in messages],

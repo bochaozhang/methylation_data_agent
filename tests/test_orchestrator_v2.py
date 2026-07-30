@@ -190,11 +190,16 @@ def test_convergence_guards() -> None:
     """
     query = "breast cancer plasma cfDNA methylation EPIC early detection"
     max_tool_calls = 4
+    max_searches = 2
 
-    # Never emits a final answer — always requests the same search again.
+    # Never emits a final answer, and REWORDS the query every time — reproducing
+    # the real failure, where text-keyed caching missed on every call because the
+    # model never repeated itself verbatim.
     scripted_responses = [
         AIMessage(content="", tool_calls=[{
-            "name": "search_papers", "args": {"query": query}, "id": f"call_{i}",
+            "name": "search_papers",
+            "args": {"query": f"{query} (attempt {i}, rephrased variant {i})"},
+            "id": f"call_{i}",
         }])
         for i in range(30)
     ]
@@ -212,6 +217,7 @@ def test_convergence_guards() -> None:
         base_config["download"]["output_dir"] = str(Path(tmpdir) / "output")
         base_config["review"] = {"enabled": False}
         base_config.setdefault("orchestrator", {})["max_tool_calls"] = max_tool_calls
+        base_config["orchestrator"]["max_searches"] = max_searches
         base_config["orchestrator"]["recursion_limit"] = 25
         tmp_config_path = str(Path(tmpdir) / "settings.yaml")
         with open(tmp_config_path, "w") as f:
@@ -222,25 +228,29 @@ def test_convergence_guards() -> None:
 
     print("\n=== convergence guard test ===")
     print(f"  real search_and_extract() invocations : {real_search_calls['n']}")
+    print(f"  search_calls (accepted)               : {report['search_calls']}")
     print(f"  tool call attempts                    : {report['tool_calls']}")
     print(f"  refused (over budget)                 : {report['refused_calls']}")
-    print(f"  duplicate calls skipped               : {len(report['skipped_duplicate_calls'])}")
+    print(f"  duplicate/over-limit skipped          : {len(report['skipped_duplicate_calls'])}")
 
-    # The load-bearing guarantee: NCBI/LLM work is done once, no matter how many
-    # times a non-converging model asks for it. This is what stopped the ~10x
-    # request burst that tripped NCBI's rate limiter.
-    assert real_search_calls["n"] == 1, (
-        f"search_and_extract should run once despite repeated tool calls, "
-        f"ran {real_search_calls['n']}x"
+    # The load-bearing guarantee: the expensive Stage 1/2 pipeline runs at most
+    # max_searches times no matter how many times, or how differently, a
+    # non-converging model asks. Reworded queries must NOT buy extra searches —
+    # that is precisely what let a real run burn ~72 LLM calls.
+    assert real_search_calls["n"] <= max_searches, (
+        f"search_and_extract ran {real_search_calls['n']}x, expected <= {max_searches} "
+        f"even with reworded queries"
     )
-    # This scripted model deliberately never stops, so it exhausts the budget and
-    # is then terminated by recursion_limit. A cooperative model stops at _BUDGET_MSG.
+    assert report["search_calls"] <= max_searches
+    # The over-limit path must be recorded, and over-budget calls refused outright.
+    assert any("over-limit" in s for s in report["skipped_duplicate_calls"]), (
+        f"expected an over-limit refusal, got {report['skipped_duplicate_calls']}"
+    )
     assert report["refused_calls"] > 0, "over-budget calls should be refused, not executed"
-    assert len(report["skipped_duplicate_calls"]) >= 1, "repeat searches should be recorded as skipped"
     # GraphRecursionError must be caught, not propagated — partial results survive.
     assert isinstance(report, dict) and report["query"] == query
-    print("  PASS — real work ran once, over-budget calls refused, "
-          "recursion backstop caught, report still returned.")
+    print(f"  PASS — pipeline ran {real_search_calls['n']}x (cap {max_searches}) despite "
+          f"30 reworded requests; over-budget refused; report still returned.")
 
 
 if __name__ == "__main__":
