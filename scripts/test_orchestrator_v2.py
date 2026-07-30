@@ -208,6 +208,7 @@ def test_convergence_guards() -> None:
     real_search_calls = {"n": 0}
 
     def _counting_search(intent, llm_, top_n=5, review=True):
+        # Always returns the SAME PMID, as a reworded repeat search does in practice.
         real_search_calls["n"] += 1
         return [_CANNED_PAPER]
 
@@ -242,6 +243,12 @@ def test_convergence_guards() -> None:
         f"even with reworded queries"
     )
     assert report["search_calls"] <= max_searches
+    # Repeat searches returning the same PMID must not inflate papers_found:
+    # a live run reported 6 papers when only 3 were distinct.
+    assert report["papers_found"] == 1, (
+        f"same PMID returned by {real_search_calls['n']} searches should dedupe to 1, "
+        f"got papers_found={report['papers_found']}"
+    )
     # The over-limit path must be recorded, and over-budget calls refused outright.
     assert any("over-limit" in s for s in report["skipped_duplicate_calls"]), (
         f"expected an over-limit refusal, got {report['skipped_duplicate_calls']}"

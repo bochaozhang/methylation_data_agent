@@ -238,7 +238,22 @@ def build_tools(config: Dict[str, Any], registry: Registry, llm: BaseChatModel):
         run_trace["search_calls"] += 1
         intent = parse_query_rules(query)
         papers = search_and_extract(intent, llm, top_n=5, review=review_enabled)
-        run_trace["papers"].extend(papers)
+
+        # Accumulate by PMID. A reworded second search often re-returns the same
+        # PMIDs (observed: 2 searches -> 6 records but only 3 distinct papers),
+        # which double-counted papers_found and duplicated the saved report.
+        # Deduping also makes a zero-yield extra search visible: search_calls
+        # rises while papers_found does not.
+        # A record with no pmid is kept rather than dropped — it cannot be
+        # deduped, but losing it outright would be worse than a rare duplicate.
+        seen = {p.get("pmid") for p in run_trace["papers"] if p.get("pmid")}
+        new_papers = [p for p in papers if not p.get("pmid") or p["pmid"] not in seen]
+        run_trace["papers"].extend(new_papers)
+        if len(new_papers) < len(papers):
+            logger.info(
+                f"[orchestrator_v2] search {run_trace['search_calls']}: "
+                f"{len(new_papers)}/{len(papers)} papers were new"
+            )
 
         # Hand the model a compact digest instead of the full extraction blob. The
         # verbose payload (multi-paragraph `reason` + `review_report` per paper) ran
