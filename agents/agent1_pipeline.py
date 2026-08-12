@@ -88,6 +88,43 @@ def build_agent1_pipeline(config: Dict[str, Any], registry: Any = None):
     )
     geo_client = GEOClient(api_key=ncbi_key or None, proxy=ncbi_proxy or None)
 
+    # ---- adaptive evidence (path B) setup -------------------------------- #
+    # When filter_dataset returns manual_review, a bounded ReAct agent gathers
+    # more evidence (PMC full text / supplementary tables / GSE->PubMed reverse
+    # lookup / more GSMs) and re-judges. Off unless geo.adaptive_evidence is set.
+    _adaptive_on = bool(config.get("geo", {}).get("adaptive_evidence", False))
+    _adaptive_max_steps = int(config.get("geo", {}).get("adaptive_max_steps", 4))
+    _adaptive_max_fetches = int(config.get("geo", {}).get("adaptive_max_fetches", 6))
+    _lit_holder = [None]  # lazy LiteratureClient
+
+    def _get_lit_client():
+        if _lit_holder[0] is None:
+            from tools.pubmed_tools import LiteratureClient
+            _key = os.environ.get(config.get("geo", {}).get("api_key_env", ""), "") or None
+            _email = os.environ.get("GEO_EMAIL", "") or None
+            _lit_holder[0] = LiteratureClient(ncbi_api_key=_key, geo_email=_email)
+        return _lit_holder[0]
+
+    def _run_adaptive(ds, intent, first_verdict):
+        from skills.adaptive_evidence.agent import run_evidence_agent
+        from skills.base import SkillContext
+        ctx = SkillContext(config=config, geo_client=geo_client,
+                           lit_client=_get_lit_client(), llm=llm,
+                           state={"parsed_intent": intent})
+        try:
+            verdict, trace = run_evidence_agent(
+                llm, ctx, ds, intent, first_verdict,
+                max_steps=_adaptive_max_steps, max_fetches=_adaptive_max_fetches)
+            verdict["_adaptive_trace"] = trace
+            logger.info(f"adaptive_evidence {ds.get('accession')}: "
+                        f"{first_verdict.get('outcome')} -> {verdict.get('outcome')} "
+                        f"(steps={len(trace)})")
+            return verdict
+        except Exception as e:  # never break the pipeline
+            logger.warning(f"adaptive_evidence {ds.get('accession')} failed ({e}); "
+                           f"keeping manual_review")
+            return first_verdict
+
     search_skill = SearchSkill(config)
 
     # ---- parse ----
@@ -147,6 +184,11 @@ def build_agent1_pipeline(config: Dict[str, Any], registry: Any = None):
             except Exception as e:
                 logger.debug(f"agent1 filter abstract {acc}: {e}")
         verdict = filter_dataset(llm, ds, intent, gsm, abstract=abstract)
+
+        # Adaptive evidence gathering (path B): if still manual_review, gather
+        # more evidence and re-judge.
+        if verdict.get("outcome") == "manual_review" and _adaptive_on:
+            verdict = _run_adaptive(ds, intent, verdict)
 
         # Log the verdict (reasoning + outcome + tokens) to the per-query CSV.
         if qlog is not None:

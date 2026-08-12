@@ -313,6 +313,17 @@ class DatabaseAgent:
         # Populated per run() — the active query's logger.
         self._qlog: Optional[QueryLogger] = None
 
+        # Adaptive evidence-gathering (path B): when geo_filter returns
+        # manual_review, a bounded ReAct agent (bind_tools + real fetch tools)
+        # gathers more evidence and re-judges. Off by default; only fires on
+        # manual_review; worst case falls back to the manual_review verdict.
+        self._adaptive_evidence = bool(config.get("geo", {}).get("adaptive_evidence", False))
+        self._adaptive_max_steps = int(config.get("geo", {}).get("adaptive_max_steps", 4))
+        self._adaptive_max_fetches = int(config.get("geo", {}).get("adaptive_max_fetches", 6))
+        if self._adaptive_evidence:
+            logger.info("DatabaseAgent: adaptive_evidence ENABLED (bounded ReAct on manual_review)")
+        self._lit_client = None  # lazy LiteratureClient for the adaptive agent
+
 
     # ------------------------------------------------------------------ #
     #  LangGraph node entry point                                          #
@@ -571,6 +582,55 @@ class DatabaseAgent:
     #  Skill path: spec-driven geo_filter (threshold-free)                #
     # ------------------------------------------------------------------ #
 
+    def _get_lit_client(self):
+        """Lazy LiteratureClient for the adaptive agent (proxy via NCBI_PROXY env)."""
+        if self._lit_client is None:
+            from tools.pubmed_tools import LiteratureClient
+            ncbi_key = os.environ.get(self.config["geo"].get("api_key_env", ""), "") or None
+            geo_email = os.environ.get("GEO_EMAIL", "") or None
+            self._lit_client = LiteratureClient(ncbi_api_key=ncbi_key, geo_email=geo_email)
+        return self._lit_client
+
+    def _run_adaptive_evidence(
+        self,
+        ds: Dict[str, Any],
+        intent: Dict[str, Any],
+        first_verdict: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Run the bounded adaptive evidence agent (path B) on a manual_review verdict.
+        Returns the (possibly updated) verdict. On any failure, returns the original
+        manual_review verdict unchanged (worst case = today's behaviour).
+        """
+        from skills.adaptive_evidence.agent import run_evidence_agent
+        from skills.base import SkillContext
+
+        ctx = SkillContext(
+            config=self.config,
+            geo_client=self.geo_client,
+            lit_client=self._get_lit_client(),
+            llm=self.llm,
+            state={"parsed_intent": intent},
+        )
+        try:
+            verdict, trace = run_evidence_agent(
+                self.llm, ctx, ds, intent, first_verdict,
+                max_steps=self._adaptive_max_steps,
+                max_fetches=self._adaptive_max_fetches,
+            )
+            verdict["_adaptive_trace"] = trace
+            logger.info(
+                f"adaptive_evidence {ds.get('accession')}: "
+                f"{first_verdict.get('outcome')} -> {verdict.get('outcome')} "
+                f"(steps={len(trace)})"
+            )
+            return verdict
+        except Exception as e:  # noqa: BLE001  -- never break the pipeline
+            logger.warning(
+                f"adaptive_evidence {ds.get('accession')} failed ({e}); keeping manual_review"
+            )
+            return first_verdict
+
     def _filter_dataset_skill(
         self,
         ds: Dict[str, Any],
@@ -599,6 +659,10 @@ class DatabaseAgent:
                 logger.debug(f"_filter_dataset_skill({acc}): abstract fetch failed ({e})")
 
         verdict = filter_dataset(self.llm, ds, intent, gsm_details, abstract=abstract)
+        # Adaptive evidence gathering (path B): if still manual_review and enabled,
+        # let the bounded ReAct agent gather more evidence and re-judge.
+        if verdict.get("outcome") == "manual_review" and self._adaptive_evidence:
+            verdict = self._run_adaptive_evidence(ds, intent, verdict)
         # Record this judgment in the per-query CSV log (thread-safe).
         if self._qlog is not None:
             self._qlog.log_dataset(ds, verdict)

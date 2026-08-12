@@ -126,6 +126,7 @@ _SKILL_PACKAGES = [
     "skills.literature",
     "skills.registry_ops",
     "skills.report",
+    "skills.adaptive_evidence",
 ]
 
 

@@ -14,9 +14,9 @@ llm:
   #   OPENAI_BASE_URL=https://open.bigmodel.cn/api/paas/v4
   #   OPENAI_MODEL=glm-4-flash
   # (the factory auto-detects bigmodel.cn and applies correct auth)
-  backend: deepseek
-  # model read from DEEPSEEK_MODEL env (deepseek-chat); temperature auto-selected
-  api_key_env: DEEPSEEK_API_KEY
+  backend: zhipu
+  # model read from ZHIPU_MODEL env (glm-5.2); temperature auto-selected
+  api_key_env: ZHIPU_API_KEY
   max_tokens: 4096
 
 download:
@@ -50,6 +50,15 @@ geo:
   #                     verdict per dataset, following skills/geo_filter/SPEC.md.
   #                     Edit filtering behaviour by editing that SPEC.md.
   skill_filter: true
+
+  # Adaptive evidence gathering (path B): when geo_filter returns manual_review,
+  # a bounded ReAct agent (bind_tools + real fetch tools via to_tool()) gathers
+  # more evidence — PMC full text / supplementary tables / GSE->PubMed reverse
+  # lookup / more GSMs — and re-judges. Off by default; only fires on
+  # manual_review; worst case falls back to the manual_review verdict.
+  adaptive_evidence: true
+  adaptive_max_steps: 4      # hard ReAct loop bound
+  adaptive_max_fetches: 6    # hard cap on evidence fetches per dataset
 
 tcga:
   gdc_api_base: https://api.gdc.cancer.gov
