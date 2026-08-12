@@ -25,7 +25,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
 
 from registry.registry import Registry
-from skills.geo_filter import SPEC_NAME, apply_verdict, filter_dataset
+from skills.geo_filter import SPEC_NAME, apply_verdict, filter_dataset, resolve_gsm_details
 from state.graph_state import MethyAgentState
 from utils.query_logger import QueryLogger
 from tools.geo_tools import GEOClient
@@ -646,8 +646,16 @@ class DatabaseAgent:
         """
         acc = ds.get("accession", "?")
         wanted = intent.get("sample_type", "") or ""
-        gsm_details = self.geo_client.get_representative_gsm_details(
-            acc, wanted_sample_type=wanted
+        # Resolve per-sample GSM metadata via the cheapest complete source
+        # (series_matrix → JSON cache → efetch-all, soft-capped). filter_dataset
+        # then dedups → ONE LLM call, so this path mirrors agent1_pipeline.
+        gsm_details = resolve_gsm_details(
+            self.geo_client,
+            acc,
+            ds,
+            output_dir=self.config.get("download", {}).get("output_dir", "/data"),
+            wanted_sample_type=wanted,
+            max_all_fetch=int(self.config.get("geo", {}).get("all_gsm_max_samples", 600)),
         )
 
         abstract = None

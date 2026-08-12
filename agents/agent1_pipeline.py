@@ -23,7 +23,13 @@ from typing import Any, Callable, Dict, List
 from langgraph.graph import END, START, StateGraph
 
 from agents.tcga_direct import run_tcga_direct
-from skills.geo_filter import SPEC_NAME, apply_verdict, filter_dataset, split_by_outcome
+from skills.geo_filter import (
+    SPEC_NAME,
+    apply_verdict,
+    filter_dataset,
+    resolve_gsm_details,
+    split_by_outcome,
+)
 from skills.geo_filter.file_inspect import verify_a_level_files
 from skills.geo_filter.skill import _OUTCOME_TO_LEGACY
 from skills.geo_search import SearchSkill
@@ -168,14 +174,20 @@ def build_agent1_pipeline(config: Dict[str, Any], registry: Any = None):
         acc = ds.get("accession", "?")
         wanted = intent.get("sample_type", "") or ""
 
-        # Phase 2.5: series_matrix 优先取证（全部样本注释 vs 6 个代表）
-        sm_info = geo_client.fetch_series_matrix_sample_info(acc)
-        if sm_info:
-            gsm = sm_info
-            logger.info(f"agent1 filter {acc}: series_matrix {len(gsm)} samples")
-        else:
-            gsm = geo_client.get_representative_gsm_details(acc, wanted_sample_type=wanted)
-            logger.info(f"agent1 filter {acc}: representative GSMs {len(gsm)} samples")
+        # Resolve per-sample GSM metadata via the cheapest complete source:
+        # series_matrix (all samples, structured) → JSON cache → efetch-all, with a
+        # soft cap that falls back to representative sampling for very large series.
+        # All sources return the same schema; filter_dataset dedups → ONE LLM call,
+        # so Path B (no series_matrix) now mirrors Path A. Cache avoids re-efetching.
+        gsm = resolve_gsm_details(
+            geo_client,
+            acc,
+            ds,
+            output_dir=(output_dir or config.get("download", {}).get("output_dir", "./data")),
+            wanted_sample_type=wanted,
+            max_all_fetch=int(config.get("geo", {}).get("all_gsm_max_samples", 600)),
+        )
+        logger.info(f"agent1 filter {acc}: resolved {len(gsm)} GSM samples")
         abstract = None
         pmids = ds.get("pubmed_ids") or []
         if pmids:

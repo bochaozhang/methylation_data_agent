@@ -60,6 +60,13 @@ geo:
   adaptive_max_steps: 4      # hard ReAct loop bound
   adaptive_max_fetches: 6    # hard cap on evidence fetches per dataset
 
+  # Per-GSM evidence resolution when a dataset has no series_matrix (Path B):
+  # every GSM is efetch'd then deduped before the single filter LLM call (mirrors
+  # the series_matrix path). Above this sample-count cap, fall back to representative
+  # sampling to avoid O(N) efetch on very large series. The efetch-all result is
+  # cached under {output_dir}/{accession}/gsm_metadata_cache.json across runs.
+  all_gsm_max_samples: 600
+
 tcga:
   gdc_api_base: https://api.gdc.cancer.gov
   gdc_token_env: GDC_TOKEN   # optional, only needed for controlled-access data

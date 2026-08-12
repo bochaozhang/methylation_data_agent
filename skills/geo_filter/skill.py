@@ -181,16 +181,77 @@ def _intent_block(intent: Dict[str, Any]) -> str:
     )
 
 
+# ---------------------------------------------------------------------- #
+#  Characteristics noise filter (used by _dedup_gsm_combos)              #
+# ---------------------------------------------------------------------- #
+#
+# GEO !Sample_characteristics columns are free-text and mix biological
+# labels with per-sample noise. If every column participates in the dedup key,
+# any per-patient field (patient id / age / batch / sex / date) defeats collapse
+# — each GSM becomes its own combo and the LLM sees N near-duplicate rows.
+#
+# Policy: drop columns whose name is unambiguously NON-biological, keep
+# everything else (disease state / tissue / sample type / treatment / stage /
+# grade / condition / source / ...). This is a CONSERVATIVE blocklist: it can
+# only fail to collapse (never wrongly merge distinct sample types), because a
+# column is dropped only when its name matches a known-noise token.
+#
+# This single constant is the one place to tune the noise policy. Matched
+# case-insensitively on whole tokens of the column name, e.g.
+#   "patient id" / "Age at diagnosis" / "Batch number" / "Sex"  → dropped
+#   "disease state" / "tissue" / "treatment" / "tumor stage"    → kept
+_NOISE_CHAR_TOKENS = frozenset({
+    # submitter / per-patient identifiers
+    "patient", "subject", "donor", "individual", "id", "code",
+    # demographics
+    "age", "sex", "gender", "race", "ethnicity", "ethnic", "birth",
+    # batch / wet-lab technical
+    "batch", "plate", "well", "lane", "flowcell", "flowcells",
+    "barcode", "index", "indices", "adapter", "primer",
+    # sequencing / library prep
+    "library", "sequencer", "instrument", "machine", "reads", "insert",
+    "concentration", "rin",
+    # dates / time
+    "date", "time", "day", "month", "year", "timestamp",
+    # cell culture
+    "passage",
+})
+
+_CHAR_KEY_TOKEN_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _is_noise_characteristic_key(key: str) -> bool:
+    """True if a characteristics column name is non-biological noise (per the
+    token blocklist above). Whole-token match on the lower-cased name."""
+    if not key:
+        return False
+    tokens = _CHAR_KEY_TOKEN_RE.split(str(key).strip().lower())
+    return any(tok and tok in _NOISE_CHAR_TOKENS for tok in tokens)
+
+
+def _biological_characteristics(ch: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a copy of `ch` with noise columns (patient id / age / batch / sex /
+    dates / sequencing-technical) removed, so dedup collapses biologically
+    identical samples. Conservative — only matches the noise blocklist."""
+    return {k: v for k, v in (ch or {}).items()
+            if not _is_noise_characteristic_key(k)}
+
+
 def _dedup_gsm_combos(gsm_details: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Deduplicate GSM samples by (source_name, molecule, group, characteristics).
+
+    ``characteristics`` is first passed through ``_biological_characteristics``
+    so per-sample noise columns (patient id / age / batch / ...) don't split
+    biologically identical samples into separate combos. Affects BOTH the dedup
+    key and the characteristics shown to the LLM / used for verdict expansion.
 
     Returns a list of unique combos, each with a 'count' field showing how many
     GSMs share this combination. The 'gsm' field shows a representative GSM id.
     """
     seen: Dict[tuple, Dict[str, Any]] = {}
     for g in gsm_details:
-        ch = g.get("characteristics") or {}
+        ch = _biological_characteristics(g.get("characteristics") or {})
         ch_key = tuple(sorted(ch.items()))
         key = (g.get("source_name", ""), g.get("molecule", ""), g.get("group", "unknown"), ch_key)
         if key not in seen:
