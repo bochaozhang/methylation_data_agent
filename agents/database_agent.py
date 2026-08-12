@@ -289,6 +289,9 @@ class DatabaseAgent:
         self.config = config
         self.registry = registry
         self.llm = get_llm(config["llm"])
+        # JSON-mode llm for JSON-expecting invokes (filter_dataset + JSON judges);
+        # self.llm stays plain for the adaptive_evidence agent (bind_tools).
+        self._json_llm = get_llm(config["llm"], json_mode=True)
 
         # Initialize API clients
         ncbi_key = os.environ.get(config["geo"].get("api_key_env", ""), "")
@@ -666,7 +669,7 @@ class DatabaseAgent:
             except Exception as e:
                 logger.debug(f"_filter_dataset_skill({acc}): abstract fetch failed ({e})")
 
-        verdict = filter_dataset(self.llm, ds, intent, gsm_details, abstract=abstract)
+        verdict = filter_dataset(self._json_llm, ds, intent, gsm_details, abstract=abstract)
         # Adaptive evidence gathering (path B): if still manual_review and enabled,
         # let the bounded ReAct agent gather more evidence and re-judge.
         if verdict.get("outcome") == "manual_review" and self._adaptive_evidence:

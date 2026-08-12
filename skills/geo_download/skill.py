@@ -86,7 +86,8 @@ class DownloadSkill:
         # LLM for Tier-2 sample-type-aware file selection (None if unconfigured →
         # the selector falls back to keeping all non-junk files + manual_review).
         try:
-            self.llm = get_llm(config.get("llm") or {})
+            # JSON mode: the file-selection invoke returns {files:[...]} JSON.
+            self.llm = get_llm(config.get("llm") or {}, json_mode=True)
         except Exception as exc:
             logger.warning(f"geo-download: LLM unavailable ({exc}); file selection will keep all non-junk")
             self.llm = None

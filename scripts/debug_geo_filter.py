@@ -79,6 +79,8 @@ def main() -> int:
                     help="Parse the query with the rule-based parser (no LLM call).")
     ap.add_argument("--verbose", "-v", action="store_true",
                     help="Show INFO/DEBUG library logs (default: WARNING only, clean output).")
+    ap.add_argument("--no-json-mode", action="store_true",
+                    help="Disable response_format JSON mode (A/B test the old prompt-only path).")
     args = ap.parse_args()
 
     # Keep the printed output clean unless --verbose.
@@ -87,7 +89,10 @@ def main() -> int:
     config = load_config(args.config)
 
     # ---- LLM ----
-    llm = get_llm(config["llm"])
+    # json_mode mirrors production (agent1_pipeline passes a json_mode llm to
+    # parse_query_with_llm + filter_dataset). --no-json-mode toggles it off for A/B.
+    json_mode = not args.no_json_mode
+    llm = get_llm(config["llm"], json_mode=json_mode)
     model_name = (
         getattr(llm, "model_name", None) or getattr(llm, "model", None) or "unknown"
     )
@@ -100,7 +105,7 @@ def main() -> int:
     # ---- Parse query → intent ----
     print(_hr())
     print(f"QUERY: {args.query}")
-    print(f"MODEL: {model_name}    SPEC: {SPEC_NAME}    PROXY: {ncbi_proxy or '(none)'}")
+    print(f"MODEL: {model_name} [json_mode={json_mode}]    SPEC: {SPEC_NAME}    PROXY: {ncbi_proxy or '(none)'}")
     print(_hr())
     if args.use_rules_parser:
         intent = parse_query_rules(args.query)

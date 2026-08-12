@@ -85,6 +85,10 @@ def build_agent1_pipeline(config: Dict[str, Any], registry: Any = None):
         registry: shared Registry (may also be supplied via state["registry"]).
     """
     llm = get_llm(config["llm"])
+    # JSON-mode llm for the JSON-expecting invokes (parse + filter_dataset);
+    # the plain `llm` stays for the adaptive_evidence agent (bind_tools —
+    # response_format + tools together is unreliable).
+    json_llm = get_llm(config["llm"], json_mode=True)
 
     ncbi_key = os.environ.get(config.get("geo", {}).get("api_key_env", ""), "") or None
     ncbi_proxy = (
@@ -137,7 +141,7 @@ def build_agent1_pipeline(config: Dict[str, Any], registry: Any = None):
     def parse_node(state: Agent1State) -> Dict[str, Any]:
         raw = state.get("raw_query", "")
         try:
-            parsed = parse_query_with_llm(raw, llm)
+            parsed = parse_query_with_llm(raw, json_llm)
         except Exception as e:
             logger.warning(f"agent1 parse: LLM failed ({e}), rules fallback")
             parsed = parse_query_rules(raw)
@@ -195,7 +199,7 @@ def build_agent1_pipeline(config: Dict[str, Any], registry: Any = None):
                 abstract = geo_client.fetch_pubmed_abstract(str(pmids[0]))
             except Exception as e:
                 logger.debug(f"agent1 filter abstract {acc}: {e}")
-        verdict = filter_dataset(llm, ds, intent, gsm, abstract=abstract)
+        verdict = filter_dataset(json_llm, ds, intent, gsm, abstract=abstract)
 
         # Adaptive evidence gathering (path B): if still manual_review, gather
         # more evidence and re-judge.

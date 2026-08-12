@@ -29,7 +29,7 @@ def _is_zhipu_url(url: str) -> bool:
     return "bigmodel.cn" in url
 
 
-def get_llm(config: Dict[str, Any]) -> BaseChatModel:
+def get_llm(config: Dict[str, Any], json_mode: bool = False) -> BaseChatModel:
     """
     Instantiate and return a LangChain chat model based on config.
 
@@ -59,6 +59,13 @@ def get_llm(config: Dict[str, Any]) -> BaseChatModel:
     temperature = config.get("temperature", 0)
     max_tokens = config.get("max_tokens", 4096)
     api_key_env = config.get("api_key_env", "OPENAI_API_KEY")
+
+    # JSON mode: OpenAI-style response_format={"type":"json_object"}. Applied to
+    # ChatOpenAI-based backends below (zhipu-fallback/openai/deepseek/qwen/kimi)
+    # so the model returns parseable JSON first-pass. Ignored by ChatZhipuAI,
+    # anthropic, and ollama (no native json_object mode) — those keep using the
+    # prompt contract + tolerant _safe_json fallback. rf=None means "don't send".
+    rf = {"type": "json_object"} if json_mode else None
 
     # ------------------------------------------------------------------ #
     #  Auto-detect ZhipuAI from OPENAI_BASE_URL                          #
@@ -106,7 +113,7 @@ def get_llm(config: Dict[str, Any]) -> BaseChatModel:
 
         # Fallback: ChatOpenAI with default_headers to force Authorization: Bearer
         from langchain_openai import ChatOpenAI
-        return ChatOpenAI(
+        zk: Dict[str, Any] = dict(
             model=model,
             temperature=temperature,
             max_tokens=max_tokens,
@@ -114,6 +121,11 @@ def get_llm(config: Dict[str, Any]) -> BaseChatModel:
             base_url=_ZHIPU_BASE_URL,
             default_headers={"Authorization": f"Bearer {api_key}"},
         )
+        # response_format routes through model_kwargs (this langchain_openai
+        # version has no direct response_format field). Omit when not in JSON mode.
+        if rf is not None:
+            zk["model_kwargs"] = {"response_format": rf}
+        return ChatOpenAI(**zk)
 
     # ------------------------------------------------------------------ #
     #  OpenAI (or generic compatible endpoint)                            #
@@ -144,6 +156,8 @@ def get_llm(config: Dict[str, Any]) -> BaseChatModel:
         )
         if base_url:
             kwargs["base_url"] = base_url
+        if rf is not None:
+            kwargs["model_kwargs"] = {"response_format": rf}
 
         return ChatOpenAI(**kwargs)
 
@@ -246,6 +260,10 @@ def get_llm(config: Dict[str, Any]) -> BaseChatModel:
             kwargs["model_kwargs"] = {"max_completion_tokens": max_tokens}
         else:
             kwargs["max_tokens"] = max_tokens
+        if rf is not None:
+            _mk = dict(kwargs.get("model_kwargs") or {})
+            _mk["response_format"] = rf
+            kwargs["model_kwargs"] = _mk
 
         return ChatOpenAI(**kwargs)
 
@@ -276,13 +294,16 @@ def get_llm(config: Dict[str, Any]) -> BaseChatModel:
             or "qwen-plus"
         )
 
-        return ChatOpenAI(
+        qk: Dict[str, Any] = dict(
             model=model,
             temperature=temperature,
             max_tokens=max_tokens,
             api_key=api_key,
             base_url=_QWEN_BASE_URL,
         )
+        if rf is not None:
+            qk["model_kwargs"] = {"response_format": rf}
+        return ChatOpenAI(**qk)
 
     # ------------------------------------------------------------------ #
     #  Kimi (Moonshot AI, OpenAI-compatible)                              #
@@ -322,6 +343,10 @@ def get_llm(config: Dict[str, Any]) -> BaseChatModel:
             kwargs["model_kwargs"] = {"max_completion_tokens": max_tokens}
         else:
             kwargs["max_tokens"] = max_tokens
+        if rf is not None:
+            _mk = dict(kwargs.get("model_kwargs") or {})
+            _mk["response_format"] = rf
+            kwargs["model_kwargs"] = _mk
 
         return ChatOpenAI(**kwargs)
 
