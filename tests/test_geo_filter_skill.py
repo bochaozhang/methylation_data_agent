@@ -20,6 +20,11 @@ from skills.geo_filter import (
     split_by_outcome,
 )
 from skills.geo_filter.grouping import classify_group, group_summary
+from skills.geo_filter.skill import (
+    _biological_characteristics,
+    _dedup_gsm_combos,
+    _is_noise_characteristic_key,
+)
 
 
 def make_mock_llm(response_text: str):
@@ -202,6 +207,90 @@ class TestSplitByOutcome(unittest.TestCase):
         self.assertEqual([r["accession"] for r in buckets["lead_list"]], ["B"])
         self.assertEqual([r["accession"] for r in buckets["exclude_list"]], ["C"])
         self.assertEqual([r["accession"] for r in buckets["manual_review_list"]], ["D", "F"])
+
+
+class TestDedupNoiseFilter(unittest.TestCase):
+    """The characteristics noise filter (blocklist) drops patient id / age /
+    batch / sex / date / technical columns so they don't split biologically
+    identical samples. Conservative: only blocklisted names are dropped."""
+
+    def test_noise_keys_recognised(self):
+        for k in ["patient id", "Patient ID", "patient", "subject id", "donor id",
+                  "age", "Age at diagnosis", "sex", "gender", "race", "ethnicity",
+                  "batch", "Batch number", "plate", "well", "lane", "flowcell",
+                  "barcode", "index", "library strategy", "sequencer", "instrument",
+                  "collection date", "date", "timestamp", "passage number", "id"]:
+            self.assertTrue(_is_noise_characteristic_key(k), f"expected noise: {k!r}")
+
+    def test_biological_keys_kept(self):
+        for k in ["disease state", "tissue", "sample type", "treatment", "tumor stage",
+                  "disease stage", "stage", "grade", "condition", "source", "histology",
+                  "sample source", "molecular subtype", "response"]:
+            self.assertFalse(_is_noise_characteristic_key(k), f"expected KEPT: {k!r}")
+
+    def test_noise_does_not_swallow_substrings(self):
+        # "age" must not match inside "stage" / "village"; "id" not inside "valid"
+        self.assertFalse(_is_noise_characteristic_key("disease stage"))
+        self.assertFalse(_is_noise_characteristic_key("tumor stage"))
+        self.assertFalse(_is_noise_characteristic_key("village of origin"))
+
+    def test_biological_characteristics_drops_only_noise(self):
+        ch = {
+            "disease state": "colorectal cancer",
+            "tissue": "plasma",
+            "patient id": "P001",
+            "age": 60,
+            "batch": "B1",
+            "sex": "male",
+            "collection date": "2021-03-04",
+        }
+        out = _biological_characteristics(ch)
+        self.assertEqual(out, {"disease state": "colorectal cancer", "tissue": "plasma"})
+
+    def test_dedup_collapses_samples_differing_only_in_noise(self):
+        # Two plasma CRC samples that differ ONLY in patient id / age / batch.
+        gsm = [
+            {"gsm": "GSM1", "source_name": "plasma", "molecule": "genomic DNA",
+             "group": "plasma_cfdna",
+             "characteristics": {"disease state": "colorectal cancer",
+                                 "patient id": "P001", "age": "60", "batch": "B1"}},
+            {"gsm": "GSM2", "source_name": "plasma", "molecule": "genomic DNA",
+             "group": "plasma_cfdna",
+             "characteristics": {"disease state": "colorectal cancer",
+                                 "patient id": "P002", "age": "55", "batch": "B2"}},
+        ]
+        combos = _dedup_gsm_combos(gsm)
+        self.assertEqual(len(combos), 1)
+        self.assertEqual(combos[0]["count"], 2)
+        self.assertEqual(set(combos[0]["gsm_ids"]), {"GSM1", "GSM2"})
+        # noise columns are gone from the stored characteristics
+        self.assertNotIn("patient id", combos[0]["characteristics"])
+        self.assertEqual(combos[0]["characteristics"], {"disease state": "colorectal cancer"})
+
+    def test_dedup_keeps_distinct_disease_states_separate(self):
+        gsm = [
+            {"gsm": "GSM1", "source_name": "plasma", "molecule": "genomic DNA",
+             "group": "plasma_cfdna",
+             "characteristics": {"disease state": "colorectal cancer", "age": "60"}},
+            {"gsm": "GSM2", "source_name": "plasma", "molecule": "genomic DNA",
+             "group": "plasma_cfdna",
+             "characteristics": {"disease state": "healthy", "age": "55"}},
+        ]
+        combos = _dedup_gsm_combos(gsm)
+        self.assertEqual(len(combos), 2)  # age dropped, but disease state differs
+
+    def test_dedup_keeps_distinct_treatment_separate(self):
+        # Treatment is NOT in the blocklist → must not be merged (over-merge guard).
+        gsm = [
+            {"gsm": "GSM1", "source_name": "tumor", "molecule": "genomic DNA",
+             "group": "tissue",
+             "characteristics": {"disease state": "CRC", "treatment": "drug", "patient id": "P1"}},
+            {"gsm": "GSM2", "source_name": "tumor", "molecule": "genomic DNA",
+             "group": "tissue",
+             "characteristics": {"disease state": "CRC", "treatment": "vehicle", "patient id": "P2"}},
+        ]
+        combos = _dedup_gsm_combos(gsm)
+        self.assertEqual(len(combos), 2)  # treatment differs → separate verdicts
 
 
 if __name__ == "__main__":

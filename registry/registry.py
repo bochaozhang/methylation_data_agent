@@ -396,6 +396,8 @@ class Registry:
         """
         Approve a review item: clear needs_review and set download_status='pending'
         so the download worker picks it up immediately.
+        Does NOT modify sample_metadata.csv — the per-GSM download/not_download
+        verdict from the filter is preserved.
         """
         now = datetime.now(timezone.utc).isoformat()
         with self._lock:

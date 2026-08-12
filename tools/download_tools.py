@@ -277,6 +277,7 @@ def build_geo_download_tasks(
     metadata: Dict[str, Any],
     output_dir: str,
     data_type_filter: Optional[str] = None,
+    download_all_non_raw: bool = False,
 ) -> List[Dict[str, Any]]:
     """
     Build download task list for a GEO dataset.
@@ -285,6 +286,11 @@ def build_geo_download_tasks(
         metadata: GEO series metadata dict from GEOClient.get_series_metadata().
         output_dir: Base output directory.
         data_type_filter: Optional filter ('array', 'sequencing', or None for all).
+        download_all_non_raw: When True, include EVERY supplementary file except
+            RAW data (RAW.tar etc.) — do not gate on the methylation filename
+            keyword filter. The download skill then inspects each file's content
+            and keeps only A-level matrices. Default False keeps the legacy
+            filename-keyword behavior (used by the literature agent).
 
     Returns:
         List of download task dicts.
@@ -299,7 +305,9 @@ def build_geo_download_tasks(
     tasks = []
     for url in supp_files:
         filename = _url_to_filename(url)
-        if _is_methylation_file(filename):
+        keep = (not _is_raw_data_file(filename)) if download_all_non_raw \
+            else _is_methylation_file(filename)
+        if keep:
             tasks.append({
                 "accession": accession,
                 "url": url,
@@ -368,13 +376,23 @@ def _url_to_filename(url: str) -> str:
     return name if name else "download.bin"
 
 
+def _is_raw_data_file(filename: str) -> bool:
+    """RAW data bundle (RAW.tar etc.) — can be 10s of GB, never auto-download."""
+    fname_lower = filename.lower()
+    return "raw" in fname_lower and ("tar" in fname_lower or ".tar" in fname_lower)
+
+
 def _is_methylation_file(filename: str) -> bool:
     """
     Return True if the filename looks like a methylation data file.
     Requires BOTH a methylation-related keyword AND a data file extension
-    to avoid false positives (e.g. README.txt, LICENSE).
+    to avoid false positives (e.g. README.txt, LICENSE, RAW.tar).
+    Explicitly excludes RAW data files (RAW.tar, raw, etc.).
     """
     fname_lower = filename.lower()
+    # Explicit RAW exclusion — RAW.tar can be huge (10s of GB), never auto-download.
+    if _is_raw_data_file(filename):
+        return False
     methylation_keywords = (
         "beta", "methylat", "idat", "bismark", "cpg", "cov",
         "matrix", "mvalue", "m_value",
@@ -382,7 +400,7 @@ def _is_methylation_file(filename: str) -> bool:
     valid_extensions = (
         ".txt.gz", ".csv.gz", ".tsv.gz", ".bed.gz", ".cov.gz",
         ".txt", ".csv", ".tsv", ".bed", ".cov", ".idat",
-        ".zip", ".tar.gz",
+        ".zip",
     )
     has_keyword = any(kw in fname_lower for kw in methylation_keywords)
     has_extension = any(fname_lower.endswith(ext) for ext in valid_extensions)

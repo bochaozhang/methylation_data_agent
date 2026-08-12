@@ -1247,8 +1247,206 @@ class GEOClient:
         except Exception as e:
             logger.debug(f"fetch_file_head({url}) failed: {e}")
             return b""
-    #  Accession verification (LLM hallucination filter)                  #
+
     # ------------------------------------------------------------------ #
+    #  Series matrix sample info (all-sample annotations)                 #
+    # ------------------------------------------------------------------ #
+
+    def fetch_series_matrix_sample_info(self, accession: str) -> Optional[List[Dict]]:
+        """
+        Download a GSE's series_matrix file and extract per-sample annotations
+        (!Sample_* lines). Returns a list of dicts (one per GSM) with keys:
+        gsm, source_name, molecule, characteristics, group, title — matching
+        the format of get_representative_gsm_details().
+
+        Returns None if series_matrix is unavailable (404) or download fails.
+        """
+        from tools.geo_tools import SAMPLE_GROUP_KEYWORDS as _SGK
+
+        prefix = accession[:-3] + "nnn"
+        url = (f"https://ftp.ncbi.nlm.nih.gov/geo/series/{prefix}/{accession}/"
+               f"matrix/{accession}_series_matrix.txt.gz")
+        try:
+            time.sleep(self._rate_limit_delay)
+            resp = self.session.head(url, timeout=10, allow_redirects=True)
+            if resp.status_code != 200:
+                logger.debug(f"fetch_series_matrix_sample_info({accession}): HEAD {resp.status_code}")
+                return None
+        except Exception as e:
+            logger.debug(f"fetch_series_matrix_sample_info({accession}): HEAD failed: {e}")
+            return None
+
+        # Download and decompress
+        try:
+            time.sleep(self._rate_limit_delay)
+            resp = self.session.get(url, timeout=30)
+            resp.raise_for_status()
+            import gzip
+            text = gzip.decompress(resp.content).decode("utf-8", errors="replace")
+        except Exception as e:
+            logger.warning(f"fetch_series_matrix_sample_info({accession}): download failed: {e}")
+            return None
+
+        # Parse !Sample_ lines (tab-delimited, one value per sample)
+        sample_keys = ["gsm", "title", "source_name", "molecule"]
+        per_sample: Dict[str, List[str]] = {k: [] for k in sample_keys}
+        characteristics_dims: List[List[str]] = []  # each dim = list of values per sample
+        char_keys: List[str] = []
+        n_samples = 0
+
+        for line in text.splitlines():
+            if not line.startswith("!Sample_"):
+                continue
+            parts = line.split("\t")
+            tag = parts[0]
+            values = [v.strip().strip('"') for v in parts[1:]]
+
+            if tag == "!Sample_geo_accession":
+                per_sample["gsm"] = values
+                n_samples = len(values)
+            elif tag == "!Sample_title":
+                per_sample["title"] = values
+            elif tag == "!Sample_source_name_ch1":
+                per_sample["source_name"] = values
+            elif tag == "!Sample_molecule_ch1":
+                per_sample["molecule"] = values
+            elif tag == "!Sample_characteristics_ch1":
+                # Extract dimension key from first value: "disease state: xxx" → "disease state"
+                first_val = values[0] if values else ""
+                dim_key = first_val.split(":")[0].strip().lower() if ":" in first_val else f"dim{len(char_keys)}"
+                char_keys.append(dim_key)
+                characteristics_dims.append(values)
+
+        if n_samples == 0:
+            logger.debug(f"fetch_series_matrix_sample_info({accession}): no samples parsed")
+            return None
+
+        # Pad missing fields
+        for k in sample_keys:
+            if len(per_sample[k]) < n_samples:
+                per_sample[k] = per_sample[k] + [""] * (n_samples - len(per_sample[k]))
+
+        # Build per-sample dicts
+        results: List[Dict[str, Any]] = []
+        for i in range(n_samples):
+            chars: Dict[str, str] = {}
+            for dim_idx, dim_key in enumerate(char_keys):
+                if i < len(characteristics_dims[dim_idx]):
+                    raw_val = characteristics_dims[dim_idx][i]
+                    # Remove the "key: " prefix
+                    if ":" in raw_val:
+                        val = raw_val.split(":", 1)[1].strip()
+                    else:
+                        val = raw_val
+                    chars[dim_key] = val
+
+            title = per_sample["title"][i]
+            source = per_sample["source_name"][i]
+            # Classify group (reuse the same keyword logic)
+            title_lower = (title + " " + source).lower()
+            group = "unknown"
+            for gname, keywords in _SGK.items():
+                if any(kw in title_lower for kw in keywords):
+                    group = gname
+                    break
+
+            results.append({
+                "gsm": per_sample["gsm"][i],
+                "source_name": source,
+                "molecule": per_sample["molecule"][i],
+                "characteristics": chars,
+                "group": group,
+            })
+
+        logger.info(f"fetch_series_matrix_sample_info({accession}): "
+                    f"{len(results)} samples from series_matrix")
+        return results
+
+    def series_matrix_has_data(self, accession: str) -> bool:
+        """
+        Check if the series_matrix has actual data rows (not just headers).
+
+        Downloads the series_matrix, counts lines between
+        !series_matrix_table_begin and !series_matrix_table_end.
+        >2 lines means there's at least one data row.
+        """
+        prefix = accession[:-3] + "nnn"
+        url = (f"https://ftp.ncbi.nlm.nih.gov/geo/series/{prefix}/{accession}/"
+               f"matrix/{accession}_series_matrix.txt.gz")
+        try:
+            time.sleep(self._rate_limit_delay)
+            resp = self.session.head(url, timeout=10, allow_redirects=True)
+            if resp.status_code != 200:
+                return False
+            time.sleep(self._rate_limit_delay)
+            resp = self.session.get(url, timeout=30)
+            resp.raise_for_status()
+            import gzip
+            text = gzip.decompress(resp.content).decode("utf-8", errors="replace")
+
+            in_table = False
+            data_rows = 0
+            for line in text.splitlines():
+                if "!series_matrix_table_begin" in line:
+                    in_table = True
+                    continue
+                if "!series_matrix_table_end" in line:
+                    break
+                if in_table:
+                    data_rows += 1
+            has = data_rows > 1  # >1 means at least one data row (header + data)
+            logger.debug(f"series_matrix_has_data({accession}): {data_rows} data rows → {has}")
+            return has
+        except Exception as e:
+            logger.debug(f"series_matrix_has_data({accession}): {e}")
+            return False
+
+    def fetch_gsm_supplementary_file(self, gsm_accession: str) -> Optional[Dict[str, Any]]:
+        """
+        Fetch a GSM sample page and find supplementary file download links.
+
+        Scrapes https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={gsm}
+        for supplementary file URLs (e.g., "supplementary file", "download full table").
+        Returns {gsm, url, filename} or None.
+        """
+        url = f"https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={gsm_accession}"
+        try:
+            time.sleep(self._rate_limit_delay)
+            resp = self.session.get(url, timeout=15)
+            resp.raise_for_status()
+            html = resp.text
+        except Exception as e:
+            logger.debug(f"fetch_gsm_supplementary_file({gsm_accession}): {e}")
+            return None
+
+        try:
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(html, "html.parser")
+
+            # Look for supplementary file links in the GSM page
+            # GEO GSM pages have links like:
+            #   <a href="https://ftp.ncbi.nlm.nih.gov/geo/samples/.../suppl/...">...(file).txt</a>
+            # Or "(format full table)" / "supplementary file" sections
+            for a in soup.find_all("a", href=True):
+                href = a["href"]
+                text = a.get_text().strip().lower()
+                # Match FTP supplementary file links
+                if "ftp.ncbi.nlm.nih.gov" in href and "/suppl/" in href:
+                    filename = href.rsplit("/", 1)[-1] if "/" in href else href
+                    logger.info(f"fetch_gsm_supplementary_file({gsm_accession}): found {filename}")
+                    return {"gsm": gsm_accession, "url": href, "filename": filename}
+                # Match "download full table" style links
+                if "full table" in text or "supplementary" in text:
+                    if href.startswith("http"):
+                        filename = href.rsplit("/", 1)[-1] if "/" in href else gsm_accession
+                        logger.info(f"fetch_gsm_supplementary_file({gsm_accession}): found {filename}")
+                        return {"gsm": gsm_accession, "url": href, "filename": filename}
+
+            logger.debug(f"fetch_gsm_supplementary_file({gsm_accession}): no supp file found")
+            return None
+        except Exception as e:
+            logger.warning(f"fetch_gsm_supplementary_file({gsm_accession}): parse failed: {e}")
+            return None
 
     def verify_accession(self, accession: str) -> bool:
         """

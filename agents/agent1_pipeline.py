@@ -23,7 +23,13 @@ from typing import Any, Callable, Dict, List
 from langgraph.graph import END, START, StateGraph
 
 from agents.tcga_direct import run_tcga_direct
-from skills.geo_filter import SPEC_NAME, apply_verdict, filter_dataset, split_by_outcome
+from skills.geo_filter import (
+    SPEC_NAME,
+    apply_verdict,
+    filter_dataset,
+    resolve_gsm_details,
+    split_by_outcome,
+)
 from skills.geo_filter.file_inspect import verify_a_level_files
 from skills.geo_filter.skill import _OUTCOME_TO_LEGACY
 from skills.geo_search import SearchSkill
@@ -79,6 +85,10 @@ def build_agent1_pipeline(config: Dict[str, Any], registry: Any = None):
         registry: shared Registry (may also be supplied via state["registry"]).
     """
     llm = get_llm(config["llm"])
+    # JSON-mode llm for the JSON-expecting invokes (parse + filter_dataset);
+    # the plain `llm` stays for the adaptive_evidence agent (bind_tools —
+    # response_format + tools together is unreliable).
+    json_llm = get_llm(config["llm"], json_mode=True)
 
     ncbi_key = os.environ.get(config.get("geo", {}).get("api_key_env", ""), "") or None
     ncbi_proxy = (
@@ -88,13 +98,50 @@ def build_agent1_pipeline(config: Dict[str, Any], registry: Any = None):
     )
     geo_client = GEOClient(api_key=ncbi_key or None, proxy=ncbi_proxy or None)
 
+    # ---- adaptive evidence (path B) setup -------------------------------- #
+    # When filter_dataset returns manual_review, a bounded ReAct agent gathers
+    # more evidence (PMC full text / supplementary tables / GSE->PubMed reverse
+    # lookup / more GSMs) and re-judges. Off unless geo.adaptive_evidence is set.
+    _adaptive_on = bool(config.get("geo", {}).get("adaptive_evidence", False))
+    _adaptive_max_steps = int(config.get("geo", {}).get("adaptive_max_steps", 4))
+    _adaptive_max_fetches = int(config.get("geo", {}).get("adaptive_max_fetches", 6))
+    _lit_holder = [None]  # lazy LiteratureClient
+
+    def _get_lit_client():
+        if _lit_holder[0] is None:
+            from tools.pubmed_tools import LiteratureClient
+            _key = os.environ.get(config.get("geo", {}).get("api_key_env", ""), "") or None
+            _email = os.environ.get("GEO_EMAIL", "") or None
+            _lit_holder[0] = LiteratureClient(ncbi_api_key=_key, geo_email=_email)
+        return _lit_holder[0]
+
+    def _run_adaptive(ds, intent, first_verdict):
+        from skills.adaptive_evidence.agent import run_evidence_agent
+        from skills.base import SkillContext
+        ctx = SkillContext(config=config, geo_client=geo_client,
+                           lit_client=_get_lit_client(), llm=llm,
+                           state={"parsed_intent": intent})
+        try:
+            verdict, trace = run_evidence_agent(
+                llm, ctx, ds, intent, first_verdict,
+                max_steps=_adaptive_max_steps, max_fetches=_adaptive_max_fetches)
+            verdict["_adaptive_trace"] = trace
+            logger.info(f"adaptive_evidence {ds.get('accession')}: "
+                        f"{first_verdict.get('outcome')} -> {verdict.get('outcome')} "
+                        f"(steps={len(trace)})")
+            return verdict
+        except Exception as e:  # never break the pipeline
+            logger.warning(f"adaptive_evidence {ds.get('accession')} failed ({e}); "
+                           f"keeping manual_review")
+            return first_verdict
+
     search_skill = SearchSkill(config)
 
     # ---- parse ----
     def parse_node(state: Agent1State) -> Dict[str, Any]:
         raw = state.get("raw_query", "")
         try:
-            parsed = parse_query_with_llm(raw, llm)
+            parsed = parse_query_with_llm(raw, json_llm)
         except Exception as e:
             logger.warning(f"agent1 parse: LLM failed ({e}), rules fallback")
             parsed = parse_query_rules(raw)
@@ -117,6 +164,7 @@ def build_agent1_pipeline(config: Dict[str, Any], registry: Any = None):
                 model_name=model_name,
                 spec_name=SPEC_NAME,
                 output_dir=state.get("output_dir") or config.get("download", {}).get("output_dir", "./data"),
+                task_id=state.get("task_id"),
             )
         return {"parsed_intent": intent, "query_logger": qlog}
 
@@ -125,10 +173,25 @@ def build_agent1_pipeline(config: Dict[str, Any], registry: Any = None):
         return search_skill.run(dict(state))
 
     # ---- geo-filter ----
-    def _filter_one(ds: Dict[str, Any], intent: Dict[str, Any], qlog=None) -> Dict[str, Any]:
+    def _filter_one(ds: Dict[str, Any], intent: Dict[str, Any], qlog=None,
+                    task_id=None, output_dir=None) -> Dict[str, Any]:
         acc = ds.get("accession", "?")
         wanted = intent.get("sample_type", "") or ""
-        gsm = geo_client.get_representative_gsm_details(acc, wanted_sample_type=wanted)
+
+        # Resolve per-sample GSM metadata via the cheapest complete source:
+        # series_matrix (all samples, structured) → JSON cache → efetch-all, with a
+        # soft cap that falls back to representative sampling for very large series.
+        # All sources return the same schema; filter_dataset dedups → ONE LLM call,
+        # so Path B (no series_matrix) now mirrors Path A. Cache avoids re-efetching.
+        gsm = resolve_gsm_details(
+            geo_client,
+            acc,
+            ds,
+            output_dir=(output_dir or config.get("download", {}).get("output_dir", "./data")),
+            wanted_sample_type=wanted,
+            max_all_fetch=int(config.get("geo", {}).get("all_gsm_max_samples", 600)),
+        )
+        logger.info(f"agent1 filter {acc}: resolved {len(gsm)} GSM samples")
         abstract = None
         pmids = ds.get("pubmed_ids") or []
         if pmids:
@@ -136,7 +199,12 @@ def build_agent1_pipeline(config: Dict[str, Any], registry: Any = None):
                 abstract = geo_client.fetch_pubmed_abstract(str(pmids[0]))
             except Exception as e:
                 logger.debug(f"agent1 filter abstract {acc}: {e}")
-        verdict = filter_dataset(llm, ds, intent, gsm, abstract=abstract)
+        verdict = filter_dataset(json_llm, ds, intent, gsm, abstract=abstract)
+
+        # Adaptive evidence gathering (path B): if still manual_review, gather
+        # more evidence and re-judge.
+        if verdict.get("outcome") == "manual_review" and _adaptive_on:
+            verdict = _run_adaptive(ds, intent, verdict)
 
         # Log the verdict (reasoning + outcome + tokens) to the per-query CSV.
         if qlog is not None:
@@ -170,17 +238,23 @@ def build_agent1_pipeline(config: Dict[str, Any], registry: Any = None):
                         verdict["usable"] = usable
                         logger.info(f"agent1 file verify {acc}: downgraded download→lead (no A-level file)")
 
+        # Write sample_metadata.csv with per-GSM download verdict
+        _write_sample_metadata_csv(acc, gsm, verdict, task_id,
+                                    output_dir or config.get("download", {}).get("output_dir", "./data"))
+
         return apply_verdict(ds, verdict)
 
     def filter_node(state: Agent1State) -> Dict[str, Any]:
         intent = state.get("parsed_intent") or {}
         candidates = state.get("candidate_gse_list") or []
         qlog = state.get("query_logger")
+        task_id = state.get("task_id")
+        output_dir = state.get("output_dir")
         if not candidates:
             empty = {"download_list": [], "lead_list": [], "exclude_list": [],
                      "manual_review_list": []}
             return {**empty, "filter_log": "geo-filter: no candidates"}
-        judged = _run_concurrent(_filter_one, candidates, intent, qlog, max_concurrent=3)
+        judged = _run_concurrent(_filter_one, candidates, intent, qlog, task_id, output_dir, max_concurrent=3)
         buckets = split_by_outcome(judged)
         log = (
             f"geo-filter: {len(candidates)} candidates → "
@@ -230,6 +304,73 @@ def build_agent1_pipeline(config: Dict[str, Any], registry: Any = None):
 
 
 # ---------------------------------------------------------------------- #
+#  sample_metadata.csv writer (per-GSM download verdict)                #
+# ---------------------------------------------------------------------- #
+
+def _write_sample_metadata_csv(
+    accession: str,
+    gsm_details: List[Dict[str, Any]],
+    verdict: Dict[str, Any],
+    task_id: Optional[str],
+    output_dir: str,
+) -> None:
+    """
+    Write/update sample_metadata.csv with per-GSM download verdict.
+
+    First time: creates CSV with gsm/source_name/molecule/group/cancer + task_id column.
+    Subsequent queries: only ADDS a new task_id column (meta columns untouched).
+    """
+    import pandas as pd
+    from pathlib import Path
+
+    if not gsm_details or not task_id:
+        return
+
+    col_name = task_id[:8]
+    csv_path = Path(output_dir) / accession / "sample_metadata.csv"
+
+    # Build per-GSM verdict map from gsm_includes
+    inc_map = {}
+    for item in (verdict.get("gsm_includes") or []):
+        inc_map[str(item.get("gsm", ""))] = bool(item.get("include", False))
+
+    try:
+        if csv_path.exists():
+            # CSV already exists → only add task_id column
+            df = pd.read_csv(csv_path)
+            if col_name not in df.columns:
+                df[col_name] = df["gsm"].map(
+                    lambda gsm: "download" if inc_map.get(str(gsm), False) else "not download"
+                )
+                df.to_csv(csv_path, index=False)
+            logger.debug(f"_write_sample_metadata_csv({accession}): added col={col_name}")
+        else:
+            # First time → create with all columns
+            from skills.geo_download.cancer_label import label_gsm_cancer, query_cancer_terms
+            qt = query_cancer_terms({"cancer_type": {"display": "colorectal cancer", "tcga_code": "COAD"}})
+            rows = []
+            for g in gsm_details:
+                rows.append({
+                    "gsm": g.get("gsm", ""),
+                    "source_name": g.get("source_name", ""),
+                    "molecule": g.get("molecule", ""),
+                    "group": g.get("group", "unknown"),
+                    "cancer": label_gsm_cancer(g.get("characteristics") or {}, qt),
+                })
+            df_new = pd.DataFrame(rows)
+            df_new[col_name] = df_new["gsm"].map(
+                lambda gsm: "download" if inc_map.get(str(gsm), False) else "not download"
+            )
+            csv_path.parent.mkdir(parents=True, exist_ok=True)
+            df_new.to_csv(csv_path, index=False)
+            logger.debug(f"_write_sample_metadata_csv({accession}): created {len(rows)} rows, col={col_name}")
+    except Exception as e:
+        logger.warning(f"_write_sample_metadata_csv({accession}): failed: {e}")
+    except Exception as e:
+        logger.warning(f"_write_sample_metadata_csv({accession}): failed: {e}")
+
+
+# ---------------------------------------------------------------------- #
 #  Registry bridge helper                                                 #
 # ---------------------------------------------------------------------- #
 
@@ -242,21 +383,19 @@ def register_state_to_registry(state: Dict[str, Any], reg: Any) -> Dict[str, int
     - exclude_list → skipped.
     Returns counts.
     """
-    n = {"auto_download": 0, "review": 0, "excluded": 0}
-    task_id = state.get("task_id")
-    raw_query = state.get("raw_query")
+    n = {"bucket": 0, "review": 0, "excluded": 0}
 
-    # download + TCGA → pending (download worker auto-downloads, no approval needed).
-    for rec in state.get("download_list") or []:
-        _upsert(reg, rec, "pending", needs_review=False, task_id=task_id, raw_query=raw_query)
-        n["auto_download"] += 1
+    # Bulk "待下载" bucket (needs_review=0): download + lead + TCGA.
+    for rec in (state.get("download_list") or []) + (state.get("lead_list") or []):
+        _upsert(reg, rec, "awaiting_approval", needs_review=False)
+        n["bucket"] += 1
     for rec in state.get("tcga_candidates") or []:
-        _upsert(reg, {**rec, "source": "TCGA"}, "pending", needs_review=False, task_id=task_id, raw_query=raw_query)
-        n["auto_download"] += 1
+        _upsert(reg, {**rec, "source": "TCGA"}, "awaiting_approval", needs_review=False)
+        n["bucket"] += 1
 
-    # Review Queue (needs_review=1): lead + manual_review.
-    for rec in (state.get("lead_list") or []) + (state.get("manual_review_list") or []):
-        _upsert(reg, rec, "awaiting_approval", needs_review=True, task_id=task_id, raw_query=raw_query)
+    # Review Queue (needs_review=1): manual_review.
+    for rec in state.get("manual_review_list") or []:
+        _upsert(reg, rec, "awaiting_approval", needs_review=True)
         n["review"] += 1
 
     n["excluded"] = len(state.get("exclude_list") or [])
@@ -266,14 +405,21 @@ def register_state_to_registry(state: Dict[str, Any], reg: Any) -> Dict[str, int
 
 def _upsert(reg: Any, rec: Dict[str, Any], status: str,
             local_path: str = None, file_size_bytes: int = None,
-            needs_review: bool = False,
-            task_id: str = None, raw_query: str = None) -> None:
+            needs_review: bool = False) -> None:
     """Map a skill record onto Registry.upsert_dataset(...) + status update."""
     acc = rec.get("accession")
     if not acc:
         return
     notes = rec.get("notes") or ""
     no_pubmed = "no_pubmed_link" in notes
+
+    # Compute sample_metadata path for this accession
+    smp = None
+    if output_dir and acc:
+        from pathlib import Path
+        p = Path(output_dir) / acc / "sample_metadata.csv"
+        if p.exists():
+            smp = str(p)
     try:
         reg.upsert_dataset(
             accession=acc,
@@ -289,7 +435,6 @@ def _upsert(reg: Any, rec: Dict[str, Any], status: str,
             paper_pmid=str((rec.get("pubmed_ids") or [None])[0]) if rec.get("pubmed_ids") else None,
             notes=notes,
             no_pubmed_link=no_pubmed,
-            sample_metadata_path=rec.get("sample_metadata_path"),
             usable=rec.get("usable", 1),
             recommended_action=rec.get("recommended_action"),
             reason=rec.get("reason"),
@@ -299,8 +444,6 @@ def _upsert(reg: Any, rec: Dict[str, Any], status: str,
             disease_groups=rec.get("disease_groups"),
             needs_review=needs_review,
             download_status=status,
-            task_id=task_id,
-            raw_query=raw_query,
         )
         # For completed downloads, also set local_path/size.
         if local_path and status in ("done", "failed"):

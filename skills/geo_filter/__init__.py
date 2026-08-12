@@ -8,6 +8,7 @@ from skills.geo_filter.skill import (
     split_by_outcome,
     GeoFilterSkill,
 )
+from skills.geo_filter.gsm_resolve import resolve_gsm_details
 
 __all__ = [
     "SPEC",
@@ -17,4 +18,5 @@ __all__ = [
     "apply_verdict",
     "split_by_outcome",
     "GeoFilterSkill",
+    "resolve_gsm_details",
 ]
