@@ -24,6 +24,9 @@ from skills.geo_filter.skill import (
     _biological_characteristics,
     _dedup_gsm_combos,
     _is_noise_characteristic_key,
+    _safe_json,
+    get_json_parse_stats,
+    reset_json_parse_stats,
 )
 
 
@@ -291,6 +294,47 @@ class TestDedupNoiseFilter(unittest.TestCase):
         ]
         combos = _dedup_gsm_combos(gsm)
         self.assertEqual(len(combos), 2)  # treatment differs → separate verdicts
+
+
+class TestSafeJsonTiers(unittest.TestCase):
+    """_safe_json returns (dict, tier) and bumps the per-tier counter (§3 metric)."""
+
+    def setUp(self):
+        reset_json_parse_stats()
+
+    def test_clean_bare_json(self):
+        out, tier = _safe_json('{"a": 1}')
+        self.assertEqual(out, {"a": 1})
+        self.assertEqual(tier, "clean")
+
+    def test_fenced_json(self):
+        out, tier = _safe_json("```json\n{\"a\": 1}\n```")
+        self.assertEqual(out, {"a": 1})
+        self.assertEqual(tier, "fenced")
+
+    def test_extracted_from_surrounding_text(self):
+        out, tier = _safe_json('here is the verdict: {"a": 1} done')
+        self.assertEqual(out, {"a": 1})
+        self.assertEqual(tier, "extracted")
+
+    def test_failed_raises_and_counts(self):
+        with self.assertRaises(json.JSONDecodeError):
+            _safe_json("not json at all")
+        self.assertEqual(get_json_parse_stats()["failed"], 1)
+
+    def test_counter_tracks_all_tiers(self):
+        _safe_json('{"a": 1}')                              # clean
+        _safe_json("```json\n{\"b\": 2}\n```")              # fenced
+        _safe_json('x {"c": 3} y')                          # extracted
+        try:
+            _safe_json("nope")                              # failed
+        except json.JSONDecodeError:
+            pass
+        stats = get_json_parse_stats()
+        self.assertEqual(stats["clean"], 1)
+        self.assertEqual(stats["fenced"], 1)
+        self.assertEqual(stats["extracted"], 1)
+        self.assertEqual(stats["failed"], 1)
 
 
 if __name__ == "__main__":

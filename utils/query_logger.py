@@ -57,6 +57,7 @@ COLUMNS: List[str] = [
     "total_tokens",
     "cached_tokens",
     "api_model",
+    "json_parse_tier",
 ]
 
 
@@ -136,6 +137,9 @@ class QueryLogger:
                     "total_tokens": usage.get("total_tokens", ""),
                     "cached_tokens": usage.get("cached_tokens", ""),
                     "api_model": usage.get("api_model", ""),
+                    # How much JSON recovery the verdict needed (clean/fenced/
+                    # extracted/failed) — feeds the §3 JSON-parse-rate benchmark.
+                    "json_parse_tier": verdict.get("_json_parse_tier", ""),
                 }
             )
 

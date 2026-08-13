@@ -30,6 +30,7 @@ from skills.geo_filter import (
     resolve_gsm_details,
     split_by_outcome,
 )
+from skills.adaptive_evidence.trace_log import append_trace
 from skills.geo_filter.file_inspect import verify_a_level_files
 from skills.geo_filter.skill import _OUTCOME_TO_LEGACY
 from skills.geo_search import SearchSkill
@@ -204,7 +205,13 @@ def build_agent1_pipeline(config: Dict[str, Any], registry: Any = None):
         # Adaptive evidence gathering (path B): if still manual_review, gather
         # more evidence and re-judge.
         if verdict.get("outcome") == "manual_review" and _adaptive_on:
+            before = verdict.get("outcome")
             verdict = _run_adaptive(ds, intent, verdict)
+            # Persist the trace for the §2 guardrail benchmark.
+            append_trace(
+                output_dir or config.get("download", {}).get("output_dir", "./data"),
+                acc, before, verdict.get("outcome"), verdict.get("_adaptive_trace"),
+            )
 
         # Log the verdict (reasoning + outcome + tokens) to the per-query CSV.
         if qlog is not None:
