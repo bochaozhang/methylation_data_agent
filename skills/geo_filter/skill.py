@@ -22,8 +22,9 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
@@ -345,18 +346,76 @@ def _strip_fences(raw: str) -> str:
     return raw.strip()
 
 
-def _safe_json(raw: str) -> Dict[str, Any]:
-    """Parse JSON, tolerating leading/trailing text and code fences."""
-    raw = _strip_fences(raw)
+# ---------------------------------------------------------------------- #
+#  JSON-parse tier counters (feeds the §3 model-stability benchmark)     #
+# ---------------------------------------------------------------------- #
+# How much recovery _safe_json needed. "clean" = bare JSON parsed first
+# try — what json_mode makes the norm. Tracked per-process (thread-safe).
+_JSON_PARSE_STATS: Dict[str, int] = {"clean": 0, "fenced": 0, "extracted": 0, "failed": 0}
+_JSON_PARSE_LOCK = threading.Lock()
+
+
+def get_json_parse_stats() -> Dict[str, int]:
+    """Snapshot of cumulative geo_filter JSON-parse outcomes for this process.
+
+    clean     = bare JSON, parsed first-try (json_mode target → ~100%).
+    fenced    = needed ```-fence stripping (the old glm default).
+    extracted = needed the first balanced {...} block (most degraded).
+    failed    = unparseable → caller falls back to manual_review.
+    """
+    with _JSON_PARSE_LOCK:
+        return dict(_JSON_PARSE_STATS)
+
+
+def reset_json_parse_stats() -> None:
+    """Zero the counters (e.g. at the start of a benchmark run)."""
+    with _JSON_PARSE_LOCK:
+        for k in _JSON_PARSE_STATS:
+            _JSON_PARSE_STATS[k] = 0
+
+
+def _bump_json_stat(tier: str) -> None:
+    with _JSON_PARSE_LOCK:
+        _JSON_PARSE_STATS[tier] = _JSON_PARSE_STATS.get(tier, 0) + 1
+
+
+def _safe_json(raw: str) -> Tuple[Dict[str, Any], str]:
+    """Tolerant JSON parse → (parsed_dict, tier).
+
+    Tries bare JSON first (tier "clean"), then ```-fence stripping ("fenced"),
+    then the first balanced {...} block ("extracted"); bumps exactly one counter
+    per call. Raises json.JSONDecodeError (tier "failed") only when all tiers
+    miss — the caller (filter_dataset) catches that → conservative manual_review.
+    """
+    stripped = raw.strip()
+    # Tier clean: bare JSON, no fence stripping.
     try:
-        return json.loads(raw)
+        out = json.loads(stripped)
+        _bump_json_stat("clean")
+        return out, "clean"
     except json.JSONDecodeError:
-        # Fall back to the first {...} balanced block.
-        start = raw.find("{")
-        end = raw.rfind("}")
-        if start != -1 and end > start:
-            return json.loads(raw[start:end + 1])
-        raise
+        pass
+    # Tier fenced: strip markdown fences, retry.
+    unfenced = _strip_fences(raw)
+    if unfenced != stripped:
+        try:
+            out = json.loads(unfenced)
+            _bump_json_stat("fenced")
+            return out, "fenced"
+        except json.JSONDecodeError:
+            pass
+    # Tier extracted: first balanced {...} block.
+    start = unfenced.find("{")
+    end = unfenced.rfind("}")
+    if start != -1 and end > start:
+        try:
+            out = json.loads(unfenced[start:end + 1])
+            _bump_json_stat("extracted")
+            return out, "extracted"
+        except json.JSONDecodeError:
+            pass
+    _bump_json_stat("failed")
+    raise json.JSONDecodeError("geo_filter: could not parse JSON", stripped, 0)
 
 
 def filter_dataset(
@@ -409,7 +468,13 @@ def filter_dataset(
             HumanMessage(content=user_msg),
         ])
         raw = response.content if isinstance(response.content, str) else str(response.content)
-        verdict = _safe_json(raw)
+        verdict, json_tier = _safe_json(raw)
+        verdict["_json_parse_tier"] = json_tier
+        if json_tier != "clean":
+            logger.info(
+                f"geo_filter {acc}: JSON parse needed '{json_tier}' recovery "
+                f"(json_mode off, or model wrapped/truncated the JSON)"
+            )
 
         # Capture token usage + API-returned model (for the per-query CSV log).
         usage = _extract_usage(response)
@@ -456,6 +521,7 @@ def filter_dataset(
             "notes": f"filter_error: {e}",
             "reasoning": f"filter_error: {e}",
             "gsm_includes": [],
+            "_json_parse_tier": "failed",
         }
 
 

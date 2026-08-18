@@ -26,6 +26,7 @@ from langchain_core.tools import tool
 
 from registry.registry import Registry
 from skills.geo_filter import SPEC_NAME, apply_verdict, filter_dataset, resolve_gsm_details
+from skills.adaptive_evidence.trace_log import append_trace
 from state.graph_state import MethyAgentState
 from utils.query_logger import QueryLogger
 from tools.geo_tools import GEOClient
@@ -673,7 +674,13 @@ class DatabaseAgent:
         # Adaptive evidence gathering (path B): if still manual_review and enabled,
         # let the bounded ReAct agent gather more evidence and re-judge.
         if verdict.get("outcome") == "manual_review" and self._adaptive_evidence:
+            before = verdict.get("outcome")
             verdict = self._run_adaptive_evidence(ds, intent, verdict)
+            # Persist the trace for the §2 guardrail benchmark.
+            append_trace(
+                self.config.get("download", {}).get("output_dir", "/data"),
+                acc, before, verdict.get("outcome"), verdict.get("_adaptive_trace"),
+            )
         # Record this judgment in the per-query CSV log (thread-safe).
         if self._qlog is not None:
             self._qlog.log_dataset(ds, verdict)

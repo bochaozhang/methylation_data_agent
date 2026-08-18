@@ -82,6 +82,9 @@ report_*.json
 report_*.md
 geo_candidates_*.json
 
+# Local docs (working notes — not tracked)
+docs/
+
 # Cache and temporary
 *.cache
 *.tmp
