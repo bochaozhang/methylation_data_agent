@@ -296,6 +296,19 @@ async def get_query_detail(task_id: str):
     return {"task_id": task_id, "items": items, "total": len(items)}
 
 
+@app.get("/query-datasets/{task_id}/samples")
+async def get_query_samples(task_id: str):
+    """
+    GSM-level view for a task: one row per (accession, gsm) with its per-query
+    verdict ("download" / "not download") and GSM metadata. This is the sample-grain
+    companion to /query-datasets/{task_id} (which is GSE-level).
+    """
+    registry = get_registry()
+    items = registry.get_samples_by_task_id(task_id)
+    counts = registry.get_gsm_counts_by_task(task_id)
+    return {"task_id": task_id, "items": items, "counts": counts, "total": len(items)}
+
+
 @app.get("/review", response_model=ReviewListResponse)
 async def list_pending_review():
     """List all datasets flagged for human review (medium-confidence LLM extractions)."""

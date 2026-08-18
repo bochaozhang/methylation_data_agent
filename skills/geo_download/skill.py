@@ -63,8 +63,9 @@ class DownloadSkill:
 
     name = "geo-download"
 
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: Dict[str, Any], registry=None):
         self.config = config
+        self.registry = registry
         dl = config["download"]
         self.output_dir = dl["output_dir"]
         self.downloader = DownloadEngine(
@@ -99,9 +100,10 @@ class DownloadSkill:
         intent = state.get("parsed_intent") or {}
         output_dir = state.get("output_dir") or self.output_dir
         query_terms = query_cancer_terms(intent)
+        task_id = state.get("task_id")
 
         results = [
-            self.process_dataset(rec, query_terms, output_dir)
+            self.process_dataset(rec, query_terms, output_dir, task_id=task_id)
             for rec in download_list
         ]
         n_ok = sum(1 for r in results if r.get("outcome_final") == "download_success")
@@ -116,18 +118,29 @@ class DownloadSkill:
     # ------------------------------------------------------------------ #
 
     def process_dataset(self, rec: Dict[str, Any], query_terms: List[str],
-                        output_dir: str) -> Dict[str, Any]:
+                        output_dir: str, task_id: Optional[str] = None) -> Dict[str, Any]:
         """
         Download + cancer-subset ONE dataset record. Three-tier fallback:
           1. series_matrix has data → download series_matrix (all samples in one file)
           2. supplementary files exist → download those
           3. neither → scrape GSM pages for per-sample beta tables (only "download" GSMs)
+
+        task_id routes the per-GSM "download" set via the registry (GSM-grain
+        query_sample_map) instead of guessing from a CSV column — essential when a
+        GSE is hit by multiple queries. Falls back to the CSV when task_id is
+        absent or the registry has no rows for this task.
         """
         acc = rec.get("accession", "?")
         flags = rec.get("flags", "")
 
         # Phase 2b: read existing sample_metadata.csv (written by filter).
         sm = _read_sample_metadata(acc, output_dir)
+
+        # Resolve THIS task's "download" GSM set once: registry-first, CSV fallback.
+        # Used by Tier 3 (which GSM pages to scrape) and Tier 2 (target-sample summary
+        # for LLM file selection) so both honour task routing.
+        download_gsms = _read_downloadable_gsms(
+            acc, output_dir, task_id=task_id, registry=self.registry)
 
         # ---- Three-tier download task building ----
         tier_used = "?"
@@ -148,7 +161,7 @@ class DownloadSkill:
             # Tier 3: GSM page scraping (only "download" GSMs)
             else:
                 tier_used = "3(gsm_scrape)"
-                gsm_list = _read_downloadable_gsms(acc, output_dir)
+                gsm_list = download_gsms
                 logger.info(f"geo-download {acc}: Tier 3 (scraping {len(gsm_list)} GSM pages)")
                 tasks = []
                 for gsm_id in gsm_list:
@@ -186,7 +199,7 @@ class DownloadSkill:
         sel_forced: Optional[str] = None
         if tier_used.startswith("2"):
             done, discarded, selection_note, sel_forced = self._select_relevant_files(
-                acc, done, rec, sm)
+                acc, done, rec, sm, download_gsms=download_gsms)
 
         # ---- Cancer subset ----
         subset_path, subset_note, forced_outcome = self._subset_by_cancer(
@@ -313,7 +326,7 @@ class DownloadSkill:
 
     def _select_relevant_files(
         self, acc: str, done_results: List[Dict[str, Any]], rec: Dict[str, Any],
-        sm: Optional[pd.DataFrame],
+        sm: Optional[pd.DataFrame], download_gsms: Optional[List[str]] = None,
     ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], str, Optional[str]]:
         """
         Select which downloaded Tier-2 supp files to keep.
@@ -340,7 +353,8 @@ class DownloadSkill:
             ), "manual_review_file_selection"
 
         try:
-            kept, llm_discarded, llm_note = self._llm_select_files(acc, candidates, rec, sm)
+            kept, llm_discarded, llm_note = self._llm_select_files(
+                acc, candidates, rec, sm, download_gsms=download_gsms)
         except Exception as exc:
             logger.warning(f"geo-download {acc}: LLM file-selection failed ({exc}) → keep all non-junk")
             return candidates, junk, (
@@ -414,13 +428,14 @@ class DownloadSkill:
 
     def _llm_select_files(self, acc: str, candidates: List[Dict[str, Any]],
                           rec: Dict[str, Any], sm: Optional[pd.DataFrame],
+                          download_gsms: Optional[List[str]] = None,
                           ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], str]:
         """
         Ask the LLM which candidate files contain samples matching the query sample
         type. Returns (kept, discarded, note). Raises on parse/error (caller falls back).
         """
         # Target-sample summary from sample_metadata (the LLM-selected "download" set).
-        target_summary = self._target_sample_summary(sm)
+        target_summary = self._target_sample_summary(sm, download_gsms=download_gsms)
 
         file_blocks = []
         name_to_result: Dict[str, Dict[str, Any]] = {}
@@ -485,18 +500,31 @@ class DownloadSkill:
         return kept, discarded, note
 
     @staticmethod
-    def _target_sample_summary(sm: Optional[pd.DataFrame]) -> str:
-        """One-line summary of the LLM-selected 'download' sample set for the prompt."""
+    def _target_sample_summary(sm: Optional[pd.DataFrame],
+                               download_gsms: Optional[List[str]] = None) -> str:
+        """One-line summary of the LLM-selected 'download' sample set for the prompt.
+
+        If download_gsms is provided (task-routed from the registry), summarize exactly
+        those GSMs. Otherwise fall back to the rightmost per-task CSV column — the old
+        behaviour, kept for callers without a task_id.
+        """
         if sm is None or sm.empty or "gsm" not in sm.columns:
             return "(sample_metadata unavailable)"
-        base = {"gsm", "source_name", "molecule", "group", "cancer"}
-        tid_cols = [c for c in sm.columns if c not in base and len(str(c)) == 8]
-        if not tid_cols:
-            return f"{len(sm)} sample(s) (no per-task download column)"
-        col = tid_cols[-1]
-        dl = sm[sm[col] == "download"]
-        if dl.empty:
-            return f"0 samples marked download (col={col})"
+
+        if download_gsms:
+            dl = sm[sm["gsm"].astype(str).isin(set(download_gsms))]
+            if dl.empty:
+                return f"0 samples matched task download set ({len(download_gsms)} ids)"
+        else:
+            base = {"gsm", "source_name", "molecule", "group", "cancer"}
+            tid_cols = [c for c in sm.columns if c not in base and len(str(c)) == 8]
+            if not tid_cols:
+                return f"{len(sm)} sample(s) (no per-task download column)"
+            col = tid_cols[-1]
+            dl = sm[sm[col] == "download"]
+            if dl.empty:
+                return f"0 samples marked download (col={col})"
+
         parts = [f"{len(dl)} sample(s) marked download"]
         if "source_name" in dl.columns:
             dist = dl["source_name"].astype(str).value_counts().head(5)
@@ -696,11 +724,34 @@ def _read_sample_metadata(accession: str, output_dir: str) -> Optional[pd.DataFr
         return None
 
 
-def _read_downloadable_gsms(accession: str, output_dir: str) -> List[str]:
+def _read_downloadable_gsms(accession: str, output_dir: str,
+                            task_id: Optional[str] = None,
+                            registry=None) -> List[str]:
     """
-    Read sample_metadata.csv and return GSM IDs marked "download" in the
-    latest task_id column. Only used in Tier 3 (GSM page scraping).
+    Resolve the GSM IDs marked "download" for this download job.
+
+    task_id + registry → query the GSM-grain query_sample_map (task-routed, correct
+    when a GSE is hit by multiple queries). Otherwise fall back to reading the
+    rightmost per-task column of sample_metadata.csv (the historical behaviour,
+    used when no task_id is available or the registry has no rows yet).
+    Only used in Tier 3 (GSM page scraping).
     """
+    # Registry-first: exact task routing.
+    if task_id and registry is not None:
+        try:
+            gsms = registry.get_downloadable_gsms(task_id, accession)
+            if gsms:
+                logger.info(
+                    f"_read_downloadable_gsms({accession}): {len(gsms)} GSMs via "
+                    f"registry (task={task_id[:8]})")
+                return gsms
+            # Empty registry result → still fall through to CSV (task may predate the
+            # GSM-level registry, i.e. not backfilled). A genuine "0 downloads" verdict
+            # is indistinguishable here, so the CSV is the safer tiebreaker.
+        except Exception as e:
+            logger.debug(f"_read_downloadable_gsms({accession}): registry lookup failed: {e}")
+
+    # CSV fallback: rightmost 8-char task column.
     from pathlib import Path
     csv_path = Path(output_dir) / accession / "sample_metadata.csv"
     if not csv_path.exists():

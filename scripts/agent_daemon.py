@@ -294,7 +294,7 @@ def run_pending_downloads(registry: Registry) -> None:
             from skills.geo_download import DownloadSkill
             from skills.geo_download.cancer_label import query_terms_from_label
             from agents.agent1_pipeline import _run_concurrent
-            skill = DownloadSkill(config)
+            skill = DownloadSkill(config, registry=registry)
         except Exception as exc:
             logger.error(f"[download] DownloadSkill init failed: {exc}")
             geo_pending = []
@@ -332,7 +332,8 @@ def run_pending_downloads(registry: Registry) -> None:
             }
             query_terms = query_terms_from_label(ds.get("cancer_type") or "")
             try:
-                result = skill.process_dataset(rec, query_terms, output_dir)
+                result = skill.process_dataset(rec, query_terms, output_dir,
+                                               task_id=ds.get("task_id"))
             except Exception as exc:
                 logger.error(f"[download] {acc} DownloadSkill failed: {exc}")
                 result = {"outcome_final": "failed", "files_downloaded": [],

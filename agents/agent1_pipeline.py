@@ -249,6 +249,21 @@ def build_agent1_pipeline(config: Dict[str, Any], registry: Any = None):
         _write_sample_metadata_csv(acc, gsm, verdict, task_id,
                                     output_dir or config.get("download", {}).get("output_dir", "./data"))
 
+        # Persist GSM-grain metadata + per-task verdicts to the registry (DB twin
+        # of the CSV task column). This is what lets downloads route by task_id
+        # and the API show per-GSM verdicts. GEO-only by construction (this path
+        # is never hit for TCGA). Best-effort: never let a registry error drop a
+        # filter verdict.
+        if registry is not None:
+            try:
+                registry.upsert_samples(acc, gsm, cancer_map=_gsm_cancer_map(intent, gsm))
+                registry.record_gsm_verdicts(
+                    task_id, acc, verdict.get("gsm_includes") or [],
+                    raw_query=intent.get("raw_query"),
+                )
+            except Exception as e:
+                logger.warning(f"agent1 filter {acc}: GSM registry write failed: {e}")
+
         return apply_verdict(ds, verdict)
 
     def filter_node(state: Agent1State) -> Dict[str, Any]:
@@ -375,6 +390,25 @@ def _write_sample_metadata_csv(
         logger.warning(f"_write_sample_metadata_csv({accession}): failed: {e}")
     except Exception as e:
         logger.warning(f"_write_sample_metadata_csv({accession}): failed: {e}")
+
+
+def _gsm_cancer_map(intent: Dict[str, Any], gsm_details: List[Dict[str, Any]]) -> Dict[str, str]:
+    """
+    Build {gsm_id: cancer_label} for a query using the SAME labeling the download
+    skill uses (skills/geo_download/cancer_label.py), so the registry's samples
+    column and the download subsetting agree. Labels are query-relative:
+    query_cancer / control / unclear.
+    """
+    try:
+        from skills.geo_download.cancer_label import label_gsm_cancer, query_cancer_terms
+        qt = query_cancer_terms(intent)
+        return {
+            str(g.get("gsm", "")): label_gsm_cancer(g.get("characteristics") or {}, qt)
+            for g in gsm_details
+            if g.get("gsm")
+        }
+    except Exception:
+        return {}
 
 
 # ---------------------------------------------------------------------- #

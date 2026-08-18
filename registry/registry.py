@@ -12,6 +12,10 @@ Tables:
   download_log          - Append-only event log for each accession
   llm_extraction_cache  - DOI-keyed cache for LLM extraction results
   task_queue            - Task queue for agent daemon polling
+  samples               - One row per (accession, gsm); GSM-grain metadata
+                          (joint GSE+GSM primary key, mirrors sample_metadata.csv)
+  query_sample_map      - task_id ↔ (accession, gsm) many-to-many with per-cell
+                          verdict; the DB twin of a sample_metadata.csv task column
 """
 import hashlib
 import json
@@ -154,6 +158,7 @@ class Registry:
         # (indexes on new columns will fail if the column doesn't exist yet)
         self._migrate_schema()
         self._ensure_query_dataset_map()
+        self._ensure_sample_tables()
 
         # Step 3: Create indexes (safe after migration ensures columns exist)
         with self._get_conn() as conn:
@@ -182,6 +187,61 @@ class Registry:
                     created_at TEXT,
                     PRIMARY KEY (task_id, accession)
                 )
+                """
+            )
+
+    def _ensure_sample_tables(self):
+        """
+        Create the GSM-level tables if they don't exist.
+
+        These give the registry a sample-grain model that mirrors
+        data/{GSE}/sample_metadata.csv, so a query's task_id can map to
+        individual GSMs (many-to-many) instead of only to the GSE.
+
+          samples          - one row per (accession, gsm); the fixed columns of
+                             sample_metadata.csv + a round-trippable characteristics
+                             JSON. PRIMARY KEY (accession, gsm) — i.e. GSE and GSM
+                             jointly, as the unit of final judgment.
+          query_sample_map - one row per (task_id, accession, gsm) with a per-cell
+                             verdict ("download" / "not download"). The DB twin of a
+                             sample_metadata.csv task column; queryable and routable.
+                             NOTE: GEO-only by construction — TCGA (keyed by cancer
+                             type, no GSM concept) never writes here.
+        """
+        with self._get_conn() as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS samples (
+                    accession          TEXT NOT NULL,
+                    gsm                TEXT NOT NULL,
+                    source_name        TEXT,
+                    molecule           TEXT,
+                    sample_group       TEXT,
+                    cancer             TEXT,
+                    characteristics_json TEXT,
+                    created_at         TEXT NOT NULL,
+                    updated_at         TEXT NOT NULL,
+                    PRIMARY KEY (accession, gsm),
+                    FOREIGN KEY (accession) REFERENCES datasets(accession)
+                );
+                CREATE INDEX IF NOT EXISTS idx_samples_accession
+                    ON samples(accession);
+
+                CREATE TABLE IF NOT EXISTS query_sample_map (
+                    task_id     TEXT NOT NULL,
+                    accession   TEXT NOT NULL,
+                    gsm         TEXT NOT NULL,
+                    verdict     TEXT NOT NULL,
+                    reason      TEXT,
+                    raw_query   TEXT,
+                    created_at  TEXT NOT NULL,
+                    PRIMARY KEY (task_id, accession, gsm),
+                    FOREIGN KEY (accession, gsm) REFERENCES samples(accession, gsm)
+                );
+                CREATE INDEX IF NOT EXISTS idx_qsm_task
+                    ON query_sample_map(task_id);
+                CREATE INDEX IF NOT EXISTS idx_qsm_download
+                    ON query_sample_map(task_id, verdict);
                 """
             )
 
@@ -608,7 +668,12 @@ class Registry:
 
     def add_query_dataset(self, task_id: str, accession: str,
                           raw_query: str = None) -> None:
-        """Insert a query→dataset mapping (many-to-many). Ignores duplicates."""
+        """Insert a query→dataset mapping (many-to-many). Ignores duplicates.
+
+        Note: query_dataset_map is GSE-grain and soft-deprecated in favour of the
+        GSM-grain query_sample_map (see the GSM-level section below). Kept because
+        it is cheap to maintain and still feeds the GSE-level summary views.
+        """
         import datetime as _dt
         now = _dt.datetime.now(_dt.timezone.utc).isoformat()
         with self._lock:
@@ -620,6 +685,203 @@ class Registry:
                     """,
                     (task_id, accession, raw_query, now),
                 )
+
+    # ------------------------------------------------------------------ #
+    #  GSM-level (samples + query_sample_map)                             #
+    #                                                                     #
+    #  Mirrors data/{GSE}/sample_metadata.csv at sample grain so a query  #
+    #  (task_id) maps to individual GSMs many-to-many, and the download    #
+    #  worker can route "which GSMs does THIS task want" instead of        #
+    #  guessing from a CSV column. GEO-only — TCGA never writes here.      #
+    # ------------------------------------------------------------------ #
+
+    def upsert_samples(
+        self,
+        accession: str,
+        gsm_details: List[Dict[str, Any]],
+        cancer_map: Optional[Dict[str, str]] = None,
+    ) -> int:
+        """
+        Upsert per-GSM rows into `samples` (one row per GSM in this GSE).
+
+        Args:
+            accession: GSE accession (e.g. "GSE124600").
+            gsm_details: list of dicts from resolve_gsm_details(); each carries
+                gsm, source_name, molecule, group, characteristics (dict). The
+                `characteristics` dict is stored as JSON so it round-trips exactly
+                (unlike the flat CSV — see gsm_resolve.py:20-24).
+            cancer_map: optional {gsm_id: cancer_label} for the query-relative
+                cancer column (query_cancer/control/unclear). Passed by the caller
+                (it has query context); None leaves existing/NULL values untouched.
+
+        Returns:
+            Number of rows written.
+        """
+        if not gsm_details:
+            return 0
+        now = datetime.now(timezone.utc).isoformat()
+        rows = []
+        for g in gsm_details:
+            gsm_id = str(g.get("gsm", "")).strip()
+            if not gsm_id:
+                continue
+            chars = g.get("characteristics")
+            cancer = (cancer_map or {}).get(gsm_id)
+            rows.append((
+                accession, gsm_id,
+                g.get("source_name"),
+                g.get("molecule"),
+                g.get("group"),
+                cancer,
+                json.dumps(chars) if isinstance(chars, dict) else None,
+                now, now,
+            ))
+        if not rows:
+            return 0
+        with self._lock:
+            with self._get_conn() as conn:
+                conn.executemany(
+                    """
+                    INSERT INTO samples (
+                        accession, gsm, source_name, molecule, sample_group,
+                        cancer, characteristics_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(accession, gsm) DO UPDATE SET
+                        source_name        = COALESCE(excluded.source_name, samples.source_name),
+                        molecule           = COALESCE(excluded.molecule, samples.molecule),
+                        sample_group       = COALESCE(excluded.sample_group, samples.sample_group),
+                        cancer             = COALESCE(excluded.cancer, samples.cancer),
+                        characteristics_json = COALESCE(excluded.characteristics_json, samples.characteristics_json),
+                        updated_at         = excluded.updated_at
+                    """,
+                    rows,
+                )
+        return len(rows)
+
+    def record_gsm_verdicts(
+        self,
+        task_id: str,
+        accession: str,
+        gsm_includes: List[Dict[str, Any]],
+        raw_query: Optional[str] = None,
+    ) -> int:
+        """
+        Persist per-GSM download verdicts for one (task_id, accession) into
+        query_sample_map — the DB twin of a sample_metadata.csv task column.
+
+        Args:
+            task_id: the query's task id.
+            accession: GSE accession.
+            gsm_includes: normalized verdict list of {gsm, include(bool), reason}
+                (shape produced by skills/geo_filter/skill.py:_normalise_verdict).
+                include=True  -> verdict "download"
+                include=False -> verdict "not download" (reason kept if present)
+            raw_query: optional original query string.
+
+        Returns:
+            Number of verdict rows written.
+
+        INSERT OR REPLACE semantics: re-running the same task updates its cells;
+        a different task_id adds fresh rows — true many-to-many at GSM grain.
+        """
+        if not task_id or not gsm_includes:
+            return 0
+        now = datetime.now(timezone.utc).isoformat()
+        rows = []
+        for item in gsm_includes:
+            gsm_id = str(item.get("gsm", "")).strip()
+            if not gsm_id:
+                continue
+            include = bool(item.get("include", False))
+            rows.append((
+                task_id, accession, gsm_id,
+                "download" if include else "not download",
+                item.get("reason") if not include else None,
+                raw_query, now,
+            ))
+        if not rows:
+            return 0
+        with self._lock:
+            with self._get_conn() as conn:
+                conn.executemany(
+                    """
+                    INSERT OR REPLACE INTO query_sample_map
+                        (task_id, accession, gsm, verdict, reason, raw_query, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    rows,
+                )
+        return len(rows)
+
+    def get_downloadable_gsms(self, task_id: str, accession: str) -> List[str]:
+        """
+        Return the GSMs marked "download" for (task_id, accession).
+
+        This is the task-routed replacement for reading the rightmost task column
+        of sample_metadata.csv. Empty list ⇒ caller falls back to whole-file
+        download (or the CSV).
+        """
+        if not task_id:
+            return []
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT gsm FROM query_sample_map
+                WHERE task_id = ? AND accession = ? AND verdict = 'download'
+                """,
+                (task_id, accession),
+            ).fetchall()
+            return [r["gsm"] for r in rows]
+
+    def get_samples_by_task_id(self, task_id: str) -> List[Dict]:
+        """
+        GSM-level view for a task: one row per (accession, gsm), joined with
+        samples metadata and the GSE-level datasets row.
+
+        Returns columns: accession, gsm, source_name, molecule, sample_group,
+        cancer, verdict, reason, raw_query, gse_title, download_status,
+        cancer_type, platform, sample_count.
+        """
+        if not task_id:
+            return []
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT m.accession, m.gsm,
+                       s.source_name, s.molecule, s.sample_group, s.cancer,
+                       m.verdict, m.reason, m.raw_query,
+                       d.title        AS gse_title,
+                       d.download_status,
+                       d.cancer_type, d.platform, d.sample_count
+                FROM query_sample_map m
+                LEFT JOIN samples  s ON s.accession = m.accession AND s.gsm = m.gsm
+                LEFT JOIN datasets d ON d.accession = m.accession
+                WHERE m.task_id = ?
+                ORDER BY m.accession, m.verdict DESC, m.gsm
+                """,
+                (task_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_gsm_counts_by_task(self, task_id: str) -> List[Dict]:
+        """Per-accession GSM rollup for a task: total / download / not_download."""
+        if not task_id:
+            return []
+        with self._get_conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT accession,
+                       COUNT(*)                                          AS total_gsm,
+                       SUM(CASE WHEN verdict = 'download'     THEN 1 ELSE 0 END) AS download_gsm,
+                       SUM(CASE WHEN verdict = 'not download' THEN 1 ELSE 0 END) AS not_download_gsm
+                FROM query_sample_map
+                WHERE task_id = ?
+                GROUP BY accession
+                ORDER BY accession
+                """,
+                (task_id,),
+            ).fetchall()
+            return [dict(r) for r in rows]
 
     def get_summary(self) -> Dict:
         """Return a summary dict for the final report."""
