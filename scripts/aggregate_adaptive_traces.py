@@ -139,7 +139,7 @@ def main() -> int:
     else:
         print(f"  adaptive runs        : {total}")
         print(f"  resolution rate      : {resolved}/{total} = {resolved/total:.1%}  "
-              f"(manual_review → download/lead/exclude)")
+              f"(manual_review → download/exclude)")
         print(f"  fallback rate        : {fallback}/{total} = {fallback/total:.1%}  "
               f"(degraded to first_verdict; should be rare)")
         print(f"  steps distribution   : {_dist(steps)}")

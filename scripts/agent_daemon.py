@@ -172,7 +172,7 @@ def run_database_agent(query: str, registry: Registry, task_id: str = None) -> d
 
             dl = state.get("download_results") or []
             tcga = state.get("tcga_results") or []
-            review = (state.get("lead_list") or []) + (state.get("manual_review_list") or [])
+            review = state.get("manual_review_list") or []
             geo_ok = [r.get("accession") for r in dl if r.get("outcome_final") == "download_success"]
             geo_fail = [r.get("accession") for r in dl if r.get("outcome_final") != "download_success"]
             tcga_ok = [r.get("accession") for r in tcga if r.get("outcome_final") == "download_success"]

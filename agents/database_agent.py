@@ -791,11 +791,11 @@ class DatabaseAgent:
 
         keep_list = [
             d for d in judged
-            if d.get("recommended_action") in ("keep", "manual_review", "download", "lead")
+            if d.get("recommended_action") in ("keep", "manual_review", "download")
         ]
         reject_list = [
             d for d in judged
-            if d.get("recommended_action") not in ("keep", "manual_review", "download", "lead")
+            if d.get("recommended_action") not in ("keep", "manual_review", "download")
         ]
         logger.info(
             f"geo_filter (skill): {len(datasets)} total → "

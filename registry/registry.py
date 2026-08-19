@@ -492,9 +492,11 @@ class Registry:
     def confirm_bulk_download(self) -> int:
         """
         Bulk-confirm the "待下载" bucket: move every awaiting_approval dataset
-        with needs_review=0 (download / lead / TCGA / approved manual_review) to
-        'pending' so the daemon downloads them. Untouched: un-reviewed
-        manual_review (needs_review=1) stays in the Review Queue.
+        with needs_review=0 (approved manual_review) to 'pending' so the daemon
+        downloads them. Untouched: un-reviewed manual_review (needs_review=1)
+        stays in the Review Queue. (download / TCGA go straight to pending at
+        registration time — file-format usability is judged post-download by
+        the download skill.)
         Returns the number moved to pending.
         """
         now = datetime.now(timezone.utc).isoformat()

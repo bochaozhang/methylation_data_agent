@@ -45,7 +45,7 @@ class _AccArgs(BaseModel):
 
 
 class _ConcludeArgs(BaseModel):
-    outcome: str = Field(..., description="final outcome: download | lead | exclude | manual_review")
+    outcome: str = Field(..., description="final outcome: download | exclude | manual_review")
     reason: str = Field(..., description="one sentence: what the samples are and why this outcome")
     confirmed_sample_type: str = Field(
         "unknown",

@@ -138,10 +138,10 @@ def test_repeat_blocked():
 def test_budget_exhausted():
     stub = StubLLM([[_tc("fetch_abstract", pmid="111")],
                     [_tc("fetch_more_gsm", accession="GSE999")],  # 2nd fetch -> budget
-                    [_tc("conclude", outcome="lead", reason="limited")]])
+                    [_tc("conclude", outcome="download", reason="usable after evidence")]])
     v, trace = _run(stub, max_fetches=1, max_steps=4)
     assert _events(trace) == ["fetch", "budget_exhausted", "conclude"]
-    assert v["outcome"] == "lead"
+    assert v["outcome"] == "download"
     print("  [4] max_fetches budget -> nudged to conclude                       PASS")
 
 

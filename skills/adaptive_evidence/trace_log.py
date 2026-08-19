@@ -20,7 +20,7 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-_RESOLVED = {"download", "lead", "exclude"}  # decisive outcomes (not manual_review)
+_RESOLVED = {"download", "exclude"}  # decisive outcomes (not manual_review)
 _FALLBACK_EVENTS = {"no_tool_call", "max_steps_exhausted", "agent_error"}
 
 

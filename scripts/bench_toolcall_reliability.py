@@ -99,7 +99,7 @@ def load_scenarios(limit: Optional[int] = None) -> List[Dict[str, Any]]:
     """Load judged rows from the latest query_log CSV as next-action scenarios.
 
     Each scenario carries the dataset context + an `acceptable` action set:
-      resolved (download/lead/exclude) -> {finish}        (must STOP)
+      resolved (download/exclude) -> {finish}        (must STOP)
       manual_review                    -> {finish} ∪ sensible fetches
     (concluding an unresolvable manual_review is legitimate, so finish is always
     acceptable; a fetch is acceptable only if it matches the evidence gap.)
@@ -115,7 +115,7 @@ def load_scenarios(limit: Optional[int] = None) -> List[Dict[str, Any]]:
     scenarios: List[Dict[str, Any]] = []
     for r in rows:
         outcome = (r.get("recommended_action") or "").strip()
-        if outcome not in {"download", "lead", "exclude", "manual_review"}:
+        if outcome not in {"download", "exclude", "manual_review"}:
             continue
         pmid = pmid_map.get((r.get("accession") or "").strip(), "")
         scenarios.append({**r, "_outcome": outcome, "_pmid": pmid,
@@ -135,7 +135,7 @@ def load_scenarios(limit: Optional[int] = None) -> List[Dict[str, Any]]:
 
 
 def _acceptable(row: Dict[str, Any], outcome: str, pmid: str) -> Set[str]:
-    if outcome in {"download", "lead", "exclude"}:
+    if outcome in {"download", "exclude"}:
         return {"finish"}
     # manual_review: concluding is always legit; fetches must match the gap
     acc: Set[str] = {"finish"}
@@ -186,7 +186,7 @@ def _mock_tools() -> List[Any]:
     ctx = _Ctx.make()
 
     class FinishArgs(BaseModel):
-        outcome: str = Field(..., description="final outcome: download|lead|exclude|manual_review")
+        outcome: str = Field(..., description="final outcome: download|exclude|manual_review")
         reason: str = Field("", description="one-sentence final reason")
 
     class PmidArgs(BaseModel):
@@ -202,7 +202,7 @@ def _mock_tools() -> List[Any]:
     class FinishSkill(Skill):
         name = "finish"; description = ("Conclude: stop gathering evidence and emit the final "
                                         "verdict. Call this when the dataset is resolved "
-                                        "(clear download/lead/exclude) or after enough evidence.")
+                                        "(clear download/exclude) or after enough evidence.")
         args_schema = FinishArgs
         def run(self, ctx, outcome: str = "manual_review", reason: str = "") -> str:
             return f"FINISHED: outcome={outcome}; {reason}"
@@ -277,7 +277,7 @@ SYS_COMMON = (
     "the evidence gathered so far, and the current verdict.\n\n"
     "Decide either:\n"
     "  (a) CONCLUDE — the verdict is final. This is correct when the outcome is a clear "
-    "download / lead / exclude (the dataset is resolved on the current evidence).\n"
+    "download / exclude (the dataset is resolved on the current evidence).\n"
     "  (b) FETCH MORE EVIDENCE — only when the outcome is manual_review and a specific "
     "piece of evidence is missing. Available evidence types:\n"
     "     - abstract: the linked PubMed abstract (use when had_abstract=no and a PMID exists)\n"
@@ -314,12 +314,12 @@ SYS_A = SYS_COMMON + (
     "\nRespond with ONLY a JSON object (no markdown, no prose outside JSON):\n"
     '{"next_action": "finish|abstract|pubmed_reverse_lookup|full_text|supplementary_table|more_gsm", '
     '"evidence_gaps": [{"dimension": "...", "note": "..."}], "reason": "one sentence"}\n'
-    "If the outcome is download/lead/exclude, next_action MUST be \"finish\"."
+    "If the outcome is download/exclude, next_action MUST be \"finish\"."
 )
 
 SYS_B = SYS_COMMON + (
     "\nExpress your decision by calling EXACTLY ONE tool now:\n"
-    "- If the outcome is download/lead/exclude, call `finish`.\n"
+    "- If the outcome is download/exclude, call `finish`.\n"
     "- Otherwise call the single most appropriate evidence-fetch tool.\n"
     "After you receive evidence, call `finish` with your final outcome. Do not repeat a tool call."
 )
@@ -415,7 +415,7 @@ def run_mode_b(llm: Any, tools: List[Any], s: Dict[str, Any]) -> Dict[str, Any]:
             # loop exhausted without break -> did not terminate cleanly
             res["terminated"] = False
         # correctness
-        if s["_outcome"] in {"download", "lead", "exclude"}:
+        if s["_outcome"] in {"download", "exclude"}:
             res["correct"] = (res["terminal"] == "finish" and res["terminated"])
         else:  # manual_review
             res["correct"] = called_fetch_acceptable

@@ -4,7 +4,7 @@ Compare benchmark query_log CSVs across LLM × SPEC combos.
 
 Reads all query_*.csv in a directory, groups by (llm_model, SPEC name), and
 produces:
-  ① 四态分布表 (stdout markdown): per combo → download/lead/exclude/manual_review counts + tokens.
+  ① 三态分布表 (stdout markdown): per combo → download/exclude/manual_review counts + tokens.
   ② 逐 GSE 一致性矩阵 (gse_outcome_matrix.csv): rows=GSE, columns=combo, cells=outcome.
   ③ token 汇总 (token_summary.csv): per combo → total/avg/cached tokens.
   ④ 准确率 (accuracy.csv, if --gold): per combo → match rate against gold standard.
@@ -78,18 +78,18 @@ def parse_query_log(path: str) -> Optional[Dict[str, Any]]:
 # ---------------------------------------------------------------------- #
 
 def report_outcome_distribution(logs: List[Dict]) -> None:
-    """① 四态分布表 (markdown)."""
-    print("\n## ① 四态分布\n")
-    print("| combo (LLM + SPEC) | download | lead | exclude | manual_review | total_tokens |")
+    """① 三态分布表 (markdown)."""
+    print("\n## ① 三态分布\n")
+    print("| combo (LLM + SPEC) | download | exclude | manual_review | total_tokens |")
     print("|---|---|---|---|---|---|")
     for log in logs:
-        counts = {"download": 0, "lead": 0, "exclude": 0, "manual_review": 0}
+        counts = {"download": 0, "exclude": 0, "manual_review": 0}
         for r in log["rows"]:
             oc = r["outcome"]
             if oc in counts:
                 counts[oc] += 1
         n = len(log["rows"])
-        print(f"| {log['combo']} | {counts['download']} | {counts['lead']} | "
+        print(f"| {log['combo']} | {counts['download']} | "
               f"{counts['exclude']} | {counts['manual_review']} | {log['total_tokens']} |")
 
 

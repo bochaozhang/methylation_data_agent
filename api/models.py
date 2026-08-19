@@ -96,7 +96,7 @@ class ReviewItemResponse(BaseModel):
     platform: Optional[str] = None
     sample_count: Optional[int] = None
     sample_type: Optional[str] = None
-    outcome: Optional[str] = None  # recommended_action: download/lead/exclude/manual_review
+    outcome: Optional[str] = None  # recommended_action: download/exclude/manual_review
     reason: Optional[str] = None
     paper_doi: Optional[str] = None
     paper_pmid: Optional[str] = None
@@ -168,7 +168,7 @@ class ApprovalItem(BaseModel):
     notes: Optional[str] = None
     sample_metadata_path: Optional[str] = None
     needs_review: bool = False  # True → Review Queue (manual_review); False → bulk 待下载 bucket
-    recommended_action: Optional[str] = None  # filter outcome: download/lead/manual_review/exclude
+    recommended_action: Optional[str] = None  # filter outcome: download/manual_review/exclude
     reason: Optional[str] = None
     created_at: str
 

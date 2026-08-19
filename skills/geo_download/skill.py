@@ -187,17 +187,20 @@ class DownloadSkill:
         dl_results = self.downloader.download_many_sync(tasks) if tasks else []
         done = [r for r in dl_results if r.get("status") == "done"]
 
-        # ---- Tier 2 file selection ----
-        # We downloaded every non-RAW supp file. Now select which to KEEP:
+        # ---- Tier 2/3 file selection ----
+        # We downloaded every non-RAW supp file (Tier 2) or per-GSM supp file
+        # (Tier 3). Now select which to KEEP:
         #   1. junk-filter (demoted inspect_matrix_head) drops clear non-data files
         #      (empty/README, p-value/logFC tables) — NOT a value-range A-level gate.
         #   2. the LLM picks files whose SAMPLE TYPE matches the query (e.g. plasma
         #      cfDNA vs tissue), using the query + the target-sample set + each file's
         #      head. Conservative fallback keeps all non-junk + manual_review.
+        # This is where "keep which data" is decided now that geo-filter no longer
+        # gates on file format (3-state outcome; usability judged post-download).
         discarded: List[Dict[str, Any]] = []
         selection_note = ""
         sel_forced: Optional[str] = None
-        if tier_used.startswith("2"):
+        if tier_used.startswith(("2", "3")):
             done, discarded, selection_note, sel_forced = self._select_relevant_files(
                 acc, done, rec, sm, download_gsms=download_gsms)
 

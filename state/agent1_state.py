@@ -158,7 +158,6 @@ class Agent1State(TypedDict, total=False):
 
     # ---- geo-filter node (four-state) ----
     download_list: List[Dict[str, Any]]
-    lead_list: List[Dict[str, Any]]
     exclude_list: List[Dict[str, Any]]
     manual_review_list: List[Dict[str, Any]]
     filter_log: str

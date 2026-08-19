@@ -51,16 +51,17 @@ Procedure:
 
 Hard rules:
 - Never repeat the same fetch. Call at most a few tools, then conclude.
-- Four outcomes (see SPEC): download / lead / exclude / manual_review.
+- Three outcomes (see SPEC): download / exclude / manual_review. File-format
+  usability is NOT judged here — it is judged after download by geo-download.
 - Apply the SPEC hard gates: cell line / organoid / animal / in-vitro / treated /
-  metastasis-only / non-target-unsplittable / non-methylation -> exclude.
+  metastasis-only / non-target-unsplittable / non-methylation / locked /
+  article-only-in-paper -> exclude.
 - plasma / serum = cfDNA.
 """
 
-_VALID_OUTCOMES = {"download", "lead", "exclude", "manual_review"}
+_VALID_OUTCOMES = {"download", "exclude", "manual_review"}
 _OUTCOME_TO_LEGACY = {
     "download": ("download", "yes"),
-    "lead": ("lead", "partial"),
     "exclude": ("exclude", "no"),
     "manual_review": ("manual_review", "unclear"),
 }

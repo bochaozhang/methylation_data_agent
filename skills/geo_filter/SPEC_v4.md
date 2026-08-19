@@ -1,14 +1,14 @@
-# GEO 数据检索注意事项 v5
+# GEO 数据检索注意事项 v4
 
 适用对象：癌症早筛 AI Scientist 中负责 GEO 数据集可用性判定的 skill（geo_filter）。
 本 skill 只做一件事：判断一个 GSE 数据集是否可用于癌症早筛液体活检方法开发。
 
 ## Scope（做什么 / 不做什么）
 
-- Does: 判定单个 GEO 数据集 → keep / exclude / manual_review。
+- Does: 判定单个 GEO 数据集 → keep / exclude / manual_review / article_only。
 - Does NOT:
   - 检索/构建检索式 → 由 search 层（`config/cancer_synonyms.yaml` + `build_geo_search_string`）负责。
-  - 下载后检查数据是否可用 → 由 download 流程负责。
+  - 下载 → 由 download 流程负责。
   - 跨数据集排序 → 由下游 ranking 负责（本 skill 只判定单个数据集，不排序）。
 - 检索目标是找到“可用于癌症早筛液体活检方法开发的数据”，不是找到所有癌症甲基化相关数据。
 - GEO 是主要数据来源但不是唯一；CFEA、EWAS Data Hub、TCGA/Xena、ArrayExpress/ENA、NGDC/GSA/OMIX、SRA、文章补充表等由其他流程另行检索，不在本 skill 范围。
@@ -24,7 +24,7 @@
 5. 样本类型：是不是请求的样本类型（plasma/血清 = cfDNA）？是否有病例 + 对照？
 6. 证据充分性：GSM 字段不够时，靠关联文章（abstract/Methods/Data availability）确认。
 
-→ 给出 outcome（三态之一），并记录为什么（不能只输出 accession）。
+→ 给出 outcome（四态之一），并记录为什么（不能只输出 accession）。
 
 贯穿上述步骤的核心判断原则：
 
@@ -108,12 +108,13 @@
 结构化 JSON 的 schema 定义在代码（`skills/geo_filter/skill.py` 的 `_OUTPUT_CONTRACT`），本文件不重复。
 语义约定：
 
-- outcome（三态）：
-  - `download`：符合请求。
+- outcome（四态）：
+  - `download`：符合请求 **且** 元数据表明有可下载的 A 级甲基化值矩阵（β/M 值、甲基化比例、配对计数）。
+  - `lead`：相关（癌种/样本类型对）但**无 A 级矩阵**（只有 IDAT / fastq/BAM / marker list / signal intensity），或样本受限；作参考/线索，不自动下载。
   - `exclude`：细胞系/类器官/动物/体外/治疗后/转移灶-only/非目标癌种不可拆/非甲基化。
   - `manual_review`：存疑、GEO 与文章冲突、或无法确认样本类型/对照。
-- `files`：按 GEO summary/页面声明的文件做**元数据级**推断；Tier 1: series_matrix 有数据；Tier 2: series_matrix 为空表但有 RAW 文件以外的supplementary files ；Tier 3： series_matrix 为空表且没有 RAW 文件以外的supplementary file。
-- usable 由 outcome 派生（download=yes / exclude=no / manual_review=unclear）。
+- `files[]`：按 GEO summary/页面声明的文件做**元数据级**推断（Phase 1 不打开文件）；标 `is_A_level`/`download`/`data_form`。`lead_type`/`exclude_reason`/`flags` 按结果填。
+- usable 由 outcome 派生（download=yes / lead=partial / exclude=no / manual_review=unclear）。
 - plasma / 血清样本即 cell-free DNA（cfDNA）。
 - 不要只输出“找到了 GSEXXXX”；必须说明样本是什么、为什么这个 outcome（写在 reason + reasoning）。
 

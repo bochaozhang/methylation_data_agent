@@ -1,10 +1,10 @@
 """
-Tests for the spec-driven geo_filter skill (four-state outcome contract).
+Tests for the spec-driven geo_filter skill (three-state outcome contract).
 
 Covers: SYSTEM_PROMPT loading, structured-verdict parsing (plain + fenced),
 outcome normalisation + legacy-field derivation, error fallback (manual_review),
 apply_verdict field mapping (incl. sample-count correction, notes accumulation,
-available_file_type derived from files[]), and split_by_outcome.
+download_tier normalisation), and split_by_outcome.
 
 LLM is mocked with the same MagicMock pattern used in test_llm_extractor.py.
 """
@@ -95,10 +95,7 @@ class TestFilterDatasetParsing(unittest.TestCase):
             "consistency": "consistent",
             "sample_level_annotation": "yes",
             "technology": "450K",
-            "files": [
-                {"name": "GSE999999_beta_matrix.txt.gz", "is_A_level": True,
-                 "download": True, "data_form": "merged_beta_matrix", "reason": "beta matrix"}
-            ],
+            "download_tier": 2,
             "flags": "",
             "disease_groups": "50 CRC vs 50 healthy",
             "reason": "plasma cfDNA, CRC vs healthy",
@@ -110,11 +107,13 @@ class TestFilterDatasetParsing(unittest.TestCase):
         }
         verdict = filter_dataset(make_mock_llm_json(payload), DS, INTENT, GSM_DETAILS)
         self.assertEqual(verdict["outcome"], "download")
-        # recommended_action now mirrors the true outcome (download/lead/exclude/manual_review)
+        # recommended_action mirrors the true outcome (download/exclude/manual_review)
         self.assertEqual(verdict["recommended_action"], "download")
         self.assertEqual(verdict["usable"], "yes")
         self.assertEqual(len(verdict["gsm_includes"]), 2)
-        self.assertEqual(len(verdict["files"]), 1)
+        self.assertEqual(verdict["download_tier"], 2)
+        # legacy files[] from old prompts is dropped (contract replaced by download_tier)
+        self.assertNotIn("files", verdict)
 
     def test_strips_markdown_fences(self):
         payload = {"outcome": "exclude", "exclude_reason": "cell_line",
@@ -128,6 +127,18 @@ class TestFilterDatasetParsing(unittest.TestCase):
         verdict = filter_dataset(make_mock_llm_json(payload), DS, INTENT, GSM_DETAILS)
         self.assertEqual(verdict["outcome"], "manual_review")
         self.assertEqual(verdict["usable"], "unclear")
+
+    def test_legacy_lead_maps_to_download(self):
+        # "lead" was retired from the contract; old prompts/caches may still emit it.
+        # Defensive normalisation: lead → download (format judged post-download).
+        payload = {"outcome": "lead", "lead_type": "no_A_file",
+                   "reason": "only IDAT files", "gsm_includes": []}
+        verdict = filter_dataset(make_mock_llm_json(payload), DS, INTENT, GSM_DETAILS)
+        self.assertEqual(verdict["outcome"], "download")
+        self.assertEqual(verdict["recommended_action"], "download")
+        self.assertEqual(verdict["usable"], "yes")
+        self.assertIn("legacy lead", verdict["reason"])
+        self.assertNotIn("lead_type", verdict)
 
     def test_error_falls_back_to_manual_review(self):
         llm = MagicMock()
@@ -149,8 +160,7 @@ class TestApplyVerdict(unittest.TestCase):
             "sample_level_annotation": "yes",
             "disease_groups": "CRC vs healthy",
             "consistency": "consistent",
-            "files": [{"name": "beta.txt.gz", "is_A_level": True, "download": True,
-                       "data_form": "merged_beta_matrix", "reason": ""}],
+            "download_tier": 1,
             "flags": "",
             "reason": "ok",
             "notes": "",
@@ -161,26 +171,26 @@ class TestApplyVerdict(unittest.TestCase):
         self.assertEqual(out["usable"], 1)
         self.assertEqual(out["sample_type"], "cfdna")
         self.assertEqual(out["stage_treatment"], "treatment-naive")
-        self.assertEqual(out["available_file_type"], "merged_beta_matrix")
+        self.assertEqual(out["download_tier"], 1)
         self.assertEqual(out["_verdict"], verdict)
 
     def test_exclude_maps_usable_zero(self):
         verdict = {"outcome": "exclude", "recommended_action": "exclude", "usable": "no",
                    "exclude_reason": "cell_line", "reason": "cell line",
-                   "files": [], "gsm_includes": []}
+                   "gsm_includes": []}
         out = apply_verdict(DS, verdict)
         self.assertEqual(out["usable"], 0)
 
     def test_sample_count_corrected_when_drift_large(self):
         verdict = {"outcome": "download", "recommended_action": "keep", "usable": "yes",
-                   "sample_count_in_paper": 150, "files": [], "gsm_includes": []}
+                   "sample_count_in_paper": 150, "gsm_includes": []}
         out = apply_verdict(dict(DS), verdict)
         self.assertEqual(out["sample_count"], 150)
         self.assertIn("sample_count GEO=100 paper=150", out["notes"])
 
     def test_sample_count_kept_when_drift_small(self):
         verdict = {"outcome": "download", "recommended_action": "keep", "usable": "yes",
-                   "sample_count_in_paper": 105, "files": [], "gsm_includes": []}
+                   "sample_count_in_paper": 105, "gsm_includes": []}
         out = apply_verdict(dict(DS), verdict)
         self.assertEqual(out["sample_count"], 100)  # unchanged (5% drift)
 
@@ -189,17 +199,16 @@ class TestApplyVerdict(unittest.TestCase):
         ds["notes"] = "no_pubmed_link"
         verdict = {"outcome": "manual_review", "recommended_action": "manual_review",
                    "usable": "unclear", "notes": "conflicting sample type",
-                   "files": [], "gsm_includes": []}
+                   "gsm_includes": []}
         out = apply_verdict(ds, verdict)
         self.assertIn("no_pubmed_link", out["notes"])
         self.assertIn("conflicting sample type", out["notes"])
 
 
 class TestSplitByOutcome(unittest.TestCase):
-    def test_split_into_four_lists(self):
+    def test_split_into_three_lists(self):
         records = [
             {"accession": "A", "outcome": "download"},
-            {"accession": "B", "outcome": "lead"},
             {"accession": "C", "outcome": "exclude"},
             {"accession": "D", "outcome": "manual_review"},
             {"accession": "E", "outcome": "download"},
@@ -207,9 +216,9 @@ class TestSplitByOutcome(unittest.TestCase):
         ]
         buckets = split_by_outcome(records)
         self.assertEqual([r["accession"] for r in buckets["download_list"]], ["A", "E"])
-        self.assertEqual([r["accession"] for r in buckets["lead_list"]], ["B"])
         self.assertEqual([r["accession"] for r in buckets["exclude_list"]], ["C"])
         self.assertEqual([r["accession"] for r in buckets["manual_review_list"]], ["D", "F"])
+        self.assertNotIn("lead_list", buckets)
 
 
 class TestDedupNoiseFilter(unittest.TestCase):

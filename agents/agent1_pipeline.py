@@ -11,7 +11,7 @@ judgment). This is distinct from orchestrator_v2 (ReAct, separate owner).
 
 Each node wraps a skill / module and returns a state-dict update. The register
 node is the registry bridge: maps the skill-world State (download_results /
-lead_list / manual_review_list / tcga_results) onto the existing SQLite registry
+manual_review_list / tcga_results) onto the existing SQLite registry
 so the Web UI / approval / daemon keep working.
 """
 from __future__ import annotations
@@ -32,7 +32,6 @@ from skills.geo_filter import (
 )
 from skills.adaptive_evidence.trace_log import append_trace
 from skills.geo_filter.file_inspect import verify_a_level_files
-from skills.geo_filter.skill import _OUTCOME_TO_LEGACY
 from skills.geo_search import SearchSkill
 from state.agent1_state import Agent1State, normalize_intent
 from tools.geo_tools import GEOClient
@@ -217,33 +216,22 @@ def build_agent1_pipeline(config: Dict[str, Any], registry: Any = None):
         if qlog is not None:
             qlog.log_dataset(ds, verdict)
 
-        # Phase 2a: file-form A-level preview (核验前置). For download/lead
-        # candidates, inspect the REAL supplementary file heads and override the
-        # LLM's metadata-predicted files[] with file-head evidence. If a
-        # download candidate has no A-level file on inspection → downgrade to lead.
-        if verdict.get("outcome") in ("download", "lead"):
+        # Phase 2a: file-form preview (核验前置, informational only). For download
+        # candidates, inspect the REAL supplementary file heads to fill
+        # available_file_type with file-head evidence. This NO LONGER gates the
+        # outcome — format usability is judged after download by geo_download —
+        # it only annotates (and its head-scan result feeds the download skill's
+        # data_form reporting).
+        if verdict.get("outcome") == "download":
             supp = ds.get("supplementary_files") or []
             if supp:
                 try:
-                    has_A, inspected, a_form = verify_a_level_files(supp, geo_client)
+                    _has_A, _inspected, a_form = verify_a_level_files(supp, geo_client)
                 except Exception as e:
                     logger.debug(f"agent1 file verify {acc} failed: {e}")
-                    has_A, inspected, a_form = None, None, None
-                if inspected is not None:
-                    verdict["files"] = inspected
-                    if a_form:
-                        verdict["available_file_type"] = a_form
-                    if verdict["outcome"] == "download" and has_A is False:
-                        verdict["outcome"] = "lead"
-                        verdict["lead_type"] = "no_A_file"
-                        verdict["reason"] = (
-                            (verdict.get("reason") or "")
-                            + "; downgraded: no A-level file on head inspection"
-                        ).strip()
-                        rec, usable = _OUTCOME_TO_LEGACY["lead"]
-                        verdict["recommended_action"] = rec
-                        verdict["usable"] = usable
-                        logger.info(f"agent1 file verify {acc}: downgraded download→lead (no A-level file)")
+                    a_form = None
+                if a_form:
+                    verdict["available_file_type"] = a_form
 
         # Write sample_metadata.csv with per-GSM download verdict
         _write_sample_metadata_csv(acc, gsm, verdict, task_id,
@@ -273,16 +261,15 @@ def build_agent1_pipeline(config: Dict[str, Any], registry: Any = None):
         task_id = state.get("task_id")
         output_dir = state.get("output_dir")
         if not candidates:
-            empty = {"download_list": [], "lead_list": [], "exclude_list": [],
+            empty = {"download_list": [], "exclude_list": [],
                      "manual_review_list": []}
             return {**empty, "filter_log": "geo-filter: no candidates"}
         judged = _run_concurrent(_filter_one, candidates, intent, qlog, task_id, output_dir, max_concurrent=3)
         buckets = split_by_outcome(judged)
         log = (
             f"geo-filter: {len(candidates)} candidates → "
-            f"download={len(buckets['download_list'])} "
-            f"lead={len(buckets['lead_list'])} "
             f"exclude={len(buckets['exclude_list'])} "
+            f"download={len(buckets['download_list'])} "
             f"manual_review={len(buckets['manual_review_list'])}"
         )
         logger.info(log)
@@ -419,8 +406,9 @@ def register_state_to_registry(state: Dict[str, Any], reg: Any) -> Dict[str, int
     """
     Register filter/tcga outcomes into the registry. No downloads here.
 
-    - download_list + tcga_candidates → **pending** (auto-download via download worker).
-    - lead_list + manual_review_list → awaiting_approval (needs_review=1, Review Queue).
+    - download_list + tcga_candidates → **pending** (auto-download via download
+      worker). Format usability is judged post-download by geo_download, not here.
+    - manual_review_list → awaiting_approval (needs_review=1, Review Queue).
     - exclude_list → skipped.
     Returns counts.
     """
@@ -437,8 +425,8 @@ def register_state_to_registry(state: Dict[str, Any], reg: Any) -> Dict[str, int
         _upsert(reg, {**rec, "source": "TCGA"}, "pending", needs_review=False, task_id=task_id, raw_query=raw_query, output_dir=output_dir)
         n["auto_download"] += 1
 
-    # Review Queue (needs_review=1): lead + manual_review.
-    for rec in (state.get("lead_list") or []) + (state.get("manual_review_list") or []):
+    # Review Queue (needs_review=1): manual_review only.
+    for rec in state.get("manual_review_list") or []:
         _upsert(reg, rec, "awaiting_approval", needs_review=True, task_id=task_id, raw_query=raw_query, output_dir=output_dir)
         n["review"] += 1
 

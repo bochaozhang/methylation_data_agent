@@ -1,7 +1,8 @@
 """Tests for the agent1 skill pipeline: graph compilation + registry bridge.
 
-Pipeline registers: download/tcga → pending (auto-download), lead/manual_review →
-awaiting_approval (Review Queue), exclude → skipped.
+Pipeline registers: download/tcga → pending (auto-download; file-format usability
+is judged post-download by geo_download), manual_review → awaiting_approval
+(Review Queue), exclude → skipped.
 """
 import unittest
 from unittest.mock import MagicMock, patch
@@ -25,7 +26,6 @@ class TestRegisterBridge(unittest.TestCase):
     def _state(self):
         return {
             "download_list": [{"accession": "GSE1", "source": "GEO", "pubmed_ids": []}],
-            "lead_list": [{"accession": "GSE2", "source": "GEO"}],
             "manual_review_list": [{"accession": "GSE3", "source": "GEO"}],
             "exclude_list": [{"accession": "GSE4"}],
             "tcga_candidates": [{"accession": "TCGA-COAD", "source": "TCGA"}],
@@ -36,8 +36,8 @@ class TestRegisterBridge(unittest.TestCase):
         reg = MagicMock()
         n = register_state_to_registry(self._state(), reg)
         # auto_download = download(GSE1) + tcga(TCGA-COAD) = 2
-        # review = lead(GSE2) + manual_review(GSE3) = 2 ; excluded = 1
-        self.assertEqual(n, {"auto_download": 2, "review": 2, "excluded": 1})
+        # review = manual_review(GSE3) = 1 ; excluded = 1
+        self.assertEqual(n, {"auto_download": 2, "review": 1, "excluded": 1})
 
     def test_download_and_tcga_go_to_pending(self):
         from agents.agent1_pipeline import register_state_to_registry
@@ -46,16 +46,15 @@ class TestRegisterBridge(unittest.TestCase):
         statuses = [c.kwargs.get("download_status") for c in reg.upsert_dataset.call_args_list]
         # GSE1 + TCGA-COAD → pending
         self.assertEqual(statuses.count("pending"), 2)
-        # GSE2 + GSE3 → awaiting_approval
-        self.assertEqual(statuses.count("awaiting_approval"), 2)
+        # GSE3 (manual_review) → awaiting_approval
+        self.assertEqual(statuses.count("awaiting_approval"), 1)
 
-    def test_lead_and_manual_review_both_needs_review_1(self):
+    def test_manual_review_needs_review_1(self):
         from agents.agent1_pipeline import register_state_to_registry
         reg = MagicMock()
         register_state_to_registry(self._state(), reg)
         statuses = {c.kwargs.get("accession"): c.kwargs for c in reg.upsert_dataset.call_args_list}
-        # lead (GSE2) and manual_review (GSE3) both needs_review=True
-        self.assertTrue(statuses["GSE2"]["needs_review"])
+        # manual_review (GSE3) needs human review.
         self.assertTrue(statuses["GSE3"]["needs_review"])
         # download (GSE1) and tcga → needs_review=False
         self.assertFalse(statuses["GSE1"]["needs_review"])

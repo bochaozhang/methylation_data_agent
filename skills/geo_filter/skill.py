@@ -60,7 +60,7 @@ MUST have exactly these keys:
 
 {
   "reasoning": "<REQUIRED: step-by-step logic chain — see below>",
-  "outcome": "download" | "lead" | "exclude" | "manual_review",
+  "outcome": "download" | "exclude" | "manual_review",
   "confirmed_sample_type": "plasma|tumor|adjacent|normal|wbc|cfdna|serum|whole_blood|cell_line|other|unknown",
   "confirmed_cancer_type": "canonical English cancer name, or null",
   "technology": "450K|850K/EPIC|RRBS|WGBS|MCTA|MeDIP|panel|qMSP|null",
@@ -70,11 +70,8 @@ MUST have exactly these keys:
   "disease_groups": "case/control/precursor breakdown, or null",
   "sample_level_annotation": "yes|no|unclear",
   "annotation_source": "GSM_characteristics|sample_title|paper_table|mixed|unclear|null",
-  "files": [
-    {"name": "declared supplementary file name/type from summary", "is_A_level": true|false, "download": true|false, "data_form": "merged_beta_matrix|per_sample_calls|region_matrix|paired_counts|unknown", "reason": "why download or not"}
-  ],
-  "lead_type": "no_A_file|article_only|sample_limited|raw_only|locked|null",
-  "exclude_reason": "cell_line|animal_model|non_target_unsplittable|no_reference_value|non_methylation|null",
+  "download_tier": 1 | 2 | 3,
+  "exclude_reason": "cell_line|animal_model|non_target_unsplittable|no_reference_value|non_methylation|locked|article_only|null",
   "flags": "case_only|pooled|cross_platform|tissue_only|no_control|pan_cancer_needs_split|...|empty string",
   "sample_count_in_paper": <integer or null>,
   "consistency": "consistent|minor_discrepancy|major_discrepancy|unknown",
@@ -91,26 +88,26 @@ Field guidance:
     2. Human / target cancer type?
     3. Sample type vs request — plasma / serum ARE cell-free DNA (cfDNA).
     4. Are there non-cancer / control samples?
-    5. File/data type: is there an A-level methylation VALUE matrix (β-value / M-value /
-       methylation ratio / paired methylated-unmethylated counts) that is downloadable?
-       (Phase 1: infer from the summary and declared supplementary files — do NOT open files.)
+    5. Download tier from metadata (Tier 1/2/3 — see download_tier; do NOT open files).
     6. → outcome.
-  Must be internally consistent: if the chain shows the requested samples AND an A-level
-  matrix are present, outcome MUST be download.
-- outcome (the four states):
-    download      → matches the request AND an A-level methylation value matrix appears
-                    downloadable from the metadata.
-    lead          → relevant (right cancer / sample type) BUT no A-level matrix apparent
-                    (only IDAT / raw fastq|BAM / marker list / signal intensity), or
-                    sample-limited; useful as a reference/lead, NOT auto-downloaded.
+  Must be internally consistent: if the chain shows the requested samples are present
+  and GEO provides downloadable data, outcome MUST be download.
+- outcome (three states):
+    download      → matches the request. NO file-format requirement — whether the
+                    downloaded data is usable is judged AFTER download by the
+                    geo-download skill, not here.
     exclude       → cell line / organoid / animal / in-vitro / treated / metastasis-only /
-                    non-target-unsplittable / non-methylation.
+                    non-target-unsplittable / non-methylation / locked (data locked or
+                    application required — nothing obtainable now) / article_only (data
+                    exists only in the paper, not deposited in GEO).
     manual_review → ambiguous, GEO-vs-article metadata conflict, or cannot confirm
                     sample type / controls.
-- files[]: list supplementary files identifiable from the GEO summary/page; mark
-  is_A_level / download by metadata-level inference (Phase 1, not file content).
-  data_form is a best-guess. Empty list if no files are identifiable.
-- lead_type / exclude_reason: fill when outcome is lead / exclude respectively (else null).
+- download_tier (which download fallback tier the GEO metadata implies):
+    1 → series_matrix has data (GEO-compiled value matrix).
+    2 → series_matrix empty, but supplementary files other than RAW bundles exist.
+    3 → series_matrix empty and no non-RAW supplementary files (per-GSM scraping).
+- exclude_reason: fill when outcome is exclude (else null). locked = data locked /
+  application required; article_only = only in the paper, not deposited in GEO.
 - flags: free-text caveats (case_only, pooled, cross_platform, tissue_only, no_control,
   pan_cancer_needs_split, ...); empty string if none.
 - gsm_includes: classify ONLY the representative GSM samples you were given.
@@ -513,9 +510,8 @@ def filter_dataset(
             "consistency": "unknown",
             "sample_level_annotation": "unclear",
             "disease_groups": None,
-            "files": [],
+            "download_tier": None,
             "flags": "",
-            "lead_type": None,
             "exclude_reason": None,
             "reason": f"filter_error: {e}",
             "notes": f"filter_error: {e}",
@@ -563,15 +559,15 @@ def _extract_usage(response: Any) -> Dict[str, Any]:
     }
 
 
-# Four-state outcome (Phase 1: metadata-level inference, no per-file A-level verification).
-_OUTCOME_VALUES = {"download", "lead", "exclude", "manual_review"}
+# Three-state outcome (relevance only; file-format usability is judged post-download
+# by geo_download). Phase 1: metadata-level inference, no per-file verification.
+_OUTCOME_VALUES = {"download", "exclude", "manual_review"}
 
 # outcome → (recommended_action stored in registry, usable label).
-# recommended_action mirrors the true 4-state outcome so the Web UI "Outcome"
-# column shows download/lead/exclude/manual_review (not a collapsed legacy value).
+# recommended_action mirrors the true 3-state outcome so the Web UI "Outcome"
+# column shows download/exclude/manual_review (not a collapsed legacy value).
 _OUTCOME_TO_LEGACY: Dict[str, tuple] = {
     "download": ("download", "yes"),
-    "lead": ("lead", "partial"),
     "exclude": ("exclude", "no"),
     "manual_review": ("manual_review", "unclear"),
 }
@@ -579,6 +575,14 @@ _OUTCOME_TO_LEGACY: Dict[str, tuple] = {
 
 def _normalise_verdict(verdict: Dict[str, Any], gsm_details: List[Dict[str, Any]]) -> Dict[str, Any]:
     outcome = verdict.get("outcome")
+    # Defensive: the retired "lead" outcome (old prompts/caches) maps to download —
+    # format usability is judged after download anyway.
+    if outcome == "lead":
+        outcome = "download"
+        verdict["reason"] = (
+            (verdict.get("reason") or "")
+            + "; legacy lead → download (format judged post-download)"
+        ).strip("; ")
     if outcome not in _OUTCOME_VALUES:
         outcome = "manual_review"
     verdict["outcome"] = outcome
@@ -592,23 +596,26 @@ def _normalise_verdict(verdict: Dict[str, Any], gsm_details: List[Dict[str, Any]
     if not isinstance(verdict.get("reasoning"), str):
         verdict["reasoning"] = ""
 
-    # files[] — list of well-formed dicts (Phase 1: metadata-inferred, not verified).
-    raw_files = verdict.get("files") or []
-    files: List[Dict[str, Any]] = []
-    for f in raw_files:
-        if isinstance(f, dict):
-            files.append({
-                "name": str(f.get("name", "")),
-                "is_A_level": bool(f.get("is_A_level", False)),
-                "download": bool(f.get("download", False)),
-                "data_form": f.get("data_form", "unknown"),
-                "reason": f.get("reason", ""),
-            })
-    verdict["files"] = files
+    # download_tier — integer 1|2|3 (which fallback tier GEO metadata implies).
+    # Accept loose forms (float/int/str); anything unparseable → None (download side
+    # re-derives the tier from live GEO queries anyway).
+    tier = verdict.get("download_tier")
+    try:
+        tier = int(tier)
+        if tier not in (1, 2, 3):
+            tier = None
+    except (TypeError, ValueError):
+        tier = None
+    verdict["download_tier"] = tier
+
+    # files[] — legacy per-file shape from old prompts; no longer part of the
+    # contract (replaced by download_tier). Dropped here so downstream never sees
+    # stale metadata-inferred file verdicts.
+    verdict.pop("files", None)
+    verdict.pop("lead_type", None)
 
     if not isinstance(verdict.get("flags"), str):
         verdict["flags"] = ""
-    verdict.setdefault("lead_type", None)
     verdict.setdefault("exclude_reason", None)
 
     # gsm_includes — list of well-formed dicts covering the representatives.
@@ -632,12 +639,12 @@ def _normalise_verdict(verdict: Dict[str, Any], gsm_details: List[Dict[str, Any]
 def apply_verdict(ds: Dict[str, Any], verdict: Dict[str, Any]) -> Dict[str, Any]:
     """
     Return a copy of `ds` with verdict fields mapped onto registry columns +
-    the four-state record fields attached for the pipeline. Ready for
+    the three-state record fields attached for the pipeline. Ready for
     Registry.upsert_dataset(...) (interface unchanged) and for split_by_outcome().
     """
     action = verdict.get("recommended_action", "manual_review")
-    # usable column is INTEGER 0/1: yes/partial → 1 (benefit of the doubt for unclear).
-    usable_map = {"yes": 1, "partial": 1, "no": 0, "unclear": 1}
+    # usable column is INTEGER 0/1: yes → 1 (benefit of the doubt for unclear).
+    usable_map = {"yes": 1, "no": 0, "unclear": 1}
     usable_int = usable_map.get(verdict.get("usable", "unclear"), 1)
 
     updated = dict(ds)
@@ -656,13 +663,10 @@ def apply_verdict(ds: Dict[str, Any], verdict: Dict[str, Any]) -> Dict[str, Any]
     if stage:
         updated["stage_treatment"] = stage
 
-    # Derive available_file_type from the first A-level/downloadable file (Phase 1).
-    files = verdict.get("files") or []
-    a_file = next((f for f in files if f.get("download") and f.get("is_A_level")), None)
-    if a_file:
-        updated["available_file_type"] = a_file.get("data_form") or a_file.get("name")
-    elif files:
-        updated["available_file_type"] = files[0].get("name")
+    # Download tier implied by GEO metadata (1|2|3; the download skill re-derives
+    # the actual tier from live queries — this is the metadata-level expectation).
+    if verdict.get("download_tier"):
+        updated["download_tier"] = verdict["download_tier"]
 
     if verdict.get("technology"):
         updated["technology"] = verdict["technology"]
@@ -673,11 +677,8 @@ def apply_verdict(ds: Dict[str, Any], verdict: Dict[str, Any]) -> Dict[str, Any]
     if verdict.get("disease_groups"):
         updated["disease_groups"] = verdict["disease_groups"]
 
-    # Attach the full four-state record fields (used by split_by_outcome / pipeline).
-    updated["files"] = files
+    # Attach the full three-state record fields (used by split_by_outcome / pipeline).
     updated["flags"] = verdict.get("flags", "")
-    if verdict.get("lead_type"):
-        updated["lead_type"] = verdict["lead_type"]
     if verdict.get("exclude_reason"):
         updated["exclude_reason"] = verdict["exclude_reason"]
 
@@ -702,18 +703,17 @@ def apply_verdict(ds: Dict[str, Any], verdict: Dict[str, Any]) -> Dict[str, Any]
 
 def split_by_outcome(records: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
     """
-    Split enriched dataset records (from apply_verdict) into the four-state lists
-    consumed by the pipeline: download_list / lead_list / exclude_list /
-    manual_review_list. Each record carries its full four-state fields (outcome,
-    files[], flags, lead_type, exclude_reason, reason, ...).
+    Split enriched dataset records (from apply_verdict) into the three-state lists
+    consumed by the pipeline: download_list / exclude_list / manual_review_list.
+    Each record carries its full three-state fields (outcome, download_tier, flags,
+    exclude_reason, reason, ...).
     """
     buckets: Dict[str, List[Dict[str, Any]]] = {
         "download_list": [],
-        "lead_list": [],
         "exclude_list": [],
         "manual_review_list": [],
     }
-    _key = {"download": "download_list", "lead": "lead_list",
+    _key = {"download": "download_list",
             "exclude": "exclude_list", "manual_review": "manual_review_list"}
     for r in records:
         outcome = r.get("outcome", "manual_review")
