@@ -20,11 +20,12 @@ Output (state): download_results, download_log
 from __future__ import annotations
 
 import hashlib
+import gzip
 import json
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import pandas as pd
 
@@ -33,6 +34,19 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from skills.geo_download.cancer_label import (
     build_sample_metadata_with_cancer,
     query_cancer_terms,
+)
+from skills.geo_download.archive_extract import (
+    detect_per_sample_set,
+    extract_archive_members,
+    is_archive,
+)
+from skills.geo_download.verify import (
+    build_gsm_column_map,
+    check_column_counts,
+    check_group_completeness,
+    parse_sample_columns,
+    parse_series_matrix_samples_local,
+    quarantine_files,
 )
 from skills.geo_filter.file_inspect import inspect_matrix_head
 from tools.download_tools import DownloadEngine, build_geo_download_tasks
@@ -44,6 +58,13 @@ logger = get_logger(__name__)
 
 # If more than this fraction of GSMs are "unclear", send to manual_review.
 _UNCLEAR_MANUAL_REVIEW_THRESHOLD = 0.5
+
+# GSM→column mapping coverage below this → manual_review FLAG (files stay;
+# report-only philosophy — user decision 2026-08-21).
+_MAP_COVERAGE_REVIEW = 0.5
+
+# Filename carries a GSM id → one-sample-per-file (Tier-3 .cov/.bed forms).
+_GSM_IN_NAME_RE = re.compile(r"GSM\d+", re.IGNORECASE)
 
 
 def _cancer_matches(cancer_type: Optional[str], query_terms: List[str]) -> bool:
@@ -168,10 +189,13 @@ class DownloadSkill:
                     info = self.geo_client.fetch_gsm_supplementary_file(gsm_id)
                     if info:
                         url = info["url"].replace("ftp://", "https://", 1)
+                        # GSM-page hrefs are URL-encoded (%5F for _); decode so
+                        # the on-disk name (and GSM-in-filename detection) is sane.
+                        from urllib.parse import unquote
                         tasks.append({
                             "accession": acc,
                             "url": url,
-                            "filename": info["filename"],
+                            "filename": unquote(info["filename"]),
                             "subdir": f"{acc}/{gsm_id}",
                         })
                     else:
@@ -186,6 +210,12 @@ class DownloadSkill:
         # ---- Download ----
         dl_results = self.downloader.download_many_sync(tasks) if tasks else []
         done = [r for r in dl_results if r.get("status") == "done"]
+
+        # ---- Phase-2 ⑤: archive member extraction ----
+        # Must run BEFORE the junk filter: a compressed archive read as raw
+        # bytes looks "unparseable" to inspect_matrix_head and would be
+        # junk-dropped, losing every member inside. Failure → archive kept whole.
+        done = self._expand_archives(acc, done, output_dir)
 
         # ---- Tier 2/3 file selection ----
         # We downloaded every non-RAW supp file (Tier 2) or per-GSM supp file
@@ -204,10 +234,33 @@ class DownloadSkill:
             done, discarded, selection_note, sel_forced = self._select_relevant_files(
                 acc, done, rec, sm, download_gsms=download_gsms)
 
-        # ---- Cancer subset ----
+        # ---- Phase-2 ①②③: post-download verification ----
+        # Column count vs download-GSM count (quarantines on fail), GSM→column
+        # mapping (title-index cascade; low coverage → manual_review flag,
+        # files stay), group completeness (report-only, notes).
+        verify_note = ""
+        verify_failed_qc: List[Dict[str, Any]] = []
+        qc_forced: Optional[str] = None
+        column_map: Dict[str, Dict[str, str]] = {}
+        if done:
+            (verify_note, verify_failed_qc, qc_forced, column_map
+             ) = self._verify_dataset(acc, done, sm, output_dir,
+                                      tier_used=tier_used,
+                                      download_gsms=download_gsms)
+
+        # ---- Phase-2 ④: quarantine on column-count fail ----
+        if verify_failed_qc:
+            outcome_pre = "qc_failed_reverted_manual_review"
+            logger.warning(f"geo-download {acc}: QC fail → quarantine "
+                           f"({len(verify_failed_qc)} file(s)): {verify_note}")
+        else:
+            outcome_pre = None
+
+        # ---- Cancer subset (uses the verified column→GSM map when available) ----
         subset_path, subset_note, forced_outcome = self._subset_by_cancer(
             acc, done, sm, output_dir,
-            query_terms=query_terms, cancer_type=rec.get("cancer_type"))
+            query_terms=query_terms, cancer_type=rec.get("cancer_type"),
+            column_map=column_map)
         forced_outcome = forced_outcome or sel_forced  # selection fallback may flag review
 
         files_downloaded = [
@@ -215,16 +268,20 @@ class DownloadSkill:
                 "name": (r.get("local_path") or "").split("/")[-1],
                 "local_path": r.get("local_path"),
                 "size_bytes": r.get("file_size_bytes"),
-                "qc_passed": bool(r.get("local_path")),
+                "qc_passed": bool(r.get("local_path")) and not verify_failed_qc,
                 "data_form": r.get("data_form") or rec.get("available_file_type"),
+                "needs_processing": r.get("needs_processing"),
                 "provenance": {"source_url": r.get("url"), "checksum_md5": r.get("checksum_md5")},
             }
             for r in done
         ]
-        outcome = forced_outcome or ("download_success" if done else "failed")
+        outcome = outcome_pre or forced_outcome or (
+            "download_success" if done else "failed")
         notes = subset_note + f" [tier={tier_used}]"
         if selection_note:
             notes += f"; {selection_note}"
+        if verify_note:
+            notes += f"; {verify_note}"
         if discarded:
             reasons = ", ".join(sorted({
                 f"{d['name']}: {d.get('reason', '')}" for d in discarded}))
@@ -252,9 +309,170 @@ class DownloadSkill:
                 notes = ("; ".join(r.get("error", "") for r in dl_results
                                    if r.get("status") != "done")
                          + f" [tier={tier_used}]")
-        return self._result(acc, files_downloaded, [], outcome, flags,
+        return self._result(acc, files_downloaded, verify_failed_qc, outcome, flags,
                             notes=notes, subset_path=subset_path,
                             files_discarded=discarded)
+
+    # ------------------------------------------------------------------ #
+    #  Phase-2 ⑤: archive member extraction                              #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _expand_archives(acc: str, done_results: List[Dict[str, Any]],
+                         output_dir: str) -> List[Dict[str, Any]]:
+        """
+        Expand tar/zip supp files into their members (in place of the archive).
+        Runs BEFORE the junk filter — an archive's raw bytes would otherwise
+        be junk-dropped as "unparseable". Conservative: extraction failure or
+        an empty result keeps the archive as one candidate file.
+        """
+        out: List[Dict[str, Any]] = []
+        for r in done_results:
+            local_path = r.get("local_path")
+            if not local_path or not is_archive(local_path):
+                out.append(r)
+                continue
+            members = extract_archive_members(
+                local_path, str(Path(output_dir) / acc / "members"))
+            if members:
+                logger.info(f"geo-download {acc}: expanded {len(members)} member(s) "
+                            f"from {(local_path or '').split('/')[-1]}")
+                _delete_file(local_path, acc, (local_path or "").split("/")[-1])
+                for m in members:
+                    out.append({
+                        "accession": acc, "status": "done", "local_path": m,
+                        "file_size_bytes": os.path.getsize(m),
+                        "checksum_md5": None, "url": r.get("url"),
+                        "extracted_from": (local_path or "").split("/")[-1],
+                    })
+            else:
+                out.append(r)  # keep the archive whole (judged downstream)
+        return out
+
+    # ------------------------------------------------------------------ #
+    #  Phase-2 ①②③: post-download verification                          #
+    # ------------------------------------------------------------------ #
+
+    def _verify_dataset(self, acc: str, done_results: List[Dict[str, Any]],
+                        sm: Optional[pd.DataFrame], output_dir: str,
+                        tier_used: str = "",
+                        download_gsms: Optional[List[str]] = None,
+                        ) -> Tuple[str, List[Dict[str, Any]], Optional[str],
+                                   Dict[str, Dict[str, str]]]:
+        """
+        Verify the kept files against the task's download-GSM set:
+
+          ① sample-column count (aggregate across files; tolerance
+             max(5, 10%)) — fail → quarantine records returned;
+          ② GSM→column mapping (gsm-id regex → series !Sample_title index →
+             prefix) — low coverage → manual_review FLAG (files stay);
+          ③ disease-group completeness — report-only (notes).
+
+        Returns (note, files_failed_qc, forced_outcome, column_map).
+        files_failed_qc non-empty ⇒ caller quarantines (④).
+        """
+        n_gsms = len(download_gsms or [])
+        per_file: Dict[str, Dict[str, Any]] = {}
+        matrix_results: List[Dict[str, Any]] = []
+        # Per-sample form first: filenames carrying GSM ids (Tier-3 per-GSM
+        # downloads like .cov/.bed/.bsmap files) are one-sample-per-file BY
+        # CONSTRUCTION — parse_sample_columns would miscount their coordinate
+        # columns as 6 "samples" each. Detect by GSM-in-filename BEFORE
+        # matrix parsing, and exclude them from column aggregation.
+        per_sample_paths: List[str] = []
+        for r in done_results:
+            name = (r.get("local_path") or "").split("/")[-1]
+            if name and _GSM_IN_NAME_RE.search(name):
+                per_sample_paths.append(r["local_path"])
+                r["needs_processing"] = "merge_per_sample"
+        is_per_sample = detect_per_sample_set(per_sample_paths, n_gsms)
+
+        for r in done_results:
+            if r.get("needs_processing"):
+                continue  # per-sample files don't contribute matrix columns
+            parsed = parse_sample_columns(r.get("local_path") or "")
+            if parsed is None:
+                continue  # unparseable files don't contribute columns either
+            r["_parsed_cols"] = parsed
+            per_file[(r.get("local_path") or "").split("/")[-1]] = parsed
+            matrix_results.append(r)
+
+        col_check = check_column_counts(
+            list(per_file.values()), n_gsms,
+            per_sample_files=per_sample_paths if is_per_sample else None)
+        if not col_check["passed"]:
+            reason = f"column-count check failed: {col_check['reason']}"
+            return (f"[verify] {reason}", quarantine_files(
+                acc, done_results, output_dir, reason),
+                "qc_failed_reverted_manual_review", {})
+
+        # ② mapping (needs series sample titles; Tier 1 parses the local
+        # series_matrix, Tier 2/3 fetch it once per accession).
+        series_samples = self._series_samples(acc, done_results, output_dir,
+                                              tier_used)
+        col_names_by_file = {name: p.get("col_names") or []
+                             for name, p in per_file.items()}
+        mapres = build_gsm_column_map(col_names_by_file, series_samples)
+        column_map = mapres["column_map"]
+
+        parts = [f"[verify] {col_check['reason']}"]
+        forced: Optional[str] = None
+        if mapres["n_cols"]:
+            parts.append(f"map {mapres['level']} {mapres['n_mapped']}/{mapres['n_cols']}")
+            if mapres["coverage"] < _MAP_COVERAGE_REVIEW:
+                forced = "manual_review_gsm_mapping"
+                parts.append(f"(low coverage → {forced})")
+
+        # ③ group completeness (report-only).
+        if column_map and sm is not None:
+            grp = check_group_completeness(column_map, sm, download_gsms or [])
+            parts.append(f"groups {grp['summary']}")
+
+        return "; ".join(parts), [], forced, column_map
+
+    def _series_samples(self, acc: str, done_results: List[Dict[str, Any]],
+                        output_dir: str, tier_used: str) -> List[Dict[str, str]]:
+        """
+        Per-sample {gsm,title,source_name} rows for the mapping cascade.
+        Parse a LOCAL series_matrix first (downloaded by the tier probe, or on
+        disk from an earlier run — NCBI fetches can be throttled, and the local
+        copy is the same data); fall back to fetching once per accession (the
+        !Sample_* rows exist even when the series_matrix has no data table).
+        Best-effort: [] on failure.
+        """
+        cached = getattr(self, "_series_samples_cache", None)
+        if cached is None:
+            cached = self._series_samples_cache = {}
+        if acc in cached:
+            return cached[acc]
+        samples: List[Dict[str, str]] = []
+        try:
+            # 1) Any series_matrix among this run's downloaded files (Tier 1).
+            for r in done_results:
+                name = (r.get("local_path") or "")
+                if "series_matrix" in name.lower():
+                    samples = parse_series_matrix_samples_local(name)
+                    break
+            # 2) A leftover series_matrix on disk from an earlier run/probe
+            #    (covers Tier 2/3 where the tier check downloaded it but the
+            #    download list went elsewhere).
+            if not samples:
+                for cand in sorted(
+                        (Path(output_dir) / acc).glob("*series_matrix*")):
+                    samples = parse_series_matrix_samples_local(str(cand))
+                    if samples:
+                        break
+            # 3) Network fetch as last resort.
+            if not samples and self.geo_client is not None:
+                fetched = self.geo_client.fetch_series_matrix_sample_info(acc)
+                if fetched:
+                    samples = [{"gsm": s.get("gsm", ""), "title": s.get("title", ""),
+                                "source_name": s.get("source_name", "")}
+                               for s in fetched]
+        except Exception as e:
+            logger.debug(f"geo-download {acc}: series sample info unavailable: {e}")
+        cached[acc] = samples
+        return samples
 
     # ------------------------------------------------------------------ #
     #  Cancer subset (Phase 2c)                                          #
@@ -262,10 +480,16 @@ class DownloadSkill:
 
     def _subset_by_cancer(self, acc: str, done_results: List[Dict[str, Any]],
                           sm: Optional[pd.DataFrame], output_dir: str,
-                          query_terms: List[str] = None, cancer_type: str = None
+                          query_terms: List[str] = None, cancer_type: str = None,
+                          column_map: Optional[Dict[str, Dict[str, str]]] = None,
                           ) -> Tuple[Optional[str], str, Optional[str]]:
         """
         Decide whether to subset the downloaded matrix to query-cancer GSMs.
+
+        column_map (from Phase-2 verification, ②) resolves submitter-coded
+        column names (Pcrc90...) to GSMs — when present, the subset selects
+        columns THROUGH the map instead of GSM-substring matching in the
+        header (which fails on submitter-coded names).
 
         Returns (subset_path, note, forced_outcome):
           - forced_outcome="qc_failed_reverted_manual_review" when cancer labels
@@ -319,8 +543,17 @@ class DownloadSkill:
         local_path = target.get("local_path")
         if not local_path:
             return None, "no local file to subset", None
+        # Route through the verified column→GSM map when it covers this file's
+        # columns (submitter-coded names); else the legacy GSM-substring match.
+        query_cols: Optional[Set[str]] = None
+        if column_map:
+            query_cols = {col for col, v in column_map.items()
+                          if v.get("gsm") in query_gsms}
         subset_path, n_kept, n_cols, note = _write_query_subset(
-            local_path, str(Path(output_dir) / acc), acc, query_gsms)
+            local_path, str(Path(output_dir) / acc), acc, query_gsms,
+            query_cols=query_cols)
+        if query_cols and subset_path:
+            note = (note or "subset ok") + " (via column map)"
         return subset_path, (note or "subset ok"), None
 
     # ------------------------------------------------------------------ #
@@ -560,10 +793,16 @@ class DownloadSkill:
 # ---------------------------------------------------------------------- #
 
 def _write_query_subset(local_path: str, out_dir: str, accession: str,
-                        query_gsms: set) -> Tuple[Optional[str], int, int, str]:
+                        query_gsms: set,
+                        query_cols: Optional[Set[str]] = None,
+                        ) -> Tuple[Optional[str], int, int, str]:
     """
     Best-effort: read the (gzip) matrix, keep the first column (feature id) +
-    columns whose header contains a query-cancer GSM, write a subset file.
+    the query-cancer sample columns, write a subset file.
+
+    Column selection: query_cols (exact names, from the verified column→GSM
+    map — handles submitter-coded names) when given; else any column whose
+    header contains a query GSM (the legacy heuristic).
 
     Returns (subset_path, n_kept_columns, n_total_columns, note).
     """
@@ -583,14 +822,25 @@ def _write_query_subset(local_path: str, out_dir: str, accession: str,
 
         sep = "\t" if "\t" in header_row else ","
         cols = [c.strip().strip('"') for c in header_row.split(sep)]
-        # keep first column (feature id) + any column whose name contains a query GSM
-        keep = [cols[0]] + [c for c in cols[1:] if any(g in c for g in query_gsms)]
-        keep = _dedup_preserve(keep)
+        if query_cols is not None:
+            # Exact-name selection via the map. Mixed-delimiter headers
+            # (sample names space-separated inside one tab field) cannot be
+            # column-selected with pandas usecols — stream those manually.
+            flat = _flatten_header_cols(header_row, sep)
+            if flat and len(flat) > len(cols):
+                return _write_query_subset_flat(
+                    local_path, out_dir, accession, flat, query_cols)
+            keep = _dedup_preserve([cols[0]] + [c for c in cols[1:]
+                                                if c in query_cols])
+        else:
+            # keep first column (feature id) + any column whose name contains a query GSM
+            keep = [cols[0]] + [c for c in cols[1:] if any(g in c for g in query_gsms)]
+            keep = _dedup_preserve(keep)
         if len(keep) <= 1:
             return None, 0, len(cols) - 1, "no query-cancer GSM columns matched in header"
 
-        df = pd.read_csv(local_path, sep=sep, usecols=keep, compression=comp,
-                         low_memory=False)
+        df = pd.read_csv(local_path, sep=sep, usecols=keep,
+                         compression=comp, low_memory=False)
         subset_path = Path(out_dir) / f"{accession}_query_subset.txt.gz"
         subset_path.parent.mkdir(parents=True, exist_ok=True)
         df.to_csv(subset_path, sep="\t", index=False, compression="gzip")
@@ -604,6 +854,72 @@ def _open_maybe_gz(path: str):
     import gzip
     return gzip.open(path, "rt", encoding="utf-8", errors="replace") \
         if path.endswith(".gz") else open(path, "rt", encoding="utf-8", errors="replace")
+
+
+def _flatten_header_cols(header_row: str, sep: str) -> List[str]:
+    """
+    Flatten a possibly mixed-delimiter header (tab fields whose tail field
+    packs space-separated sample names) into the true column-name list.
+    Returns [] when the plain sep-split already accounts for every token.
+    """
+    from skills.geo_download.verify import _flatten_header
+    flat = _flatten_header(header_row)
+    plain = [c.strip().strip('"') for c in header_row.split(sep)]
+    return flat if len(flat) > len(plain) else []
+
+
+def _write_query_subset_flat(local_path: str, out_dir: str, accession: str,
+                             flat_cols: List[str], query_cols: Set[str],
+                             ) -> Tuple[Optional[str], int, int, str]:
+    """
+    Subset a MIXED-delimiter matrix (annotation cols tab-separated, sample
+    values tab-separated in data rows but names space-packed in the header).
+    pandas usecols cannot address these columns, so stream lines: keep the
+    leading tab-fields that precede the sample block + the sample fields
+    whose flattened names are query columns. Field COUNTS come from the data
+    rows (the header undercounts by packing).
+    """
+    try:
+        keep_idx: List[int] = []
+        n_ann = 0
+        for i, c in enumerate(flat_cols):
+            if c in query_cols:
+                keep_idx.append(i)
+            elif not keep_idx:
+                n_ann = i + 1  # leading annotation block
+        if not keep_idx:
+            return None, 0, len(flat_cols) - n_ann, \
+                "no query-cancer columns matched in flattened header"
+
+        subset_path = Path(out_dir) / f"{accession}_query_subset.txt.gz"
+        subset_path.parent.mkdir(parents=True, exist_ok=True)
+        n_kept = len(keep_idx)
+        with _open_maybe_gz(local_path) as src, \
+                gzip.open(subset_path, "wt", encoding="utf-8") as dst:
+            wrote_header = False
+            for line in src:
+                s = line.rstrip("\n")
+                if not s or s.startswith("!"):
+                    continue
+                if not wrote_header:
+                    # Re-emit a clean tab header: annotation names + kept samples.
+                    names = [c for c in flat_cols[:n_ann]] + \
+                            [flat_cols[i] for i in keep_idx]
+                    dst.write("\t".join(names) + "\n")
+                    wrote_header = True
+                    continue
+                fields = s.split("\t")
+                # Data rows: first n_ann-1 tab fields are annotation values,
+                # then one tab field per sample column (tab-separated).
+                ann_vals = fields[:n_ann - 1]
+                sample_vals = fields[n_ann - 1:]
+                kept_vals = [sample_vals[i - n_ann + 1]
+                             for i in keep_idx if i - n_ann + 1 < len(sample_vals)]
+                dst.write("\t".join(ann_vals + kept_vals) + "\n")
+        return str(subset_path), n_kept, len(flat_cols) - n_ann, \
+            f"subset: kept {n_kept}/{len(flat_cols) - n_ann} query-cancer sample columns"
+    except Exception as e:
+        return None, 0, 0, f"subset failed: {e}"
 
 
 def _md5_file(path: str, chunk: int = 1 << 20) -> Optional[str]:
