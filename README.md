@@ -1,454 +1,303 @@
 # MethyAgent
 
-基于 LangGraph 的双 Agent 甲基化数据自动采集系统。
+双 Agent 甲基化数据自动采集系统：自然语言查询 → GEO/TCGA 检索 → 三态过滤（download / manual_review / exclude，GSM 样本级判定）→ 自动下载 → 下载后核验（列数 / GSM→列映射 / 疾病分组）→ SQLite 注册表全程追踪。
 
 ## 系统架构
 
 ```
-用户输入关键词
+用户 query（CLI 或 HTTP API）
       │
       ▼
-┌─────────────────────────────────────────────────────┐
-│                  Orchestrator (LangGraph)             │
-│  parse_query → DatabaseAgent → LiteratureAgent → Report │
-└─────────────────────────────────────────────────────┘
-                        │
-                        ▼
-              ┌─────────────────┐
-              │  共享注册表       │
-              │  (SQLite)        │
-              │  去重 + 状态追踪  │
-              └─────────────────┘
+┌──────────────────────────────────────────────────────┐
+│  task_queue（SQLite）                                  │
+│    agent1-query  : 搜索 → 过滤 → 注册（download→pending）│
+│    agent1-download: 轮询 pending → 下载 → 核验 → done   │
+│    agent2        : PubMed/PMC 文献挖掘补充              │
+│    webui         : FastAPI（端口 80）提交/审批/看板      │
+└──────────────────────────────────────────────────────┘
+      │                                    │
+      ▼                                    ▼
+registry/methyagent.db              data/{GSE}/…
+（datasets / samples /              （矩阵文件、per-GSM 文件、
+ query_sample_map / …）              query_subset、quarantine/）
 ```
 
-**Agent 1 (DatabaseAgent)**：直接从 TCGA GDC 和 GEO 数据库检索并下载甲基化数据。
+- **agent1（DatabaseAgent）**：GEO（E-utilities）+ TCGA（GDC）检索下载。skills 管线：`geo_search`（确定性召回）→ `geo_filter`（三态相关性判定，LLM + GSM 级证据）→ `geo_download`（三级 tier 下载 + LLM 按样本类型选文件 + Phase-2 核验）。
+- **agent2（LiteratureAgent）**：从文献挖掘数据集引用，下载前查注册表去重。
+- 两个 Agent 通过共享 SQLite 注册表协调（含 GSM 级多对多表，同一 GSE 被多个 query 命中互不覆盖）。
 
-**Agent 2 (LiteratureAgent)**：从 PubMed / PMC / bioRxiv 文献中挖掘数据集引用，补充下载 Agent 1 未覆盖的数据。
+---
 
-两个 Agent 通过共享 SQLite 注册表协调，Agent 2 下载前自动检查注册表，跳过已由 Agent 1 下载的数据集。
-
-## GEO Search 流程（v5）
-
-GEO 检索采用 **三步漏斗式过滤**，从粗到细逐步筛选：
-
-```
-用户查询
-  │
-  ▼
-parse_query → intent dict
-  │
-  ▼
-build_geo_search_string(intent)  ← cancer_synonyms.yaml（16 癌种同义词 + 8 技术词 + 8 液体活检词）
-  │
-  ▼
-NCBI esearch → GSE UID list
-  │
-  ▼
-batch esummary → 元数据 + 平台/年份过滤
-  │
-  ▼
-Step 1: GEO metadata screen（GSE 级，LLM 粗筛，无 NCBI 调用）
-  LLM 读 title/summary/overall_design vs intent
-  明显不符（cell line / 错误癌种 / 错误样本类型）→ 丢弃
-  │
-  ▼ screen_keep=True
-Step 2: GSM sample metadata judge（GSM 级，ground truth，两次 LLM 调用）
-  ├── 全量 efetch 所有 GSM MINiML XML（无上限，结果缓存到 CSV）
-  ├── LLM Call 1（per-GSM，并发）
-  │     输入：intent + 单个 GSM characteristics（~100-300 tokens/call）
-  │     输出：{"include": bool, "reason": str|null}
-  │     → 写入 sample_metadata.csv（全量，每行一个 GSM）
-  ├── 计算 include_fraction = include数 / 总GSM数
-  └── LLM Call 2（dataset 级，单次）
-        输入：include_fraction + exclude_fraction + GEO summary（~200-400 tokens）
-        输出：{"dataset_keep": "true"|"false"|"unsure", "reason": str}
-  │
-  ├── "true"  → 直接进 awaiting_approval（跳过 Step 3）
-  ├── "false" → 丢弃
-  └── "unsure" → Step 3
-  │
-  ▼ dataset_keep="unsure"
-Step 3: PubMed verify（仅对 unsure 数据集）
-  有 PMID + 有 abstract → LLM 对比 GEO summary vs 摘要 → keep=True/False
-  无 PMID 或无 abstract → pubmed_keep=False（丢弃）
-  │
-  ▼
-awaiting_approval → 人工审批 → pending → daemon 下载
-  │
-  ▼
-Registry 去重 → 注册 → 下载
-  │
-  ▼
-sample_metadata.csv + report_<ts>.json
-```
-
-### 第 1 层：检索式构建
-
-`build_geo_search_string(intent)` 将用户意图拼成 NCBI E-utilities 查询字符串，各子句用 `AND` 连接。查询字符串上限 400 字符，超长时自动裁剪癌种同义词（`MAX_QUERY_LENGTH` 机制）。
-
-| 子句 | 逻辑 | 示例 |
-|------|------|------|
-| **癌种** | 从 `cancer_synonyms.yaml` 查 TCGA code 对应同义词，拼成 OR 组 | COAD → `(CRC OR "colorectal cancer" OR "colon cancer" OR ...)` |
-| **样本类型** | 液体活检（cfdna/plasma/serum）用 YAML 中 8 个高区分度词做 OR；否则走 `SAMPLE_TYPE_GEO_TERMS` 映射 | cfdna → `(cfDNA OR "cell-free DNA" OR ctDNA OR plasma OR serum OR "liquid biopsy" OR "circulating DNA")` |
-| **甲基化技术** | 指定平台时用 GPL 号 + 俗名；未指定时用 YAML 中 8 个技术词做 OR | 无平台 → `("DNA methylation" OR 450K OR EPIC OR RRBS OR WGBS OR "bisulfite sequencing" OR "methylation array" OR methylome)` |
-| **物种** | 固定加 `(human OR "Homo sapiens")` | — |
-| **年份** | 可选的 PDAT 范围过滤 | `("2020/01/01"[PDAT] : "2024/12/31"[PDAT])` |
-| **Entry Type** | 固定 `GSE[Entry Type]` | — |
-
-### 第 2 层：元数据获取 + 平台/年份过滤
-
-`GEOClient.search_gse()` → `filter_methylation_datasets()`：
-
-1. **esearch** 拿到 GSE UID 列表（max_results=2000）
-2. **batch esummary** 批量获取元数据（title, summary, overall_design, platforms, sample_count, year, pubmed_ids）
-3. **过滤**：data_type 检测（array vs sequencing）、platform_canonical 匹配、year 范围；platform_unknown 的保留（不过度过滤）
-
-### Step 1：GEO metadata screen（GSE 级粗筛）
-
-`_geo_screen_datasets_concurrent(datasets, max_concurrent=5)`
-
-LLM 仅读取 GEO 元数据（title、summary、overall_design），无需 NCBI API 调用，快速丢弃明显不符的数据集：
-
-- **RULE 1**：cell line / organoid / in-vitro → 直接拒绝
-- **RULE 2**：数据类型明显不是 DNA 甲基化 → 拒绝
-- **RULE 3**：癌种明显不符 → 拒绝
-- **RULE 4**：样本类型明显不符 → 拒绝
-- **RULE 5（默认）**：保留（宽松，允许假阳性，Step 2 做精细判断）
-
-### Step 2：GSM sample metadata judge（GSM 级，ground truth）
-
-`_sample_metadata_judge_concurrent(datasets, max_concurrent=3)`
-
-这是主过滤器，基于 GSM 级别的真实样本信息做判断，分两次 LLM 调用：
-
-#### LLM Call 1：per-GSM include/exclude（并发，Semaphore=5）
-
-对每个 GSM 独立判断，输入极短（单个样本的 characteristics）：
-
-```
-输入：
-  Intent: {cancer_type}, {sample_type}, {query_detail}
-  GSM: {gsm_id}
-    source_name: {source_name}
-    molecule: {molecule}
-    characteristics: {key: value, ...}
-
-输出：
-  {"include": true, "reason": null}          ← include 时 reason 为 null
-  {"include": false, "reason": "tumor tissue, not cfDNA"}
-```
-
-结果写入 `sample_metadata.csv`（全量，不截断）：
-- include=true → 该 query 列写 `"include"`
-- include=false → 该 query 列写 `"exclude: {reason}"`
-
-#### LLM Call 2：dataset_keep 三态判断（单次）
-
-基于汇总统计 + GEO summary，输入极短（~200-400 tokens）：
-
-```
-输入：
-  Intent: {cancer_type}, {sample_type}
-  Dataset: {accession}
-    title / summary / overall_design
-    include_count: {k}  (include_fraction: {k/n:.1%})
-    exclude_count: {n-k}  (exclude_fraction: {(n-k)/n:.1%})
-
-输出：
-  {"dataset_keep": "true" | "false" | "unsure", "reason": "..."}
-```
-
-**三态路由规则**：
-
-| dataset_keep | 条件 | 行为 |
-|-------------|------|------|
-| `"true"` | include_fraction ≥ 20% 且 GEO summary 一致 | → awaiting_approval（跳过 Step 3） |
-| `"false"` | include_fraction < 5% 且 GEO summary 明确不符 | → 丢弃 |
-| `"unsure"` | 边界情况，或 characteristics 字段缺失/模糊 | → Step 3 PubMed 核验 |
-
-**CSV 缓存**：`sample_metadata.csv` 写入 `{output_dir}/{accession}/sample_metadata.csv`，同一数据集再次查询时复用 efetch 结果，仅重跑 LLM 判断，追加新 query 列。
-
-#### GSM 分组策略（用于 CSV group 列）
-
-根据 GSM title 关键词分组（仅用于 CSV 标注，不影响 LLM 判断）：
-
-| 分组 | 匹配关键词 |
-|------|-----------|
-| `plasma_cfdna` | plasma, cfdna, cell-free, cell free, serum, liquid biopsy, circulating, ctdna |
-| `tissue` | tumor, tumour, tissue, biopsy, ffpe, frozen, gdna, genomic dna, primary, cancer tissue, solid tumor |
-| `wbc_blood` | wbc, pbmc, buffy coat, leukocyte, whole blood, peripheral blood, mononuclear |
-| `normal` | normal, healthy, adjacent, control, benign |
-| `cell_line` | cell line, organoid, in vitro, culture |
-| `other` | 不匹配以上任何关键词的样本 |
-
-### Step 3：PubMed verify（仅对 unsure 数据集）
-
-`_pubmed_verify_datasets_concurrent(unsure_list, max_concurrent=5)`
-
-**仅当 Step 2 返回 `dataset_keep="unsure"` 时触发**，不再对所有数据集执行。
-
-**核验流程（每个 unsure GSE）**：
-
-1. 取 `pubmed_ids[0]`（esummary 已返回）
-2. `GEOClient.fetch_pubmed_abstract(pmid)` → NCBI efetch 获取摘要
-3. 将 GEO 元数据 + 摘要发给 LLM（`LLM_VERIFY_SYSTEM_PROMPT`，固定不变触发 Z.AI system cache）
-4. LLM 返回 `keep=True/False` + 更新字段
-
-**严格策略（unsure 状态下不保守保留）**：
-
-| 情况 | 行为 |
-|------|------|
-| 无 PMID | `pubmed_keep=False`，丢弃（unsure + 无文章 = 无法确认 = 不下载） |
-| 摘要获取失败 | `pubmed_keep=False`，丢弃 |
-| LLM / 解析出错 | `pubmed_keep=False`，丢弃（保守拒绝） |
-
-> **设计原则**：Step 2 已经是 ground truth 判断，进入 Step 3 的数据集本身就是"存疑"的。无法通过文献确认的存疑数据集，宁可漏掉也不要噪音。
-
-**5 并发**：asyncio + Semaphore(5)。
-
-### Token 控制策略
-
-| LLM 调用 | 输入内容 | Token 量 |
-|---------|---------|---------|
-| Step 1 screen（per-GSE） | title + summary + overall_design | ~300-600 tokens |
-| Step 2 Call 1（per-GSM） | intent + 单个 GSM characteristics | ~100-300 tokens/call |
-| Step 2 Call 2（per-dataset） | include/exclude 统计 + GEO summary | ~200-400 tokens |
-| Step 3 PubMed verify（per-unsure） | GEO metadata + PubMed abstract | ~800-1500 tokens |
-
-全量 GSM 数据只写 CSV，**不发给任何 LLM**。
-
-### 第 4 层：去重 + 注册 + 人工审批 + 下载
-
-1. **Registry 去重**：已存在的 accession 跳过
-2. **注册**：`upsert_dataset()` 写入 SQLite（含 `sample_metadata_path` 字段）
-3. **人工审批**：Web UI "审批下载" Tab → 勾选确认 → `POST /datasets/approve`
-4. **daemon 下载**：后台轮询 `pending` 状态数据集，执行下载
-5. **报告**：`report_<ts>.json` + `sample_metadata.csv`（每个数据集一份）
-
-
-## 安装
+## Quick Start（Docker，推荐）
 
 ```bash
-cd methyagent
-pip install -r requirements.txt
+git clone <repo-url> methylation_data_agent
+cd methylation_data_agent
+
+# 1. 配置密钥
+cp .env.example .env
+# 编辑 .env，至少填：ZHIPU_API_KEY（LLM）、NCBI_API_KEY（GEO 检索）
+#   可选：GEO_EMAIL、GDC_TOKEN（TCGA 受控数据）
+
+# 2. 建目录（compose bind mount 需要）
+mkdir -p registry data
+
+# 3. 起服务（首次会自动 build 镜像，python:3.11-slim）
+docker compose up -d
+docker compose ps          # webui healthy 即就绪
+
+# 4. 健康检查
+curl -s http://localhost/health
+# → {"status":"ok","agent1_alive":true,...}
+
+# 5. 提交查询（生产路径：download 桶自动下载，无需人工审批）
+curl -s -X POST http://localhost/query -H "Content-Type: application/json" \
+  -d '{"query":"结直肠癌和非癌对照的血浆cfDNA甲基化数据","agent_type":"database"}'
+# → {"task_id":"<uuid>","status":"pending",...}   记下 task_id
+
+# 6. 看进度（一个 query 通常 40-60 分钟）
+docker logs -f methyagent-agent1-query      # 搜索+过滤阶段
+docker logs -f methyagent-agent1-download   # 下载+核验阶段
+
+# 7. 取结果（见下文"查询结果与数据定位"）
 ```
+
+浏览器打开 `http://localhost/` 可用 Web UI（提交、Review Queue 审批 manual_review 数据集、看板）。
+
+---
+
+## 本地安装（不用 Docker）
+
+```bash
+cd methylation_data_agent
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt        # Python 3.11+
+
+cp .env.example .env && vim .env       # 同上填 key
+set -a; source .env; set +a            # CLI 不自动加载 .env，需手动 source
+
+python main.py --status                # 自检：应打印注册表统计
+```
+
+本地 CLI 与 Docker 常驻服务**不要同时跑同一注册表**（都会写 `registry/methyagent.db`）。
+
+---
 
 ## 配置
 
-编辑 `config/settings.yaml`：
+`config/settings.yaml`（默认已可用，关键项）：
 
 ```yaml
 llm:
-  backend: openai          # openai | anthropic | ollama | zhipu
-  model: gpt-4o
-  api_key_env: OPENAI_API_KEY
+  backend: zhipu            # zhipu | openai | anthropic | ollama | deepseek
+  api_key_env: ZHIPU_API_KEY
+  # model 从 .env 的 ZHIPU_MODEL 读（glm-4-flash 免费 / glm-4-air / glm-4-long…）
 
 download:
-  output_dir: ./data/methylation
+  output_dir: ./data/methylation   # 本地 CLI 的下载目录
   max_concurrent: 5
+
+agent1:
+  pipeline: skills          # skills（默认）| legacy（回滚用旧固定管线）
+
+registry:
+  db_path: ./registry/methyagent.db
 ```
 
-设置 API Key 环境变量：
+Docker 环境下 `DATA_DIR=/app/data` 会覆盖 output_dir（= 宿主机 `./data`）。
+LLM 后端切换只需改 `backend` + 对应 `.env` key（openai 兼容端点可用
+`OPENAI_BASE_URL`，工厂自动识别 bigmodel.cn）。
 
-```bash
-export OPENAI_API_KEY=sk-...
-export NCBI_API_KEY=...   # 可选，提高 NCBI 速率限制
-```
+---
 
 ## 使用方法
 
-### 语义搜索（自然语言）
+### 提交查询
+
+query 是自然语言（中英均可），说清 癌症类型 + 样本类型（平台/年份可选）。
+支持直接给 accession。
 
 ```bash
-python main.py --query "EPIC平台在2024年的乳腺癌相关数据"
-python main.py --query "breast cancer WGBS methylation 2022-2023"
-python main.py --query "2020-2023年肺癌450K甲基化数据"
-python main.py --query "结直肠癌cfDNA甲基化血浆数据"
-```
+# 方式 A：HTTP API（推荐，Docker 部署的生产路径）
+curl -s -X POST http://localhost/query -H "Content-Type: application/json" \
+  -d '{"query":"结直肠癌和非癌对照的血浆cfDNA甲基化数据","agent_type":"database"}'
+# download 桶注册即 pending，下载 worker 自动下载
 
-### 精确 Accession 下载
-
-```bash
+# 方式 B：CLI（本地或容器内）
+python main.py --query "breast cancer WGBS methylation 2022-2023" --agent db-only
 python main.py --query "下载GEO编号GSE124600的所有数据"
-python main.py --query "GSE124600 GSE200234"
-python main.py --query "TCGA-BRCA methylation data"
+docker exec -w /app methyagent-agent1-query python main.py --query "..." --agent db-only
 ```
 
-### 运行模式
+**两种方式的差异**：CLI（legacy 编排）跑完过滤后数据集停在 `awaiting_approval`，
+需再触发下载：
 
 ```bash
-# 仅运行数据库搜索（跳过文献挖掘）
-python main.py --query "..." --agent db-only
-
-# 仅运行文献挖掘（跳过数据库搜索）
-python main.py --query "..." --agent lit-only
-
-# 两个 Agent 都运行（默认）
-python main.py --query "..." --agent both
+sqlite3 registry/methyagent.db "UPDATE datasets SET download_status='pending'
+  WHERE download_status='awaiting_approval' AND needs_review=0"
 ```
 
-### 其他命令
+（manual_review 的保持待审是设计行为；也可在 Web UI Review Queue 逐个 approve。）
+
+### CLI 其他命令
 
 ```bash
-# 查看注册表状态
-python main.py --status
-
-# 解析查询但不下载（调试用）
-python main.py --query "..." --dry-run
-
-# 详细日志
-python main.py --query "..." --verbose
-
-# 自定义输出目录
-python main.py --query "..." --output-dir /data/my_methylation
+python main.py --query "..." --dry-run    # 只解析意图，不下载（调试）
+python main.py --status                   # 注册表统计
+python main.py --query "..." --verbose    # DEBUG 日志
+python main.py --query "..." -o /data/x   # 自定义输出目录
 ```
+
+### 监控进度
+
+```bash
+# task 状态（pending → running → done）
+sqlite3 registry/methyagent.db "SELECT task_id,status FROM task_queue
+  WHERE query!='__heartbeat__' ORDER BY created_at DESC LIMIT 3"
+
+# 数据集流水
+sqlite3 registry/methyagent.db "SELECT accession,event,substr(message,1,80),timestamp
+  FROM download_log ORDER BY id DESC LIMIT 10"
+
+docker logs -f methyagent-agent1-query --since 5m
+```
+
+完成标志：`[agent1 pipeline] Done — GEO N ok / M fail, ..., K excluded.`
+核验结论行：`[verify] cols X vs Y gsms; map ...; groups ...`。
+
+### 查询结果与数据定位
+
+task 完成后结果在 `task_queue.result_json`（三桶：`datasets_downloaded` /
+`datasets_review` / `datasets_excluded` 计数）。
+
+```bash
+# ① task 结果
+sqlite3 registry/methyagent.db \
+  "SELECT result_json FROM task_queue WHERE task_id LIKE '<task前8位>%'" | python3 -m json.tool
+
+# ② task → GSE（⚠️ 必须走 query_dataset_map；datasets.task_id 是单值列，只存
+#    第一个命中该 GSE 的 task，直接查会漏）
+sqlite3 registry/methyagent.db \
+  "SELECT accession FROM query_dataset_map WHERE task_id LIKE '<task前8位>%'"
+
+# ③ GSE → 文件（local_path 是入口；容器 /app/data = 宿主机 ./data）
+sqlite3 registry/methyagent.db "
+  SELECT d.accession, d.download_status, d.local_path FROM query_dataset_map q
+  JOIN datasets d USING(accession)
+  WHERE q.task_id LIKE '<task前8位>%' AND d.download_status='done'"
+
+# ④ 样本级：这个 task 要某 GSE 的哪些 GSM、病例/对照构成
+sqlite3 registry/methyagent.db "
+  SELECT s.sample_group, s.cancer, COUNT(*) FROM query_sample_map m
+  JOIN samples s ON s.accession=m.accession AND s.gsm=m.gsm
+  WHERE m.task_id LIKE '<task前8位>%' AND m.accession='<GSE>'
+    AND m.verdict='download' GROUP BY 1,2"
+```
+
+数据目录布局：
+
+```
+data/
+├── GSE124600/                  # 每个 GSE 一个目录
+│   ├── *_umepm.txt.gz          #   保留的矩阵（LLM 按样本类型筛选后）
+│   ├── GSE124600_query_subset.txt.gz   #   query-cancer 列子集（多癌数据集）
+│   ├── GSE124600_series_matrix.txt(.gz)
+│   └── sample_metadata.csv     #   GSM 级样本标注（人类可读）
+├── GSE186007/
+│   └── GSM7426116/*.cov.gz    # Tier-3 per-sample：每 GSM 一个子目录
+├── quarantine/{GSE}/           # 核验失败隔离区（移动不删除）
+└── query_logs/query_*_<task前8位>.csv   # 每次查询的逐 GSE 判定流水
+```
+
+---
+
+## 数据处理管线（当前行为）
+
+```
+query → parse（规则 + LLM）→ intent
+  → geo_search：NCBI esearch/esummary 确定性召回（同义词扩展、平台/年份过滤）
+  → geo_filter（三态，只判相关性）：
+      LLM 读 GSE 元数据 + 代表 GSM characteristics → 每个样本 include/exclude
+      → GSE 级 verdict：download / manual_review / exclude
+      → GSM 级判定写 query_sample_map（多 task 各自成行）
+      → sample_metadata.csv + query_logs/*.csv
+  → download worker（对 pending 数据集）：
+      三级 tier：① series_matrix 有数据 → 下它；② 非 RAW 补充文件全下；
+                ③ 都没有 → 逐 download-GSM 抓页面下 per-sample 文件
+      → tar/zip 成员级提取（在垃圾预删之前）
+      → 垃圾预删（空/README/p值表）+ LLM 按样本类型 keep/drop（保守兜底：
+        无 LLM/解析失败/全拒 → 保留全部非垃圾 + manual_review）
+      → Phase-2 核验：
+          ① 样本列数 vs 该 task 的 download GSM 数（容差 max(5,10%)，
+            跨文件聚合并集；唯一会触发 quarantine 的检查）
+          ② GSM→列映射：列名含 GSM 号 → series_matrix !Sample_title 索引
+            （提交者自定义列名如 Pcrc90 由此确定性解出）→ 低覆盖率挂 review
+          ③ 疾病分组完整性（只报告进 notes）
+      → ① 失败 → 文件移 quarantine/{GSE}/，outcome 回退 manual_review
+      → cancer 子集：经映射精确选 query-cancer 列写 {GSE}_query_subset.txt.gz
+```
+
+设计规格：`skills/geo_filter/SPEC.md`（过滤规则，用户维护）、
+`skills/geo_download/SPEC.md`（下载与核验）。
+
+---
+
+## Registry Schema（registry/methyagent.db）
+
+| 表 | 粒度 | 说明 |
+|----|------|------|
+| `task_queue` | task | 提交的查询（status、result_json） |
+| `datasets` | GSE | 主表：元数据、`recommended_action`（download/manual_review/exclude）、`download_status`（pending/downloading/done/failed/no_file/awaiting_approval/skipped）、local_path、reason 等 |
+| `samples` | (GSE,GSM) | 每 GSM 的 source_name/group/cancer/characteristics_json |
+| `query_sample_map` | (task,GSE,GSM) | **每次查询对每个样本的判定**（verdict + reason）；task↔GSE↔GSM 权威多对多表 |
+| `query_dataset_map` | (task,GSE) | task↔GSE 映射（按 task 查 GSE 用它） |
+| `download_log` | 事件 | 每 GSE 下载/核验事件流水 |
+
+旧库打开自动迁移（`_migrate_schema`），无需手动操作。
 
 ## 项目结构
 
 ```
-methyagent/
+methylation_data_agent/
+├── main.py                     # CLI 入口
+├── docker-compose.yml          # 4 服务（override 文件为开发热载配置）
+├── Dockerfile                  # python:3.11-slim 单镜像
 ├── config/
-│   ├── settings.yaml          # 配置文件
-│   └── cancer_synonyms.yaml   # 癌种同义词 + 技术词 + 液体活检词
+│   ├── settings.yaml           # 主配置
+│   └── cancer_synonyms.yaml    # 癌种同义词 + 技术/液体活检词表
 ├── agents/
-│   ├── database_agent.py      # Agent 1：GEO + TCGA 搜索下载（三步过滤：GEO screen → GSM judge → PubMed verify）
-│   ├── literature_agent.py    # Agent 2：文献挖掘 + 补充下载
-│   └── orchestrator.py        # LangGraph 图定义与编排
-├── tools/
-│   ├── geo_tools.py           # GEO NCBI E-utilities API（含 get_all_gsm_metadata + get_representative_gsm_details + fetch_pubmed_abstract）
-│   ├── tcga_tools.py          # GDC REST API
-│   ├── pubmed_tools.py        # PubMed / PMC / bioRxiv
-│   ├── download_tools.py      # 异步断点续传下载器
-│   └── parser_tools.py        # 关键词解析 + accession 提取 + 同义词扩展
-├── registry/
-│   └── registry.py            # SQLite 注册表（去重核心，含核心列 + PubMed 核验列）
-├── state/
-│   └── graph_state.py         # LangGraph TypedDict 状态
-├── utils/
-│   ├── logger.py              # 日志配置
-│   └── llm_factory.py         # LLM 后端工厂
-├── main.py                    # CLI 入口
-└── requirements.txt
+│   ├── agent1_pipeline.py      # skills 管线编排（daemon 主路径）
+│   ├── database_agent.py       # legacy 编排（CLI 路径 / 回滚）
+│   ├── literature_agent.py     # Agent 2
+│   └── orchestrator.py         # LangGraph 图（CLI 用）
+├── skills/
+│   ├── geo_search/             # 确定性 GEO 召回
+│   ├── geo_filter/             # 三态过滤（SPEC.md 为行为源）
+│   ├── geo_download/           # 下载 + 核验（verify.py / archive_extract.py）
+│   └── adaptive_evidence/      # manual_review 自取证（bind_tools agent）
+├── tools/                      # geo_tools / tcga_tools / pubmed_tools /
+│                               # download_tools（断点续传）/ parser_tools
+├── registry/registry.py        # SQLite 注册表
+├── api/                        # FastAPI（main.py + templates/）
+├── scripts/agent_daemon.py     # 常驻 worker 入口（query/download/literature 模式）
+├── state/ · utils/ · tests/
 ```
-
-## 输出
-
-运行完成后在 `output_dir` 生成：
-
-```
-data/methylation/
-├── GSE124600/
-│   └── GSE124600_series_matrix.txt.gz
-├── TCGA-BRCA/
-│   └── *.methylation_array.sesame.level3betas.txt
-├── GSE220160/
-│   └── sample_metadata.csv             # GSM 级样本元数据（v5 新增）
-├── report_20240522_143021.json         # 完整报告（JSON）
-├── report_20240522_143021.md           # 可读报告（Markdown）
-└── geo_candidates_20240522_143021.json  # GEO 候选列表（含 PubMed 核验字段）
-```
-
-`geo_candidates_<ts>.json` 结构示例：
-
-```json
-{
-  "query": "结直肠癌cfDNA甲基化血浆数据",
-  "timestamp": "2024-05-22T14:30:21+00:00",
-  "total": 12,
-  "candidates": [
-    {
-      "accession": "GSE220160",
-      "title": "Plasma cfDNA methylation in CRC patients",
-      "cancer_type": "colorectal cancer",
-      "platform": "450K",
-      "sample_count": 130,
-      "year": 2022,
-      "data_type": "array",
-      "sample_type": "plasma",
-      "pubmed_ids": ["35123456"],
-      "pubmed_verified": true,
-      "pubmed_keep": true,
-      "paper_pmid": "35123456",
-      "consistency": "consistent",
-      "stage_treatment": "stage II-III, treatment-naive",
-      "usable": 1,
-      "recommended_action": "download",
-      "reason": "Abstract confirms plasma cfDNA from CRC patients, n=130",
-      "notes": "sample_count GEO=120 paper=130"
-    }
-  ]
-}
-```
-
-注册表保存在 `registry/methyagent.db`（SQLite）。
-
-## 去重机制
-
-```
-Agent 2 下载前检查流程：
-
-提取到 accession X
-        │
-        ▼
-查询 registry.db WHERE accession = X
-        │
-   ┌────┴────┐
-   │ 存在    │ 不存在
-   ▼         ▼
-跳过，记录  写入注册表 → 下载
-"已由Agent1  status=pending
- 覆盖"
-```
-
-## Registry 数据库 Schema
-
-`datasets` 表核心列：
-
-| 列名 | 类型 | 说明 |
-|------|------|------|
-| accession | TEXT PK | GSE / TCGA 编号 |
-| source | TEXT | GEO / TCGA |
-| cancer_type | TEXT | 癌种（PubMed 核验后更新） |
-| platform | TEXT | 450K / EPIC / WGBS / RRBS |
-| sample_type | TEXT | tumor / cfdna / plasma / wbc ...（PubMed 核验后更新） |
-| sample_count | INTEGER | 样本数（PubMed 核验后如差异 >20% 则修正） |
-| download_status | TEXT | pending / downloading / done / failed / skipped |
-| disease_groups | TEXT | 癌种分组（v2 新增） |
-| stage_treatment | TEXT | 分期/治疗信息（PubMed 核验后更新） |
-| available_file_type | TEXT | 检测到的文件类型（v2 新增） |
-| sample_level_annotation | TEXT | GSM 级注释 JSON（v2 新增） |
-| usable | INTEGER | 0=排除, 1=可用（与 pubmed_keep 同步） |
-| recommended_action | TEXT | download / review / skip（PubMed 核验输出） |
-| reason | TEXT | 核验结论（PubMed 核验输出） |
-| consistency | TEXT | consistent / minor_discrepancy / major_discrepancy（v4 新增） |
-| notes | TEXT | 自由备注，追加不覆盖 |
-| pubmed_verified | INTEGER | 1=已完成 PubMed 核验，0=跳过（v4 新增） |
-| pubmed_keep | INTEGER | 1=核验通过，0=核验拒绝（v4 新增） |
-| sample_metadata_path | TEXT | GSM 级样本元数据 CSV 路径（v5 新增） |
-| paper_pmid | TEXT | 核验所用 PMID（v4 新增） |
-
-旧数据库自动通过 `_migrate_schema()` 迁移，无需手动操作。
 
 ## 支持的数据类型
 
-| 类型 | 平台 | 文件格式 |
+| 类型 | 平台 | 文件形态 |
 |------|------|---------|
-| Illumina 450K | HumanMethylation450 | beta 值矩阵 .txt.gz |
-| Illumina EPIC | HumanMethylationEPIC | beta 值矩阵 .txt.gz |
-| WGBS | 全基因组亚硫酸盐测序 | .bismark.cov.gz, .bed.gz |
-| RRBS | 简化亚硫酸盐测序 | .cov.gz, .bed.gz |
+| Illumina 450K / EPIC | 芯片 | series_matrix / 合并 β 矩阵 .txt.gz（IDAT 等原始不保留） |
+| WGBS / RRBS / MCTA-Seq 等 | 测序 | 合并矩阵 或 per-sample `.cov`/`.bed`/bsmap 文件（标 `needs_processing=merge_per_sample`） |
+| TCGA | — | Level 3 β 值（公开无需 token；受控数据配 GDC_TOKEN） |
 
 ## 注意事项
 
-- TCGA 公开数据（Level 3 beta 值）无需 token
-- TCGA 受控数据（Level 1/2 原始数据）需要 dbGaP 授权，在 `settings.yaml` 中配置 `GDC_TOKEN`
-- NCBI API Key 可选，但建议设置（提高速率限制从 3 req/s 到 10 req/s）
-- 云服务器 IP 可能被 NCBI 标记为 abuse，可通过 `settings.yaml` 的 `geo.proxy` 或环境变量 `NCBI_PROXY` 配置 SOCKS5/HTTP 代理
-- 补充材料解析仅支持 PMC 开放获取文章
-- Step 2 使用 `LLM_GSM_JUDGE_SYSTEM_PROMPT`（Call 1）和 `LLM_DATASET_KEEP_SYSTEM_PROMPT`（Call 2），Step 3 使用 `LLM_VERIFY_SYSTEM_PROMPT`；三个 prompt 均固定不变以触发 Z.AI 隐式缓存（cached_tokens 降费加速）
-- PubMed 核验（Step 3）**仅对 Step 2 返回 `dataset_keep="unsure"` 的数据集执行**，大幅减少 NCBI efetch 和 LLM 调用次数
-- Step 3 中无 PMID / 摘要获取失败 / LLM 出错时，数据集**默认丢弃**（unsure + 无法确认 = 不下载）；Step 1 screen 出错时仍保守保留
-- `keep=False` 的数据集直接丢弃，不写入注册表；`recommended_action=review` 的数据集写入注册表供人工复查
-- `cancer_synonyms.yaml` 可独立更新，无需改代码即可添加新癌种同义词
-- 查询字符串上限 400 字符（`MAX_QUERY_LENGTH`），超长时自动裁剪癌种同义词，避免触发 NCBI abuse 检测
-- v5 新增 GSM 级两次 LLM 判断（`_sample_metadata_judge_concurrent`），是主过滤器；旧的 `_llm_judge_datasets_concurrent` 保留在代码中但不在主流程中调用
+- **改代码后必须重启容器**：`docker compose restart agent1-query agent1-download agent2`（bind mount 热载文件，但 daemon 常驻进程不重读代码）
+- **NCBI 限流**：无 API key 3 req/s、有 key 10 req/s；连续抓 100+ GSM 页面可能触发 abuse-redirect（表现为静默 miss），大批量分批跑
+- **磁盘**：per-sample 测序数据集单 GSE 可达 17GB，批量查询前 `df -h`
+- **成本**：一次 query（~136 候选）消耗约 130 万 LLM token
+- 下载引擎带断点续传（`.part` + Range），中断重跑自动续
+- TCGA 公开数据（Level 3）无需 token；受控数据需 dbGaP 授权（`GDC_TOKEN`）
+- `cancer_synonyms.yaml` 可独立扩充，加癌种同义词不用改代码
