@@ -1,0 +1,140 @@
+# Gold test queries → truth derivation config.
+#
+# `text` MUST equal the exact string passed to the agent (scripts/benchmark.py
+# --query / API task query) — eval_agent.py matches query_logs' "# query:"
+# preamble line against it. Don't reword without re-running the agent.
+#
+# Predicate semantics (scripts/derive_truth.py):
+#   gse_all       — GSE-level fields that must ALL hold.
+#   groups        — list of requirement groups. Each group is a CONJUNCTION
+#                   over combo fields (one combo must satisfy every field
+#                   constraint in the group). A GSE matches when gse_all holds
+#                   AND every group has ≥1 satisfying combo (groups need not be
+#                   satisfied by the SAME combo — "case exists" + "control
+#                   exists" is two groups).
+#                   target: true  → the group describes WHICH samples are wanted
+#                                   (truth GSM set = combos satisfying ALL
+#                                   target groups simultaneously).
+#                   target: false → an existence requirement only (e.g.
+#                                   "must have a control"), not itself selected.
+#   min_confidence— combos below this confidence don't satisfy any group.
+#
+# disease matching: a field value `disease_group: <name>` refers to
+# disease_groups below (any-of, case-insensitive substring on the combo's
+# `disease` label); plain lists are exact matches after lowercase/trim.
+
+version: v1
+
+disease_groups:
+  colorectal: [colorectal cancer, colon cancer, rectal cancer, colorectal adenocarcinoma, crc, colon adenocarcinoma, rectal adenocarcinoma, colorectal carcinoma]
+  liver: [hepatocellular carcinoma, liver cancer, hcc, hepatocellular]
+  lung: [lung adenocarcinoma, lung cancer, luad, non-small cell lung cancer, nsclc, lung carcinoma]
+  gastric: [gastric cancer, stomach cancer, gastric adenocarcinoma, gc]
+  breast: [breast cancer, breast carcinoma, invasive ductal carcinoma]
+  pancreatic: [pancreatic cancer, pancreatic ductal adenocarcinoma, pdac]
+  esophageal: [esophageal cancer, esophageal adenocarcinoma, esophageal squamous]
+  healthy: [healthy, normal, healthy donor, healthy control, none]
+
+queries:
+  # --- main positive scenarios ---
+  - id: crc_plasma_cfdna
+    text: "colorectal cancer和非癌对照的cfDNA甲基化数据"
+    predicate:
+      gse_all: {data_type: [array_methylation, seq_methylation], organism: [Homo sapiens], multi_organism: false}
+      groups:
+        - name: crc_case_plasma
+          target: true
+          fields: {disease_group: colorectal, disease_role: [case], sample_kind: [primary],
+                   specimen: [plasma, serum], treatment: [naive, unknown, mixed], lesion: [primary, na, unknown]}
+        - name: non_cancer_control
+          target: false
+          fields: {disease_role: [control, benign, precursor, adjacent_normal], sample_kind: [primary]}
+    min_confidence: medium
+
+  - id: crc_tissue_adjacent
+    text: "结直肠癌组织和癌旁组织的DNA甲基化数据"
+    predicate:
+      gse_all: {data_type: [array_methylation, seq_methylation], organism: [Homo sapiens], multi_organism: false}
+      groups:
+        - name: crc_tumor
+          target: true
+          fields: {disease_group: colorectal, disease_role: [case], sample_kind: [primary],
+                   specimen: [tumor_tissue, ffpe_tissue], lesion: [primary, na, unknown]}
+        - name: adjacent
+          target: true
+          fields: {disease_role: [adjacent_normal], sample_kind: [primary],
+                   specimen: [adjacent_normal, normal_tissue]}
+    min_confidence: medium
+
+  - id: hcc_plasma_cfdna
+    text: "肝细胞癌血浆cfDNA甲基化数据，要有健康人对照"
+    predicate:
+      gse_all: {data_type: [array_methylation, seq_methylation], organism: [Homo sapiens], multi_organism: false}
+      groups:
+        - name: hcc_case_plasma
+          target: true
+          fields: {disease_group: liver, disease_role: [case], sample_kind: [primary],
+                   specimen: [plasma, serum], treatment: [naive, unknown, mixed], lesion: [primary, na, unknown]}
+        - name: healthy_control
+          target: false
+          fields: {disease_group: healthy, disease_role: [control], sample_kind: [primary]}
+    min_confidence: medium
+
+  - id: pancancer_plasma
+    text: "多种癌症的血浆cfDNA甲基化数据"
+    predicate:
+      gse_all: {data_type: [array_methylation, seq_methylation], organism: [Homo sapiens], multi_organism: false}
+      groups:
+        - name: any_cancer_plasma
+          target: true
+          fields: {disease_role: [case], sample_kind: [primary],
+                   specimen: [plasma, serum], treatment: [naive, unknown, mixed]}
+        - name: non_cancer_control
+          target: false
+          fields: {disease_role: [control, benign, precursor, adjacent_normal], sample_kind: [primary]}
+    min_confidence: medium
+
+  - id: healthy_cfdna_reference
+    text: "健康人cfDNA甲基化数据，用作正常对照参考"
+    predicate:
+      gse_all: {data_type: [array_methylation, seq_methylation], organism: [Homo sapiens], multi_organism: false}
+      groups:
+        - name: healthy_plasma
+          target: true
+          fields: {disease_group: healthy, disease_role: [control], sample_kind: [primary],
+                   specimen: [plasma, serum]}
+    min_confidence: medium
+
+  # --- correct-answer-empty negatives (false-positive probes) ---
+  - id: neg_cellline_query
+    text: "HCT116细胞系的DNA甲基化数据"
+    expect_empty: true
+    predicate:
+      gse_all: {data_type: [array_methylation, seq_methylation], organism: [Homo sapiens]}
+      groups:
+        - name: hct116
+          target: true
+          fields: {disease_group: [colorectal], disease_role: [case], sample_kind: [cell_line]}
+    min_confidence: medium
+
+  - id: neg_mirna_query
+    text: "血浆miRNA表达谱数据"
+    expect_empty: true
+    predicate:
+      gse_all: {data_type: [mirna], organism: [Homo sapiens]}
+      groups:
+        - name: mirna_plasma
+          target: true
+          fields: {specimen: [plasma, serum], sample_kind: [primary]}
+    min_confidence: medium
+
+  - id: neg_mouse_query
+    text: "小鼠肝脏DNA甲基化数据"
+    expect_empty: true
+    predicate:
+      gse_all: {data_type: [array_methylation, seq_methylation], organism: [Mus musculus]}
+      groups:
+        - name: mouse_liver
+          target: true
+          fields: {specimen: [normal_tissue, tissue_other], sample_kind: [animal, primary]}
+    min_confidence: medium

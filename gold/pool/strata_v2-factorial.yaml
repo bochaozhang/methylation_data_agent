@@ -1,0 +1,62 @@
+# Gold pool v2 — FACTORIAL strata: cancer × specimen × (methylation, human fixed).
+#
+# Design rationale (docs/gold_standard_pool_gap.md §5):
+#   v1's per-cancer strata sampled 20 from a relevance-ordered top-1000 window —
+#   tissue studies dominated the window, plasma/cfDNA sets were systematically
+#   dropped (crc_plasma truth = 0). The factorial fix narrows each cell until
+#   total hits < the 1000 window, making within-cell sampling UNIFORM over the
+#   whole combination. Guarantee: every (cancer × specimen) cell has pool
+#   presence.
+#
+#   Control presence (对照) is deliberately NOT a stratum axis: GEO has no
+#   searchable control field, and adding 'healthy' to terms biases toward
+#   control-flaunting studies (dropping case-only hard examples). Control
+#   existence comes from the LABEL layer (disease_role=control combos) and is
+#   composed into truth by derive_truth.py.
+#
+# Axes:
+#   cancer   : colorectal, liver, gastric, esophageal, lung, breast, pancreatic
+#   specimen : plasma(+cfDNA/ctDNA/liquid-biopsy synonyms), serum, tissue, wbc/blood
+#   fixed    : methylation[All Fields] AND Homo sapiens[orgn] (appended per cell)
+#
+# n_target=8 per cell (combination coverage comes from the CELL, the sample only
+# adds year/platform diversity); 12 for the two primary-benchmark cells
+# (CRC×plasma, HCC×plasma). Est. hits/cell: 30–300 (all < 1000 window).
+#
+# Usage: see docs/gold_standard_pool_gap.md §3.2 (same merge/label/truth flow;
+# NCBI must have cooled down from the abuse redirect).
+
+version: v2-factorial
+seed: 44
+
+cancers:
+  colorectal: '(colorectal[All Fields] OR colon[All Fields] OR rectal[All Fields])'
+  liver: '(hepatocellular[All Fields] OR "liver cancer"[All Fields])'
+  gastric: '(gastric[All Fields] OR stomach[All Fields])'
+  esophageal: '(esophageal[All Fields] OR oesophageal[All Fields])'
+  lung: '(lung[All Fields] AND (cancer[All Fields] OR carcinoma[All Fields]))'
+  breast: 'breast[All Fields]'
+  pancreatic: '(pancreatic[All Fields] OR pancreas[All Fields])'
+
+specimens:
+  plasma: '(plasma[All Fields] OR "cell-free DNA"[All Fields] OR cfDNA[All Fields] OR ctDNA[All Fields] OR "liquid biopsy"[All Fields])'
+  serum: 'serum[All Fields]'
+  tissue: '(tissue[All Fields] OR tumor[All Fields] OR tumour[All Fields] OR biopsy[All Fields])'
+  blood: '("whole blood"[All Fields] OR "peripheral blood"[All Fields] OR leukocyte[All Fields] OR PBMC[All Fields] OR "white blood cell"[All Fields])'
+
+# per-cell overrides (default 8; primary-benchmark cells boosted)
+n_target_default: 8
+n_target_overrides:
+  'colorectal|plasma': 12
+  'liver|plasma': 12
+
+# Additional non-cancer cells (healthy reference material — control-side anchor
+# for the healthy_cfdna_reference query):
+extra_cells:
+  - name: healthy_plasma
+    esearch_term: 'methylation[All Fields] AND (plasma[All Fields] OR serum[All Fields] OR "cell-free DNA"[All Fields] OR cfDNA[All Fields]) AND (healthy[All Fields] OR "healthy donor"[All Fields] OR normal[All Fields]) AND Homo sapiens[orgn]'
+    n_target: 12
+
+# Explicit hard positives are retained from v1.1-topup (verified_crc_cfdna,
+# spec_reference_cases, recurring_manual_review) — merge order in the docs keeps
+# them; do not duplicate here.

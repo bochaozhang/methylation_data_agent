@@ -1,0 +1,64 @@
+# Gold pool top-up v1.1 — targeted strata fixing the liquid-biopsy positive gap.
+#
+# Background: pool_v1's crc/hcc plasma queries derived EMPTY truth — not a label
+# or predicate bug, a pool gap. The v1 strata's top-1000 relevance windows +
+# random sampling dropped plasma-cfDNA cancer sets (GSE124600/GSE186007 etc.).
+# Full top-1000 crawl was costed at ~700h serial / ~240h parallel + NCBI
+# rate-limit infeasibility (docs/gold_standard_pool_gap.md) — rejected.
+# This top-up adds ~90 GSE of targeted positives instead.
+#
+# Usage (after NCBI rate-limit cooldown):
+#   python scripts/build_gold_pool.py --strata-file gold/pool/strata_v1.1-topup.yaml \
+#       --out gold/pool/pool_v1.1-topup.jsonl
+#   cat gold/pool/pool_v1.jsonl gold/pool/pool_v1.1-topup.jsonl \
+#       | python -c "import sys; lines={}; [lines.update({json.loads(l)['accession']: l for l in sys.stdin})]; print(''.join(lines.values()), end='')" \
+#       > gold/pool/pool_v1.1.jsonl   # merge, dedup (first-wins: v1 strata kept)
+#   python scripts/build_gold_labels.py --pool gold/pool/pool_v1.1.jsonl
+#   python scripts/build_gold_labels.py --pool gold/pool/pool_v1.1.jsonl --export \
+#       --export-out gold/labels/v1/labels_v1.1.jsonl
+#   python scripts/derive_truth.py --labels gold/labels/v1/labels_v1.1.jsonl \
+#       --out-dir gold/truth/v1.1 --check
+#
+# NOTE the topup merge keeps pool_v1 rows verbatim (first-wins) so v1 stratum
+# provenance is preserved; topup rows carry their own stratum ids.
+
+version: v1.1-topup
+seed: 43
+
+strata:
+  # --- hard positives: agent-verified download verdicts from production runs ---
+  # Every GSE the agent itself marked download on a real colorectal-cfDNA query
+  # (data/query_logs, non-GraphQL queries). These are "search MUST find" cases.
+  - name: verified_crc_cfdna
+    mode: explicit            # no esearch — accessions listed below
+    accessions: [GSE124600, GSE149438, GSE186007, GSE199173, GSE79277]
+    n_target: 5
+
+  # SPEC.md reference cases the user named as canonical CRC/cfDNA datasets.
+  - name: spec_reference_cases
+    mode: explicit
+    accessions: [GSE122126, GSE97932, GSE110185]
+    n_target: 3
+    # GSE110185 pooled CRC cfDNA (SPEC case), GSE122126 healthy+multi-cancer cfDNA,
+    # GSE97932 serum ctDNA (SPEC "watch/manual_review" case — a HARD example)
+
+  # --- targeted liquid-biopsy sweeps (esearch) ---
+  - name: crc_plasma_sweep
+    esearch_term: 'methylation[All Fields] AND (colorectal[All Fields] OR colon[All Fields] OR rectal[All Fields]) AND (plasma[All Fields] OR serum[All Fields] OR "cell-free DNA"[All Fields] OR cfDNA[All Fields] OR ctDNA[All Fields]) AND Homo sapiens[orgn]'
+    n_target: 40
+
+  - name: hcc_plasma_sweep
+    esearch_term: 'methylation[All Fields] AND (hepatocellular[All Fields] OR "liver cancer"[All Fields]) AND (plasma[All Fields] OR serum[All Fields] OR "cell-free DNA"[All Fields] OR cfDNA[All Fields] OR ctDNA[All Fields]) AND Homo sapiens[orgn]'
+    n_target: 25
+
+  - name: pancancer_plasma_sweep
+    esearch_term: '(plasma[All Fields] OR serum[All Fields]) AND ("cell-free DNA"[All Fields] OR cfDNA[All Fields] OR ctDNA[All Fields]) AND methylation[All Fields] AND Homo sapiens[orgn]'
+    n_target: 15
+
+  # --- pending-manual-review positives worth gold coverage ---
+  # Recurrent manual_review verdicts across production runs (GSE208596 already in
+  # pool; GSE97923/GSE124775 appear 4-5x — label them once, stop re-reviewing).
+  - name: recurring_manual_review
+    mode: explicit
+    accessions: [GSE97923, GSE124775, GSE290978, GSE166259]
+    n_target: 4

@@ -1,0 +1,72 @@
+# Gold pool strata — deliberately BROAD, query-independent GEO crawls.
+#
+# These esearch terms must differ from the agent's own synonym-expanded search
+# (tools/parser_tools.build_geo_search_string) so the pool does not inherit the
+# search layer's blind spots — search recall is measured against this pool.
+#
+# Each stratum:
+#   name         — stratum id, recorded per GSE in pool_v1.jsonl
+#   esearch_term — gds-db term; the script appends " AND GSE[Entry Type]"
+#   n_target     — how many GSE to sample (random.Random(seed).sample)
+#
+# Negative strata (neg_*) are deliberate: precision / exclude-accuracy metrics
+# live on them. Do not "clean them up" after inspecting results.
+
+version: v1
+seed: 42
+
+strata:
+  # --- broad positive strata (no cancer term — core positives) ---
+  - name: hsa_meth_recent
+    esearch_term: 'methylation[All Fields] AND Homo sapiens[orgn] AND 2020:2026[pdat]'
+    n_target: 40
+  - name: hsa_meth_older
+    esearch_term: 'methylation[All Fields] AND Homo sapiens[orgn] AND 2014:2019[pdat]'
+    n_target: 20
+
+  # --- liquid-biopsy stratum (the target use case; includes non-methylation hits) ---
+  - name: cfdna_liquid
+    esearch_term: '("cell-free DNA"[All Fields] OR cfDNA[All Fields] OR "liquid biopsy"[All Fields]) AND Homo sapiens[orgn]'
+    n_target: 30
+
+  # --- per-cancer methylation sweeps ---
+  - name: crc
+    esearch_term: 'methylation[All Fields] AND (colorectal[All Fields] OR colon[All Fields] OR rectal[All Fields]) AND Homo sapiens[orgn]'
+    n_target: 20
+  - name: liver
+    esearch_term: 'methylation[All Fields] AND (hepatocellular[All Fields] OR "liver cancer"[All Fields]) AND Homo sapiens[orgn]'
+    n_target: 15
+  - name: lung
+    esearch_term: 'methylation[All Fields] AND (lung[All Fields] AND adenocarcinoma[All Fields]) AND Homo sapiens[orgn]'
+    n_target: 15
+  - name: gastric
+    esearch_term: 'methylation[All Fields] AND (gastric[All Fields] OR stomach[All Fields]) AND Homo sapiens[orgn]'
+    n_target: 10
+  - name: breast
+    esearch_term: 'methylation[All Fields] AND breast[All Fields] AND plasma[All Fields] AND Homo sapiens[orgn]'
+    n_target: 10
+
+  # --- platform browses (recall strata for array-based studies) ---
+  - name: platform_450k
+    esearch_term: 'GPL13534[Platform] AND Homo sapiens[orgn]'
+    n_target: 15
+  - name: platform_epic
+    esearch_term: '(GPL21145[Platform] OR GPL23976[Platform]) AND Homo sapiens[orgn]'
+    n_target: 15
+
+  # --- deliberate negatives ---
+  - name: neg_mouse          # organism negative
+    esearch_term: 'methylation[All Fields] AND Mus musculus[orgn]'
+    n_target: 15
+  - name: neg_cellline       # sample-kind negative
+    esearch_term: 'methylation[All Fields] AND Homo sapiens[orgn] AND "cell line"[All Fields]'
+    n_target: 15
+  - name: neg_expr           # non-methylation negative (expression profiling)
+    esearch_term: '"expression profiling by high throughput sequencing"[DataSet Type] AND Homo sapiens[orgn] AND cancer[All Fields]'
+    n_target: 15
+  - name: neg_mirna          # analyte negative (miRNA in plasma — hard distractor)
+    esearch_term: 'miRNA[All Fields] AND Homo sapiens[orgn] AND (plasma[All Fields] OR serum[All Fields])'
+    n_target: 10
+  - name: neg_rna_meth       # "methylation" ≠ DNA methylation negative
+    esearch_term: '"RNA methylation"[All Fields] AND Homo sapiens[orgn]'
+    n_target: 5

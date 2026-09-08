@@ -85,6 +85,16 @@ geo_candidates_*.json
 # Local docs (working notes — not tracked)
 docs/
 
+# ---- Gold standard (benchmark reproducibility root is tracked; bulky/dirty artifacts are not) ----
+# pool / queries / truth yaml+jsonl ARE tracked (small, version-frozen).
+# Label SQLite + evidence caches are regenerable bulk — not tracked.
+gold/labels/**/*.db
+gold/evidence_cache/
+gold/**/labels_smoke.jsonl
+gold/**/pool_smoke.jsonl
+gold/**/calibration_smoke.csv
+gold/truth/smoke/
+
 # Cache and temporary
 *.cache
 *.tmp
