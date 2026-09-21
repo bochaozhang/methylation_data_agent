@@ -329,6 +329,13 @@ class Registry:
         """
         Insert a new dataset or update metadata if it already exists.
 
+        download_status is non-downgrading on update: an existing 'done' or
+        'downloading' is never overwritten by the incoming status — a repeat
+        query re-registering a downloaded dataset as 'pending' must not reset
+        it for re-download (docs/caching_audit.md §2.3). Explicit transitions
+        (worker finishing, approve_review, retry-failed) go through
+        update_status / direct SQL and bypass this guard.
+
         Returns:
             True if a new record was inserted, False if updated.
         """
@@ -367,7 +374,8 @@ class Registry:
                             sample_metadata_path    = COALESCE(?, sample_metadata_path),
                             task_id                 = COALESCE(task_id, ?),
                             raw_query               = COALESCE(raw_query, ?),
-                            download_status         = ?,
+                            download_status         = CASE WHEN download_status IN ('done', 'downloading')
+                                                            THEN download_status ELSE ? END,
                             updated_at              = ?
                         WHERE accession = ?
                         """,

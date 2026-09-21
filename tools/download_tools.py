@@ -170,6 +170,19 @@ class DownloadEngine:
             dest_path = dest_dir / filename
             tmp_path = dest_path.with_suffix(dest_path.suffix + ".part")
 
+            # Already on disk (e.g. dataset re-queued by a repeat query or a
+            # manual reset): skip the fetch. Only a non-empty file counts — a
+            # 0-byte destination means a previous attempt died mid-rename and
+            # should be re-fetched (docs/caching_audit.md §3, fix #2).
+            if dest_path.exists() and dest_path.stat().st_size > 0:
+                logger.info(
+                    f"Download {accession}: {dest_path.name} already on disk "
+                    f"({dest_path.stat().st_size / 1024:.1f} KB) — skipping fetch"
+                )
+                result = self._success_result(accession, dest_path)
+                result["already_present"] = True
+                return result
+
             for attempt in range(self.retry_attempts):
                 try:
                     result = await self._attempt_download(
