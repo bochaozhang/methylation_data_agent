@@ -46,7 +46,7 @@ class TestResolveBranches(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_series_matrix_hit_short_circuits(self):
-        """Path A: series_matrix present → returned, no cache/efetch touched."""
+        """Path A: series_matrix present → returned, no efetch touched, result cached."""
         sm = [_gsm("GSM1"), _gsm("GSM2", "healthy")]
         geo = _mock_geo(sm=sm, all_gsm=[_gsm("X")], rep=[_gsm("Y")])
         ds = {"sample_count": 2}
@@ -57,23 +57,25 @@ class TestResolveBranches(unittest.TestCase):
         geo.fetch_series_matrix_sample_info.assert_called_once_with("GSE1")
         geo.get_all_gsm_metadata.assert_not_called()
         geo.get_representative_gsm_details.assert_not_called()
-        # Nothing cached (series_matrix is cheap; not persisted).
-        self.assertFalse(
-            (Path(self.output_dir) / "GSE1" / "gsm_metadata_cache.json").exists()
-        )
+        # Persisted so the next run's cache hit skips the series_matrix download.
+        cache_path = Path(self.output_dir) / "GSE1" / "gsm_metadata_cache.json"
+        self.assertTrue(cache_path.exists())
+        with cache_path.open() as f:
+            self.assertEqual(json.load(f), sm)
 
-    def test_cache_hit_skips_efetch(self):
-        """Cached efetch-all result is reused; no efetch on a re-run."""
+    def test_cache_hit_skips_all_network(self):
+        """Cache shadows BOTH network sources — no series_matrix fetch, no efetch."""
         cached = [_gsm("GSM1"), _gsm("GSM2")]
         cache_path = Path(self.output_dir) / "GSE2" / "gsm_metadata_cache.json"
         write_gsm_cache(cache_path, cached)
 
-        geo = _mock_geo(sm=None, all_gsm=[_gsm("SHOULD_NOT")], rep=[_gsm("NEITHER")])
+        geo = _mock_geo(sm=[_gsm("SHOULD_NOT_SM")], all_gsm=[_gsm("SHOULD_NOT")], rep=[_gsm("NEITHER")])
         ds = {"sample_count": 2}
 
         out = resolve_gsm_details(geo, "GSE2", ds, self.output_dir)
 
         self.assertEqual(out, cached)
+        geo.fetch_series_matrix_sample_info.assert_not_called()
         geo.get_all_gsm_metadata.assert_not_called()
         geo.get_representative_gsm_details.assert_not_called()
 

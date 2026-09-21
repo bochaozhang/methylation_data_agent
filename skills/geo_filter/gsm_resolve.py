@@ -6,16 +6,19 @@ path) need per-GSM metadata to feed skills.geo_filter.filter_dataset(), which
 deduplicates the samples and makes ONE LLM call. The evidence can come from three
 sources, in order of preference:
 
-  1. series_matrix  — one download yields ALL samples with structured fields
+  1. JSON cache     — {output_dir}/{accession}/gsm_metadata_cache.json, an exact
+                      snapshot of a prior series_matrix or efetch-all result.
+                      Checked first: GEO metadata is effectively immutable
+                      post-publication, so a re-run serves every sample from
+                      disk and skips all network sources.
+  2. series_matrix  — one download yields ALL samples with structured fields
                       (the "Path A" the user wants the no-series_matrix path to
-                      mirror). Cheapest and most complete when available.
-  2. JSON cache     — {output_dir}/{accession}/gsm_metadata_cache.json, an exact
-                      snapshot of a prior get_all_gsm_metadata() result. Lets a
-                      re-run skip the O(N) efetch.
+                      mirror). Cheapest and most complete when available; a hit
+                      is persisted to the cache.
   3. get_all_gsm_metadata — efetch MiniML for EVERY GSM (the new "Path B" default,
                       replacing the old representative sample of ≤30). Bounded for
                       very large series by a soft cap that falls back to
-                      representative sampling.
+                      representative sampling (the fallback is never cached).
 
 The cache is a dedicated JSON file (not sample_metadata.csv) because the two
 existing CSV writers have different, non-round-trippable schemas for
@@ -93,8 +96,13 @@ def resolve_gsm_details(
     Resolve per-sample GSM metadata via the cheapest complete source.
 
     Policy (first non-empty source wins):
-      1. series_matrix            — geo_client.fetch_series_matrix_sample_info(accession)
-      2. JSON cache hit           — {output_dir}/{accession}/gsm_metadata_cache.json
+      1. JSON cache hit           — {output_dir}/{accession}/gsm_metadata_cache.json.
+                                    An exact snapshot of a prior fetch; GEO metadata
+                                    is effectively immutable post-publication, so a
+                                    hit shadows both network sources. Delete the
+                                    JSON to force a refetch.
+      2. series_matrix            — geo_client.fetch_series_matrix_sample_info(accession);
+                                    a hit is persisted to the cache
       3. over the soft cap        — representative sampling fallback (avoids O(N) efetch
                                     on very large series); logged, NOT cached
       4. otherwise                — geo_client.get_all_gsm_metadata(accession), then
@@ -117,7 +125,16 @@ def resolve_gsm_details(
     """
     cache_path = _cache_path(output_dir, accession)
 
-    # 1. series_matrix — one download, all samples, structured fields.
+    # 1. cache hit — skip all network sources on re-runs. A prior series_matrix or
+    #    efetch-all result is an exact snapshot; GEO metadata is effectively
+    #    immutable post-publication (docs/caching_audit.md §3, fix #3).
+    cached = read_gsm_cache(cache_path)
+    if cached:
+        logger.info(f"resolve_gsm_details({accession}): cache hit {len(cached)} samples")
+        return cached
+
+    # 2. series_matrix — one download, all samples, structured fields. Persisted
+    #    so the next run's cache hit (step 1) skips this download too.
     try:
         sm = geo_client.fetch_series_matrix_sample_info(accession)
     except Exception as e:  # noqa: BLE001 — network/head failure → fall through
@@ -125,13 +142,8 @@ def resolve_gsm_details(
         sm = None
     if sm:
         logger.info(f"resolve_gsm_details({accession}): series_matrix {len(sm)} samples")
+        write_gsm_cache(cache_path, sm)
         return sm
-
-    # 2. cache hit — skip the O(N) efetch on re-runs.
-    cached = read_gsm_cache(cache_path)
-    if cached:
-        logger.info(f"resolve_gsm_details({accession}): cache hit {len(cached)} samples")
-        return cached
 
     # 3. soft cap — very large series: representative sample instead of efetch-all.
     n = ds.get("sample_count")
