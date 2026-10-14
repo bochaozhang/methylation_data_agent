@@ -427,7 +427,9 @@ def parse_query_rules(query: str) -> Dict[str, Any]:
     return {
         "raw_query": query,
         "mode": "accession" if has_explicit_accession(query) else "semantic",
-        "accessions": accessions,
+        # No "tcga" key: TCGA routes via cancer_type (tcga-direct reads
+        # tcga_code), and nothing downstream consumes accessions.tcga.
+        "accessions": {k: v for k, v in accessions.items() if k != "tcga"},
         "platform": platform,
         "cancer_type_display": cancer_display,
         "cancer_type_code": cancer_code,
@@ -451,7 +453,6 @@ Output ONLY valid JSON with these fields (use null for missing values):
   "mode": "accession" | "semantic",
   "accessions": {
     "geo": ["GSE..."],
-    "tcga": ["TCGA-..."],
     "arrayexpress": []
   },
   "cancer_type": {
@@ -472,7 +473,10 @@ Output ONLY valid JSON with these fields (use null for missing values):
 }
 
 Rules:
-- If the query contains explicit accession numbers (GSE..., TCGA-...), set mode="accession"
+- If the query contains explicit accession numbers (GSE..., E-MTAB-...), set mode="accession"
+- Do NOT emit a "tcga" key in accessions: TCGA datasets are reached via cancer_type
+  (tcga_code), not via accession lists. Mentions like "TCGA COAD/READ" are examples
+  of cancer types — map them to cancer_type, never to accessions.
 - For Chinese cancer names: 乳腺癌=BRCA, 肺癌=LUAD, 肝癌=LIHC, 胃癌=STAD, 结直肠癌=COAD
 - For platform: EPIC/850K → "EPIC", 450K/HM450 → "450K", WGBS/全基因组亚硫酸盐 → "WGBS"
 - year_start / year_end: ONLY set these if the user explicitly mentions a year or year range.

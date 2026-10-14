@@ -38,7 +38,8 @@ class CancerType(TypedDict, total=False):
 
 class Accessions(TypedDict, total=False):
     geo: List[str]          # ["GSE124600", ...]
-    tcga: List[str]         # ["TCGA-COAD", ...]
+    # No "tcga": TCGA datasets route via cancer_type.tcga_code (tcga-direct
+    # queries GDC by cancer code); nothing downstream consumes accessions.tcga.
 
 
 class SearchIntent(TypedDict):
@@ -81,13 +82,13 @@ def normalize_intent(raw_query: str, parsed: Dict[str, Any]) -> SearchIntent:
     canonical SearchIntent. Always sets raw_query; unifies cancer_type to a
     nested dict; fills missing fields with defaults.
     """
-    # ---- accessions: tolerate dict {geo,tcga,...} or other shapes ----
+    # ---- accessions: tolerate dict {geo,...} or other shapes; drop any
+    # inbound "tcga" (unused downstream — TCGA routes via cancer_type) ----
     raw_acc = parsed.get("accessions") or {}
     if isinstance(raw_acc, dict):
         geo_acc = list(raw_acc.get("geo") or [])
-        tcga_acc = list(raw_acc.get("tcga") or [])
     else:
-        geo_acc, tcga_acc = [], []
+        geo_acc = []
 
     # ---- cancer_type: nested dict (LLM) vs flat fields (rules) ----
     ct = parsed.get("cancer_type")
@@ -116,7 +117,7 @@ def normalize_intent(raw_query: str, parsed: Dict[str, Any]) -> SearchIntent:
         raw_query=raw_query,
         mode=parsed.get("mode", "semantic"),
         parse_method=parsed.get("parse_method", "rules_fallback"),
-        accessions={"geo": geo_acc, "tcga": tcga_acc},
+        accessions={"geo": geo_acc},
         cancer_type=cancer_type,
         platform=parsed.get("platform"),
         data_type=parsed.get("data_type"),
