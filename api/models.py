@@ -11,17 +11,37 @@ from pydantic import BaseModel, Field
 
 class QueryRequest(BaseModel):
     """POST /query — submit a new methylation search query."""
-    query: str = Field(
-        ...,
+    query: Optional[str] = Field(
+        default=None,
         min_length=3,
         max_length=500,
-        description="Search query, e.g. 'LUAD DNA methylation 450k'",
+        description=(
+            "Search query, e.g. 'LUAD DNA methylation 450k'. Required unless "
+            "`intent` is given (then optional — a readable summary is generated)."
+        ),
         examples=["lung adenocarcinoma methylation TCGA"],
     )
     agent_type: str = Field(
         default="both",
         description="Which agent(s) to run: 'database', 'literature', or 'both'",
         pattern="^(database|literature|both)$",
+    )
+    intent: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Structured intent (SearchIntent fields) — bypasses the LLM parser "
+            "(deterministic). Takes precedence over `query` for the database "
+            "pipeline; `query` (given or generated) still feeds the literature agent."
+        ),
+    )
+    label: Optional[str] = Field(
+        default=None,
+        max_length=50,
+        description="Sub-task role for compound queries: 'main', 'auxiliary', or any short tag.",
+    )
+    force: bool = Field(
+        default=False,
+        description="Skip the active-task dedup check and always create a new task.",
     )
 
 
@@ -44,6 +64,8 @@ class TaskResponse(BaseModel):
     agent_type: str
     query: str
     status: str
+    label: Optional[str] = None
+    deduplicated: bool = False   # True: existing equivalent task returned, nothing created
     created_at: str
     started_at: Optional[str] = None
     finished_at: Optional[str] = None

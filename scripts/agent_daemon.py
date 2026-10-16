@@ -151,10 +151,14 @@ def _build_initial_state(query: str, config: dict) -> dict:
     }
 
 
-def run_database_agent(query: str, registry: Registry, task_id: str = None) -> dict:
+def run_database_agent(query: str, registry: Registry, task_id: str = None,
+                       intent_json: str = None) -> dict:
     """
     Run the database (agent1) path for the given query.
     Returns a summary dict written to task_queue.result_json.
+
+    intent_json: optional structured SearchIntent JSON claimed from the task
+    (skills pipeline only — the legacy pipeline re-parses the query itself).
 
     config.agent1.pipeline selects the implementation:
       "skills" (default) → deterministic skill pipeline (geo-search → geo-filter
@@ -168,7 +172,8 @@ def run_database_agent(query: str, registry: Registry, task_id: str = None) -> d
         if pipeline_mode == "skills":
             from agents.agent1_pipeline import run_agent1_pipeline
             logger.info(f"[agent1] Running skill pipeline for query: {query!r}")
-            state = run_agent1_pipeline(query, config, registry, task_id=task_id)
+            state = run_agent1_pipeline(query, config, registry, task_id=task_id,
+                                        intent_json=intent_json)
 
             dl = state.get("download_results") or []
             tcga = state.get("tcga_results") or []
@@ -518,11 +523,18 @@ def daemon_loop(agent_type: str, registry: Registry, mode: str = "both"):
 
         task_id = task["task_id"]
         query = task["query"]
-        logger.info(f"Claimed task {task_id} — query={query!r}")
+        intent_json = task.get("intent_json")
+        logger.info(
+            f"Claimed task {task_id} — query={query!r}"
+            + (f" label={task.get('label')!r} structured=True" if intent_json else "")
+        )
 
         # ---- Execute ----
         try:
-            result = runner(query, registry, task_id=task_id) if agent_type == "database" else runner(query, registry)
+            result = (
+                runner(query, registry, task_id=task_id, intent_json=intent_json)
+                if agent_type == "database" else runner(query, registry)
+            )
             registry.complete_task(task_id, result=result)
             logger.info(f"Task {task_id} completed successfully.")
         except Exception as exc:

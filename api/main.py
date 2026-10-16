@@ -18,6 +18,7 @@ Environment variables:
     REGISTRY_PATH   Path to SQLite registry (default: ./registry/methyagent.db)
     HEARTBEAT_STALE_SECS  Seconds after which a heartbeat is considered stale (default: 120)
 """
+import json
 import os
 import sys
 import time
@@ -26,7 +27,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import yaml
-from fastapi import FastAPI, HTTPException, Request, Query
+from fastapi import FastAPI, HTTPException, Request, Query, Response
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 
@@ -146,12 +147,14 @@ def _is_heartbeat_alive(ts: Optional[str]) -> bool:
         return False
 
 
-def _task_to_response(task: dict) -> TaskResponse:
+def _task_to_response(task: dict, deduplicated: bool = False) -> TaskResponse:
     return TaskResponse(
         task_id=task["task_id"],
         agent_type=task["agent_type"],
         query=task["query"],
         status=task["status"],
+        label=task.get("label"),
+        deduplicated=deduplicated,
         created_at=task["created_at"],
         started_at=task.get("started_at"),
         finished_at=task.get("finished_at"),
@@ -200,16 +203,89 @@ async def dashboard(request: Request):
         return templates.TemplateResponse("index.html", {"request": request})
 
 
+def _intent_summary(intent: Dict[str, Any]) -> str:
+    """Human-readable one-liner for a structured intent (stored as task.query)."""
+    parts = []
+    ct = intent.get("cancer_type") or {}
+    if ct.get("display"):
+        parts.append(str(ct["display"]))
+    sample_types = intent.get("sample_types") or []
+    if sample_types:
+        parts.append("/".join(sample_types))
+    if intent.get("platform"):
+        parts.append(str(intent["platform"]))
+    if intent.get("mode") == "accession":
+        geo = (intent.get("accessions") or {}).get("geo") or []
+        if geo:
+            parts.append(",".join(geo[:5]))
+    return "structured: " + (" ".join(parts) if parts else "unspecified")
+
+
+def _intent_key(intent: Dict[str, Any]) -> str:
+    """Canonical serialization for intent equivalence (dedup)."""
+    import json as _json
+    return _json.dumps(intent, sort_keys=True, ensure_ascii=False, default=str)
+
+
 @app.post("/query", response_model=TaskResponse, status_code=201)
-async def submit_query(body: QueryRequest):
+async def submit_query(body: QueryRequest, response: Response):
     """
     Submit a new methylation search query.
 
-    Creates one or two tasks in the queue (one per agent if agent_type='both').
-    Returns the primary task record.
+    Free text (`query`, LLM-parsed) or structured (`intent`, deterministic —
+    no LLM parse; `query` optional then, a readable summary is generated).
+    `label` tags sub-task roles for compound queries ('main'/'auxiliary').
+
+    Dedup: unless `force`, an equivalent pending/running task (same agent_type;
+    identical canonical intent, or identical free-text query) is returned
+    instead of creating a duplicate (deduplicated=True, HTTP 200).
     """
+    from state.agent1_state import normalize_intent
+
     registry = get_registry()
-    task_id = registry.create_task(query=body.query, agent_type=body.agent_type)
+
+    # ---- resolve query + optional structured intent -----------------------
+    intent_json: Optional[str] = None
+    intent: Optional[Dict[str, Any]] = None
+    if body.intent is not None:
+        parsed = dict(body.intent)
+        parsed.setdefault("parse_method", "structured")
+        intent = normalize_intent(body.query or "", parsed)
+        intent_json = json.dumps(intent, ensure_ascii=False)
+        query = body.query or _intent_summary(intent)
+    elif body.query:
+        query = body.query.strip()
+    else:
+        raise HTTPException(
+            status_code=422,
+            detail="Provide `query` (free text) or `intent` (structured), not neither.",
+        )
+
+    # ---- submit-side dedup: reuse an equivalent active task ----------------
+    if not body.force:
+        for t in registry.list_active_tasks(agent_type=body.agent_type):
+            if intent_json is not None:
+                if not t.get("intent_json"):
+                    continue
+                try:
+                    other = json.loads(t["intent_json"])
+                except Exception:
+                    continue
+                if _intent_key(other) == _intent_key(intent):
+                    existing = registry.get_task(t["task_id"])
+                    response.status_code = 200
+                    return _task_to_response(existing, deduplicated=True)
+            elif not t.get("intent_json") and t.get("query", "").strip() == query:
+                existing = registry.get_task(t["task_id"])
+                response.status_code = 200
+                return _task_to_response(existing, deduplicated=True)
+
+    task_id = registry.create_task(
+        query=query,
+        agent_type=body.agent_type,
+        label=body.label,
+        intent_json=intent_json,
+    )
     task = registry.get_task(task_id)
     if task is None:
         raise HTTPException(status_code=500, detail="Task creation failed.")

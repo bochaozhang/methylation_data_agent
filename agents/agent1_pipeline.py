@@ -17,8 +17,9 @@ so the Web UI / approval / daemon keep working.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
-from typing import Any, Callable, Dict, List
+from typing import Any, Callable, Dict, List, Optional
 
 from langgraph.graph import END, START, StateGraph
 
@@ -70,6 +71,32 @@ def _run_concurrent(fn: Callable, items: List[Any], *args, max_concurrent: int =
         return loop.run_until_complete(_all())
     except RuntimeError:
         return asyncio.run(_all())
+
+
+# ---------------------------------------------------------------------- #
+#  Query parsing (module-level so it is unit-testable)                    #
+# ---------------------------------------------------------------------- #
+
+def _parse_query_intent(raw: str, json_llm: Any,
+                        intent_json: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Parse a raw query into a canonical SearchIntent.
+
+    Priority: intent_json → LLM parse → rules fallback.
+      - intent_json: structured submission (task_queue.intent_json, e.g. MCP
+        compound queries). Deterministic — NO LLM call, json_llm untouched.
+      - LLM parse: parse_query_with_llm; on any failure, rules fallback.
+    """
+    if intent_json:
+        parsed = json.loads(intent_json)
+        parsed.setdefault("parse_method", "structured")
+        return normalize_intent(raw, parsed)
+    try:
+        parsed = parse_query_with_llm(raw, json_llm)
+    except Exception as e:
+        logger.warning(f"agent1 parse: LLM failed ({e}), rules fallback")
+        parsed = parse_query_rules(raw)
+    return normalize_intent(raw, parsed)
 
 
 # ---------------------------------------------------------------------- #
@@ -140,14 +167,10 @@ def build_agent1_pipeline(config: Dict[str, Any], registry: Any = None):
     # ---- parse ----
     def parse_node(state: Agent1State) -> Dict[str, Any]:
         raw = state.get("raw_query", "")
-        try:
-            parsed = parse_query_with_llm(raw, json_llm)
-        except Exception as e:
-            logger.warning(f"agent1 parse: LLM failed ({e}), rules fallback")
-            parsed = parse_query_rules(raw)
-        intent = normalize_intent(raw, parsed)
+        intent = _parse_query_intent(raw, json_llm, state.get("intent_json"))
         logger.info(
-            f"agent1 parse: mode={intent.get('mode')} "
+            f"agent1 parse: method={intent.get('parse_method')} "
+            f"mode={intent.get('mode')} "
             f"cancer={(intent.get('cancer_type') or {}).get('tcga_code')} "
             f"sample={intent.get('sample_type')}"
         )
@@ -496,8 +519,14 @@ def _upsert(reg: Any, rec: Dict[str, Any], status: str,
 # ---------------------------------------------------------------------- #
 
 def run_agent1_pipeline(query: str, config: Dict[str, Any], registry: Any,
-                        output_dir: str = None, task_id: str = None) -> Dict[str, Any]:
-    """Compile + invoke the pipeline for one query. Returns the final state."""
+                        output_dir: str = None, task_id: str = None,
+                        intent_json: str = None) -> Dict[str, Any]:
+    """
+    Compile + invoke the pipeline for one query. Returns the final state.
+
+    intent_json: optional normalized SearchIntent JSON (structured submission).
+    When set, the parse node uses it directly — no LLM parse.
+    """
     app = build_agent1_pipeline(config, registry)
     initial: Agent1State = {
         "raw_query": query,
@@ -505,6 +534,7 @@ def run_agent1_pipeline(query: str, config: Dict[str, Any], registry: Any,
         "registry": registry,
         "output_dir": output_dir or config.get("download", {}).get("output_dir", "./data/methylation"),
         "task_id": task_id,
+        "intent_json": intent_json,
         "error_log": [],
     }
     logger.info(f"agent1 pipeline start | query='{query}'")

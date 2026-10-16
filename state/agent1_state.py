@@ -145,6 +145,7 @@ class Agent1State(TypedDict, total=False):
     config: Dict[str, Any]
     registry: Any
     output_dir: str
+    intent_json: str    # structured SearchIntent JSON; parse node uses it directly (no LLM)
 
     # ---- parse node ----
     parsed_intent: SearchIntent

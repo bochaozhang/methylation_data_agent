@@ -150,7 +150,9 @@ class Registry:
                     started_at  TEXT,
                     finished_at TEXT,
                     result_json TEXT,
-                    error       TEXT
+                    error       TEXT,
+                    label       TEXT,      -- sub-task role, e.g. 'main'/'auxiliary' (compound queries)
+                    intent_json TEXT       -- structured SearchIntent; parse_node uses it directly (no LLM parse)
                 );
             """)
 
@@ -267,6 +269,9 @@ class Registry:
             # query mapping columns
             "ALTER TABLE datasets ADD COLUMN task_id TEXT",
             "ALTER TABLE datasets ADD COLUMN raw_query TEXT",
+            # task_queue v2 columns (compound-query label + structured intent)
+            "ALTER TABLE task_queue ADD COLUMN label TEXT",
+            "ALTER TABLE task_queue ADD COLUMN intent_json TEXT",
         ]
         with self._get_conn() as conn:
             for sql in migrations:
@@ -1010,14 +1015,21 @@ class Registry:
         query: str,
         agent_type: str = "both",
         task_id: Optional[str] = None,
+        label: Optional[str] = None,
+        intent_json: Optional[str] = None,
     ) -> str:
         """
         Create a new task in the queue.
 
         Args:
-            query: The search query string.
+            query: The search query string (human-readable; for structured
+                submissions this is a generated summary, kept for auditability).
             agent_type: 'database', 'literature', or 'both'.
             task_id: Optional explicit task ID; auto-generated if None.
+            label: Optional sub-task role for compound queries ('main',
+                'auxiliary', or any short custom tag).
+            intent_json: Optional normalized SearchIntent JSON — when present,
+                the pipeline's parse node uses it directly (no LLM parse).
 
         Returns:
             The task_id string.
@@ -1028,9 +1040,10 @@ class Registry:
         with self._lock:
             with self._get_conn() as conn:
                 conn.execute(
-                    """INSERT INTO task_queue (task_id, agent_type, query, status, created_at)
-                       VALUES (?, ?, ?, 'pending', ?)""",
-                    (task_id, agent_type, query, now),
+                    """INSERT INTO task_queue
+                       (task_id, agent_type, query, status, created_at, label, intent_json)
+                       VALUES (?, ?, ?, 'pending', ?, ?, ?)""",
+                    (task_id, agent_type, query, now, label, intent_json),
                 )
         return task_id
 
@@ -1049,21 +1062,21 @@ class Registry:
             with self._get_conn() as conn:
                 if agent_type == "database":
                     row = conn.execute(
-                        """SELECT task_id, query, agent_type FROM task_queue
+                        """SELECT task_id, query, agent_type, label, intent_json FROM task_queue
                            WHERE status = 'pending'
                              AND agent_type IN ('database', 'both')
                            ORDER BY created_at ASC LIMIT 1"""
                     ).fetchone()
                 elif agent_type == "literature":
                     row = conn.execute(
-                        """SELECT task_id, query, agent_type FROM task_queue
+                        """SELECT task_id, query, agent_type, label, intent_json FROM task_queue
                            WHERE status = 'pending'
                              AND agent_type IN ('literature', 'both')
                            ORDER BY created_at ASC LIMIT 1"""
                     ).fetchone()
                 else:
                     row = conn.execute(
-                        """SELECT task_id, query, agent_type FROM task_queue
+                        """SELECT task_id, query, agent_type, label, intent_json FROM task_queue
                            WHERE status = 'pending'
                            ORDER BY created_at ASC LIMIT 1"""
                     ).fetchone()
@@ -1080,7 +1093,30 @@ class Registry:
                     "task_id": task_id,
                     "query": row["query"],
                     "agent_type": row["agent_type"],
+                    "label": row["label"],
+                    "intent_json": row["intent_json"],
                 }
+
+    def list_active_tasks(self, agent_type: Optional[str] = None) -> List[Dict]:
+        """
+        Return all pending/running tasks (used by the submit-side dedup check).
+
+        Args:
+            agent_type: Optional exact filter ('database'/'literature'/'both');
+                None returns active tasks of every type.
+        """
+        with self._get_conn() as conn:
+            sql = """SELECT task_id, agent_type, query, status, label, intent_json
+                     FROM task_queue
+                     WHERE status IN ('pending', 'running')
+                       AND task_id NOT LIKE 'heartbeat_%'"""
+            params: list = []
+            if agent_type:
+                sql += " AND agent_type = ?"
+                params.append(agent_type)
+            sql += " ORDER BY created_at ASC"
+            rows = conn.execute(sql, params).fetchall()
+            return [dict(r) for r in rows]
 
     def complete_task(self, task_id: str, result: Any = None) -> None:
         """Mark a task as done and store the result JSON."""
