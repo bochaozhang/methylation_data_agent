@@ -121,6 +121,60 @@ class HealthResponse(BaseModel):
     """GET /health — agent heartbeat status."""
     status: str   # 'ok' | 'degraded'
     agent1_heartbeat: Optional[str] = None   # ISO timestamp or None
+
+
+# ---------------------------------------------------------------------------
+# /search/dry-run — recall preview (parse + geo-search, nothing else)
+# ---------------------------------------------------------------------------
+
+class DryRunRequest(BaseModel):
+    """POST /search/dry-run — search-only preview.
+
+    Give `query` (free text, goes through the LLM parser) or `intent`
+    (structured SearchIntent-shaped dict, bypasses the LLM parser) — not both.
+    """
+    query: Optional[str] = Field(
+        default=None,
+        min_length=3,
+        max_length=500,
+        description="Free-text search query, e.g. 'colorectal cancer cfDNA methylation'",
+    )
+    intent: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Structured intent (SearchIntent fields: mode, cancer_type{display,tcga_code}, "
+            "sample_types, platform, data_type, year_start, year_end, extra_keywords, notes). "
+            "Takes precedence over `query`; no LLM parse."
+        ),
+    )
+    max_candidates: int = Field(
+        default=50, ge=1, le=200,
+        description="Max candidates returned in the response (total count is always included)",
+    )
+
+
+class DryRunCandidate(BaseModel):
+    """One recalled candidate GSE (compact view — full metadata needs a task)."""
+    accession: str
+    title: Optional[str] = None
+    cancer_type: Optional[str] = None
+    platform: Optional[str] = None
+    data_type: Optional[str] = None
+    sample_count: Optional[int] = None
+    year: Optional[int] = None
+    pubmed_ids: List[str] = []
+
+
+class DryRunResponse(BaseModel):
+    """POST /search/dry-run — what the search stage would recall."""
+    parse_method: str            # 'llm' | 'rules_fallback' | 'structured'
+    intent: Dict[str, Any]       # normalized SearchIntent actually used
+    search_queries: List[str]    # the NCBI esearch string(s)
+    total_candidates: int
+    returned: int
+    truncated: bool
+    candidates: List[DryRunCandidate]
+    elapsed_seconds: float
     agent2_heartbeat: Optional[str] = None
     agent1_alive: bool = False
     agent2_alive: bool = False

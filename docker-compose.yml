@@ -135,6 +135,9 @@ services:
       REGISTRY_PATH: /app/registry/methyagent.db
       HEARTBEAT_STALE_SECS: "120"
       LOG_LEVEL: "${LOG_LEVEL:-info}"
+      # /search/dry-run runs parse+search in-process — needs the NCBI proxy
+      # like the workers (socks tunnel on the docker host).
+      NCBI_PROXY: "socks5h://172.17.0.1:1080"
     volumes:
       - ./registry:/app/registry
       - ./data:/app/data
