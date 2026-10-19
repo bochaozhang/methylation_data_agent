@@ -1252,6 +1252,12 @@ class GEOClient:
     #  Series matrix sample info (all-sample annotations)                 #
     # ------------------------------------------------------------------ #
 
+    # Hard cap on decompressed bytes scanned while looking for the !Sample_
+    # metadata header. Even a 1000-sample series' header is < 2MB; hitting
+    # 64MB without finding the table marker means a malformed/hostile file.
+    MAX_SERIES_MATRIX_HEADER_BYTES = 64 * 1024 * 1024
+    _TABLE_BEGIN_MARKER = b"!series_matrix_table_begin"
+
     def fetch_series_matrix_sample_info(self, accession: str) -> Optional[List[Dict]]:
         """
         Download a GSE's series_matrix file and extract per-sample annotations
@@ -1260,6 +1266,14 @@ class GEOClient:
         the format of get_representative_gsm_details().
 
         Returns None if series_matrix is unavailable (404) or download fails.
+
+        Memory-safety (incident 2026-10-19, GSE51032): array series_matrix
+        files embed the full β matrix and can reach 3+ GB compressed /
+        10+ GB raw — materializing them OOM-killed the worker at 13.4 GB RSS.
+        The !Sample_ metadata always precedes the matrix table, so we
+        stream-decompress and STOP at !series_matrix_table_begin instead of
+        downloading the whole file; a 64 MB decompressed cap backstops files
+        that never emit the marker.
         """
         from tools.geo_tools import SAMPLE_GROUP_KEYWORDS as _SGK
 
@@ -1276,13 +1290,41 @@ class GEOClient:
             logger.debug(f"fetch_series_matrix_sample_info({accession}): HEAD failed: {e}")
             return None
 
-        # Download and decompress
+        # Download and decompress — streaming, header-only (see docstring).
         try:
             time.sleep(self._rate_limit_delay)
-            resp = self.session.get(url, timeout=30)
+            resp = self.session.get(url, stream=True, timeout=(10, 60))
             resp.raise_for_status()
-            import gzip
-            text = gzip.decompress(resp.content).decode("utf-8", errors="replace")
+            import zlib
+            decomp = zlib.decompressobj(16 + zlib.MAX_WBITS)  # gzip wrapper
+            marker = self._TABLE_BEGIN_MARKER
+            pieces = []
+            total = 0
+            carry = b""  # tail of the previous window, for boundary-spanning markers
+            for chunk in resp.iter_content(chunk_size=65536):
+                if not chunk:
+                    continue
+                out = decomp.decompress(chunk)
+                if not out:
+                    continue
+                pieces.append(out)
+                total += len(out)
+                window = carry + out  # search the whole window, not just its tail
+                if marker in window:
+                    break
+                carry = window[-(len(marker) - 1):]
+                if total > self.MAX_SERIES_MATRIX_HEADER_BYTES:
+                    logger.warning(
+                        f"fetch_series_matrix_sample_info({accession}): header scan "
+                        f"exceeded {self.MAX_SERIES_MATRIX_HEADER_BYTES} bytes without "
+                        f"table marker — aborting (falls back to representative sampling)"
+                    )
+                    resp.close()
+                    return None
+            resp.close()
+            text = b"".join(pieces).decode("utf-8", errors="replace")
+            if "!series_matrix_table_begin" in text:
+                text = text.split("!series_matrix_table_begin")[0]
         except Exception as e:
             logger.warning(f"fetch_series_matrix_sample_info({accession}): download failed: {e}")
             return None
