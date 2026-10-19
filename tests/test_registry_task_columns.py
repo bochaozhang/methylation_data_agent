@@ -96,5 +96,74 @@ class TestTaskColumns(unittest.TestCase):
         self.assertEqual([t["task_id"] for t in active_all], [t_pending])
 
 
+class TestRequeueOrphanedTasks(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = str(Path(self.tmp.name) / "reg.db")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_orphaned_running_requeued_to_pending(self):
+        reg = Registry(db_path=self.db)
+        tid = reg.create_task(query="q", agent_type="database", label="auxiliary")
+        reg.claim_task("database")  # → running, started_at set
+
+        requeued = reg.requeue_orphaned_tasks("database")
+        self.assertEqual(requeued, [tid])
+        task = reg.get_task(tid)
+        self.assertEqual(task["status"], "pending")
+        self.assertIsNone(task["started_at"])
+        # And it is claimable again.
+        again = reg.claim_task("database")
+        self.assertEqual(again["task_id"], tid)
+        self.assertEqual(again["label"], "auxiliary")
+
+    def test_done_and_other_type_untouched(self):
+        reg = Registry(db_path=self.db)
+        t_done = reg.create_task(query="done q", agent_type="database")
+        reg.claim_task("database")
+        reg.complete_task(t_done, result={})
+        t_lit = reg.create_task(query="lit q", agent_type="literature")
+        reg.claim_task("literature")
+
+        # Database worker startup: its own done task and the literature task
+        # (not claimable by database) must be left alone.
+        requeued = reg.requeue_orphaned_tasks("database")
+        self.assertEqual(requeued, [])
+        self.assertEqual(reg.get_task(t_done)["status"], "done")
+        self.assertEqual(reg.get_task(t_lit)["status"], "running")
+
+    def test_both_agent_type_is_claimable(self):
+        """'both' tasks are claimed by database workers → requeued by them."""
+        reg = Registry(db_path=self.db)
+        t_both = reg.create_task(query="both q", agent_type="both")
+        reg.claim_task("database")
+        self.assertEqual(reg.get_task(t_both)["status"], "running")
+
+        self.assertEqual(reg.requeue_orphaned_tasks("database"), [t_both])
+        self.assertEqual(reg.get_task(t_both)["status"], "pending")
+
+    def test_heartbeat_rows_never_requeued_never_claimed(self):
+        """Incident 2026-10-19: a requeued heartbeat row briefly became a
+        claimable 'pending' task. Heartbeat rows must be excluded from both
+        requeue and claim."""
+        reg = Registry(db_path=self.db)
+        t_real = reg.create_task(query="real q", agent_type="database")
+        reg.update_heartbeat("database")  # heartbeat_database row, status running
+
+        # Requeue skips the heartbeat row even if it sits in 'running'.
+        self.assertEqual(reg.requeue_orphaned_tasks("database"), [])
+
+        # Even a pending heartbeat row (the race window) is never claimed.
+        import sqlite3
+        conn = sqlite3.connect(self.db)
+        conn.execute("UPDATE task_queue SET status='pending' WHERE task_id='heartbeat_database'")
+        conn.commit()
+        conn.close()
+        claimed = reg.claim_task("database")
+        self.assertEqual(claimed["task_id"], t_real)
+
+
 if __name__ == "__main__":
     unittest.main()

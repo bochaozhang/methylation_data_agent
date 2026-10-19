@@ -1065,6 +1065,7 @@ class Registry:
                         """SELECT task_id, query, agent_type, label, intent_json FROM task_queue
                            WHERE status = 'pending'
                              AND agent_type IN ('database', 'both')
+                             AND task_id NOT LIKE 'heartbeat_%'
                            ORDER BY created_at ASC LIMIT 1"""
                     ).fetchone()
                 elif agent_type == "literature":
@@ -1072,12 +1073,14 @@ class Registry:
                         """SELECT task_id, query, agent_type, label, intent_json FROM task_queue
                            WHERE status = 'pending'
                              AND agent_type IN ('literature', 'both')
+                             AND task_id NOT LIKE 'heartbeat_%'
                            ORDER BY created_at ASC LIMIT 1"""
                     ).fetchone()
                 else:
                     row = conn.execute(
                         """SELECT task_id, query, agent_type, label, intent_json FROM task_queue
                            WHERE status = 'pending'
+                           AND task_id NOT LIKE 'heartbeat_%'
                            ORDER BY created_at ASC LIMIT 1"""
                     ).fetchone()
 
@@ -1117,6 +1120,45 @@ class Registry:
             sql += " ORDER BY created_at ASC"
             rows = conn.execute(sql, params).fetchall()
             return [dict(r) for r in rows]
+
+    def requeue_orphaned_tasks(self, agent_type: str) -> List[str]:
+        """
+        Requeue 'running' tasks of this worker's claimable types back to
+        'pending' (started_at cleared). Returns the requeued task_ids.
+
+        Called ONCE at daemon startup by task-CLAIMING workers only
+        (mode query/both). At startup this process owns nothing, so any
+        'running' task of its claimable types was left behind by a killed
+        predecessor (e.g. container restart mid-task) and would otherwise be
+        stuck forever — claim_task only ever looks at 'pending'.
+
+        Download-only workers must NOT call this: they would requeue tasks a
+        live query worker is legitimately executing.
+        """
+        claimable = {
+            "database": ("database", "both"),
+            "literature": ("literature", "both"),
+        }.get(agent_type, (agent_type,))
+        placeholders = ",".join("?" * len(claimable))
+        with self._lock:
+            with self._get_conn() as conn:
+                rows = conn.execute(
+                    f"""SELECT task_id FROM task_queue
+                        WHERE status = 'running'
+                          AND agent_type IN ({placeholders})
+                          AND task_id NOT LIKE 'heartbeat_%'""",
+                    claimable,
+                ).fetchall()
+                ids = [r["task_id"] for r in rows]
+                if ids:
+                    id_ph = ",".join("?" * len(ids))
+                    conn.execute(
+                        f"""UPDATE task_queue
+                            SET status = 'pending', started_at = NULL, error = NULL
+                            WHERE task_id IN ({id_ph})""",
+                        ids,
+                    )
+                return ids
 
     def complete_task(self, task_id: str, result: Any = None) -> None:
         """Mark a task as done and store the result JSON."""

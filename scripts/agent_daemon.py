@@ -482,6 +482,22 @@ def daemon_loop(agent_type: str, registry: Registry, mode: str = "both"):
         f"poll_interval={POLL_INTERVAL}s, heartbeat_interval={HEARTBEAT_INTERVAL}s"
     )
 
+    # ---- Orphaned-task self-healing (claiming workers only) ----------------
+    # At startup this process owns nothing; a 'running' task of our claimable
+    # types was left by a killed predecessor (container restart mid-task) and
+    # would be stuck forever — claim_task only looks at 'pending'. Download-only
+    # workers skip this: they would requeue tasks a live query worker is running.
+    if mode in ("query", "both"):
+        try:
+            orphaned = registry.requeue_orphaned_tasks(agent_type)
+            if orphaned:
+                logger.warning(
+                    f"Requeued {len(orphaned)} orphaned running task(s) left by a "
+                    f"dead worker: {orphaned}"
+                )
+        except Exception as orph_exc:
+            logger.error(f"Orphan requeue failed (continuing anyway): {orph_exc}")
+
     while not _shutdown_requested:
         # ---- Heartbeat ----
         now = time.monotonic()
