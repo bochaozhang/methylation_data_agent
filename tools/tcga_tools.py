@@ -192,7 +192,8 @@ class GDCClient:
             "fields": (
                 "file_id,file_name,file_size,md5sum,data_type,"
                 "experimental_strategy,platform,cases.project.project_id,"
-                "cases.case_id,created_datetime,updated_datetime"
+                "cases.case_id,cases.samples.sample_type,"
+                "created_datetime,updated_datetime"
             ),
             "format": "JSON",
             "size": max_results,
@@ -273,6 +274,7 @@ class GDCClient:
             project, platform = key.split("|", 1)
             canonical_platform = _gdc_platform_to_canonical(platform)
             year = _extract_year_from_files(group_files)
+            disease_groups = _count_sample_types(group_files)
 
             records.append({
                 "accession": project,
@@ -285,9 +287,39 @@ class GDCClient:
                 "title": TCGA_PROJECTS.get(project, project),
                 "file_ids": [f["file_id"] for f in group_files],
                 "total_size_bytes": sum(f.get("file_size", 0) for f in group_files),
+                # Verdict semantics: tcga-direct bypasses geo-filter BY DESIGN
+                # (Level-3 β values are standard usable data), so these records
+                # carry a design-trust download verdict instead of a NULL that
+                # would strand them in consumers' "unknown" bucket.
+                "recommended_action": "download",
+                "reason": (f"TCGA {project} Level-3 methylation (GDC) — trusted "
+                           f"by design, bypasses geo-filter"),
+                "disease_groups": disease_groups,
+                "sample_level_annotation": "yes",
             })
 
         return records
+
+
+def _count_sample_types(files: List[Dict]) -> Optional[str]:
+    """
+    Aggregate per-file sample types into a disease_groups-style breakdown,
+    e.g. "TCGA cohort: Primary Tumor 293 / Solid Tissue Normal 26" — the same
+    field downstream platforms parse for control counts (disease_groups).
+    Returns None if the GDC hits carry no sample_type info.
+    """
+    from collections import Counter
+    counts: Counter = Counter()
+    for f in files:
+        for case in f.get("cases") or []:
+            for sample in case.get("samples") or []:
+                st = sample.get("sample_type")
+                if st:
+                    counts[st] += 1
+    if not counts:
+        return None
+    return " / ".join(f"{name} {n}" for name, n in
+                      sorted(counts.items(), key=lambda kv: -kv[1]))
 
 
 # ------------------------------------------------------------------ #

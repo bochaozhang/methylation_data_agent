@@ -131,7 +131,26 @@ list/桶条目。
 
 实测三路全通：`get_dataset`、`get_task_result` 桶、`get_task_status`（label + intent）。
 
-### 7.1 协作式任务取消（同日第二轮反馈）
+### 7.2 TCGA 行的 unknown 桶（第三轮反馈，2026-10-20）
+
+上游反馈：`recommended_action=null` 的行（实测 TCGA-COAD）落进 `get_task_result` 语义不明的
+unknown 桶，消费方只能保守跳过。**属实**：全库唯一 NULL 行就是 TCGA-COAD——tcga-direct 设计上
+绕过 geo-filter（"Level-3 β 值是标准可用数据，直接信任"），但 register 时没给判定字段。
+
+修复（语义补全，非简单填值）：
+
+- `files_to_dataset_records` 为 TCGA 记录盖**设计信任章**：`recommended_action='download'` +
+  reason（"trusted by design, bypasses geo-filter"）+ `sample_level_annotation='yes'`
+- GDC 查询补取 `cases.samples.sample_type` → 聚合出**真实**的 tumor/normal 计数填入
+  `disease_groups`（平台解析对照数直接可用）：TCGA-COAD 实测
+  `Primary Tumor 437 / Solid Tissue Normal 61 / Metastatic 1 / Recurrent Tumor 1`
+  （跨 450K/EPIC 两个平台组聚合）
+- 存量行已用真实 GDC 数据回填；验证 `get_task_result`：TCGA-COAD 现落 **download 桶**（64 项）
+
+已知小瑕疵留档：同 accession 多平台组 upsert 时 disease_groups 会被后写组覆盖（本次回填用聚合
+绕过）；pipeline 侧聚合留作小改进。测试 +4（`test_tcga_records.py`），共 228，基线不变。
+
+### 7.1 协作式任务取消（第二轮反馈）
 
 上游反馈：running 任务不可取消——错误提交只能烧完整个 ~1h / ~136 次 LLM 判定的运行。
 实现协作式取消：`cancel_task` 对 running 任务置 `cancel_requested`（API 立即返回）；
