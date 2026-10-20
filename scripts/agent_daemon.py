@@ -39,6 +39,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from registry.registry import Registry  # noqa: E402
+from agents.agent1_pipeline import TaskCancelledError  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -553,7 +554,12 @@ def daemon_loop(agent_type: str, registry: Registry, mode: str = "both"):
             )
             registry.complete_task(task_id, result=result)
             logger.info(f"Task {task_id} completed successfully.")
+        except TaskCancelledError:
+            # Cooperative cancellation raised at a filter-loop checkpoint.
+            registry.finalize_cancelled_task(task_id)
+            logger.info(f"Task {task_id} cancelled at worker checkpoint.")
         except Exception as exc:
+            error_msg = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
             error_msg = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
             registry.fail_task(task_id, error=error_msg)
             logger.error(f"Task {task_id} failed: {exc}")

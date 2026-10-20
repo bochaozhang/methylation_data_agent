@@ -77,6 +77,24 @@ def _run_concurrent(fn: Callable, items: List[Any], *args, max_concurrent: int =
 #  Query parsing (module-level so it is unit-testable)                    #
 # ---------------------------------------------------------------------- #
 
+class TaskCancelledError(Exception):
+    """Raised at a worker checkpoint when a running task's cancellation was
+    requested (task_queue.status == 'cancel_requested'). The daemon catches
+    this and finalizes the task as cancelled.
+
+    Deliberately NOT a RuntimeError subclass: _run_concurrent's
+    `except RuntimeError` fallback re-runs the gather under a fresh event
+    loop, which would swallow the cancellation and crash on the loop-bound
+    semaphore instead (found live during the 2026-10-20 smoke test)."""
+
+
+def _raise_if_cancelled(registry: Any, task_id: Optional[str]) -> None:
+    """Cooperative-cancellation checkpoint: one indexed SELECT, called at every
+    candidate boundary of the filter loop (~µs; 355 candidates ≈ negligible)."""
+    if task_id and registry is not None and registry.is_cancel_requested(task_id):
+        raise TaskCancelledError(f"task {task_id}: cancellation requested")
+
+
 def _parse_query_intent(raw: str, json_llm: Any,
                         intent_json: Optional[str] = None) -> Dict[str, Any]:
     """
@@ -199,6 +217,8 @@ def build_agent1_pipeline(config: Dict[str, Any], registry: Any = None):
     def _filter_one(ds: Dict[str, Any], intent: Dict[str, Any], qlog=None,
                     task_id=None, output_dir=None) -> Dict[str, Any]:
         acc = ds.get("accession", "?")
+        # Cooperative-cancellation checkpoint: stop before judging this candidate.
+        _raise_if_cancelled(registry, task_id)
         wanted = intent.get("sample_type", "") or ""
 
         # Resolve per-sample GSM metadata via the cheapest complete source:

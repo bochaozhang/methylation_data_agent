@@ -1144,6 +1144,17 @@ class Registry:
         placeholders = ",".join("?" * len(claimable))
         with self._lock:
             with self._get_conn() as conn:
+                # Honor pending cancellation requests even if the worker died:
+                # a cancel_requested orphan goes to 'cancelled', NOT back to
+                # 'pending' (resurrecting it would ignore the user's request).
+                conn.execute(
+                    f"""UPDATE task_queue
+                        SET status = 'cancelled', finished_at = ?
+                        WHERE status = 'cancel_requested'
+                          AND agent_type IN ({placeholders})
+                          AND task_id NOT LIKE 'heartbeat_%'""",
+                    (datetime.now(timezone.utc).isoformat(),) + claimable,
+                )
                 rows = conn.execute(
                     f"""SELECT task_id FROM task_queue
                         WHERE status = 'running'
@@ -1186,14 +1197,51 @@ class Registry:
                 )
 
     def cancel_task(self, task_id: str) -> bool:
-        """Cancel a pending task. Returns True if cancelled."""
+        """
+        Cancel a task. Cooperative for running tasks.
+
+        pending           → 'cancelled' immediately (nothing claimed it yet)
+        running           → 'cancel_requested': the worker polls this at every
+                            candidate-checkpoint during the filter loop and
+                            stops (status finalized to 'cancelled' by the
+                            worker — typically within seconds to ~2 min, the
+                            length of one in-flight candidate judgment)
+        other states      → no-op (returns False)
+
+        Returns True if the request was accepted (pending or running).
+        """
         with self._lock:
             with self._get_conn() as conn:
                 cur = conn.execute(
-                    "UPDATE task_queue SET status = 'cancelled' WHERE task_id = ? AND status = 'pending'",
+                    """UPDATE task_queue
+                       SET status = CASE WHEN status = 'running' THEN 'cancel_requested'
+                                         ELSE 'cancelled' END
+                       WHERE task_id = ? AND status IN ('pending', 'running')""",
                     (task_id,),
                 )
                 return cur.rowcount > 0
+
+    def is_cancel_requested(self, task_id: str) -> bool:
+        """True if the task's status is 'cancel_requested' (worker checkpoint flag)."""
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM task_queue WHERE task_id = ? AND status = 'cancel_requested'",
+                (task_id,),
+            ).fetchone()
+            return row is not None
+
+    def finalize_cancelled_task(self, task_id: str, result: Any = None) -> None:
+        """Worker-side: finalize a cooperative cancellation (status → cancelled)."""
+        now = datetime.now(timezone.utc).isoformat()
+        result_json = json.dumps(result) if result is not None else None
+        with self._lock:
+            with self._get_conn() as conn:
+                conn.execute(
+                    """UPDATE task_queue
+                       SET status = 'cancelled', finished_at = ?, result_json = COALESCE(?, result_json)
+                       WHERE task_id = ? AND status = 'cancel_requested'""",
+                    (now, result_json, task_id),
+                )
 
     def cancel_all_tasks(self) -> Dict[str, int]:
         """

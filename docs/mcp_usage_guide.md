@@ -54,7 +54,7 @@ MCP 是 REST 的薄适配层，所有能力都有等价 HTTP 端点（见 §8）
 | `submit_compound_query` | 提交 | 一次提交 main + auxiliary 两个带 label 的任务 | 立即返回 |
 | `get_task_status` | 只读 | 任务状态 + 完成时的 result 摘要 | 快 |
 | `get_task_result` | 只读 | 判定分桶（download/manual_review/exclude）+ 文件路径 | 快 |
-| `cancel_task` | 写 | 取消 **pending** 任务（running 不可取消） | 快 |
+| `cancel_task` | 写 | 取消任务：pending 立即取消；**running 协作式取消**（worker 在候选边界检查标志，秒级~2 分钟内停下） | 快 |
 | `list_datasets` | 只读 | 浏览注册表（可按 download_status 过滤） | 快 |
 | `get_dataset` | 只读 | 单个数据集全量记录（含路径 + LLM 判定证据） | 快 |
 | `health` | 只读 | 后端心跳 + 注册表统计 | 快 |
@@ -183,7 +183,7 @@ list_datasets(status="done", limit=50)
 | 事项 | 行为 |
 |---|---|
 | **去重** | 提交时若存在等价的 pending/running 任务（规范化 intent 相等，或自由文本 query 全等），返回既有 task_id 且 `deduplicated=true`（不新建）。想强制重跑传 `force=true`。已 done 的任务不会被去重命中 |
-| 任务不可中途取消 | `cancel_task` 只对 pending 有效；running 的任务会跑完（约 1h） |
+| 任务可协作式取消 | `cancel_task`：pending 立即取消；running → `cancel_requested`，worker 在每个候选判定边界检查标志并停止（在飞的单个候选判定需先完成，通常秒级~2 分钟）。已产生的部分 GSM 判定记录保留（任务作用域），但不会触发 register/下载。worker 崩溃时自愈逻辑会直接把 `cancel_requested` 落成 `cancelled`（不会复活已取消任务） |
 | worker 故障自愈 | worker 重启会把遗留 `running` 的孤儿任务自动拉回 `pending` 重跑 |
 | verdict 随机性 | filter 判定是 LLM 调用（无 verdict cache），同一查询两次跑的边缘判定可能不同（download↔manual_review 浮动属正常） |
 | 已下载数据不重下 | 重复查询同一 GSE 零重复下载（dest-exists 跳过 + 状态不降级） |

@@ -278,8 +278,12 @@ def get_task_result(task_id: str, exclude_limit: int = 0) -> Dict[str, Any]:
 
 @server.tool()
 def cancel_task(task_id: str) -> Dict[str, Any]:
-    """Cancel a PENDING task (running tasks cannot be cancelled — the worker
-    is already executing them)."""
+    """Cancel a task — cooperative for running ones.
+
+    pending → cancelled immediately. running → the worker stops at its next
+    candidate checkpoint (status shows 'cancel_requested' until then;
+    typically finalized within seconds to ~2 minutes). Wrong submissions can
+    be stopped instead of burning a full ~1h run."""
     return _api().post(f"/tasks/{task_id}/cancel")
 
 

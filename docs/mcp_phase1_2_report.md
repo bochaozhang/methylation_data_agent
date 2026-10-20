@@ -131,6 +131,23 @@ list/桶条目。
 
 实测三路全通：`get_dataset`、`get_task_result` 桶、`get_task_status`（label + intent）。
 
+### 7.1 协作式任务取消（同日第二轮反馈）
+
+上游反馈：running 任务不可取消——错误提交只能烧完整个 ~1h / ~136 次 LLM 判定的运行。
+实现协作式取消：`cancel_task` 对 running 任务置 `cancel_requested`（API 立即返回）；
+pipeline 在**每个候选判定边界**检查标志（一次索引 SELECT，µs 级）并抛
+`TaskCancelledError`；daemon 捕获后落 `cancelled`。启动自愈同步升级：孤儿回收时
+`cancel_requested` 直接落 cancelled（不复活已被取消的任务）。
+
+实测：18 个判定后取消 → **20 秒内** finalized `cancelled`。
+
+排障记录（smoke 中抓到）：`TaskCancelledError` 初版继承 `RuntimeError`，被
+`_run_concurrent` 的 `except RuntimeError` 回退分支捕获并在新事件循环里重跑 gather →
+Semaphore 跨循环 → 二次异常 → 任务误落 `failed`。改为继承 `Exception` 解决。
+另修复一处环境事故：协作者用自己账号（uid 1002）直接开过 registry 库，留下的
+`-wal`/`-shm` 文件归属 1002，容器进程（uid 1000）写不了 → API 全部 readonly——
+chown 回 1000 恢复。**教训：不要绕过服务直接开生产 SQLite；必须开时用容器同 uid。**
+
 ## 8. 已知限制与下一步
 
 - ~~filter 内存炸弹~~ **已修复**（`5970bc5`，见 §5 #5；355 候选任务验证通过）

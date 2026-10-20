@@ -619,10 +619,12 @@ async def cancel_all_tasks():
 @app.post("/tasks/{task_id}/cancel", response_model=CancelTaskResponse)
 async def cancel_task(task_id: str):
     """
-    Cancel a single pending task by ID.
+    Cancel a task by ID (cooperative for running tasks).
 
-    Only tasks with status='pending' can be cancelled this way.
-    Running tasks are not interrupted mid-execution.
+    pending → cancelled immediately. running → 'cancel_requested': the
+    worker checks this flag at every candidate boundary of the filter loop
+    and stops — typically within seconds to ~2 minutes (one in-flight
+    candidate judgment must finish first).
     """
     registry = get_registry()
     task = registry.get_task(task_id)
@@ -634,12 +636,16 @@ async def cancel_task(task_id: str):
             cancelled=False,
             message=f"Task is already in status '{task['status']}', cannot cancel.",
         )
+    was_running = task["status"] == "running"
     cancelled = registry.cancel_task(task_id)
-    return CancelTaskResponse(
-        task_id=task_id,
-        cancelled=cancelled,
-        message="Task cancelled." if cancelled else "Task could not be cancelled (may have just started running).",
-    )
+    if cancelled and was_running:
+        message = ("Cancellation requested — the worker will stop at the next "
+                   "candidate checkpoint (status: cancel_requested → cancelled).")
+    elif cancelled:
+        message = "Task cancelled."
+    else:
+        message = "Task could not be cancelled (it may have just finished)."
+    return CancelTaskResponse(task_id=task_id, cancelled=cancelled, message=message)
 
 
 @app.get("/health", response_model=HealthResponse)
