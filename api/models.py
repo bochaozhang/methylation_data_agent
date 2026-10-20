@@ -98,6 +98,11 @@ class DatasetResponse(BaseModel):
     needs_review: bool = False
     llm_evidence: Optional[str] = None
     sample_type: Optional[str] = None
+    # Case/control breakdown text (e.g. "CRC 40 / Normal cfDNA 46") — downstream
+    # platforms parse reported_control_count from this for eligibility gates.
+    disease_groups: Optional[str] = None
+    # "yes" | "no" | "unclear" — per-sample annotation availability.
+    sample_level_annotation: Optional[str] = None
     no_pubmed_link: bool = False
     created_at: str
     updated_at: str

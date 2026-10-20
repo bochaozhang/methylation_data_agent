@@ -671,7 +671,8 @@ class Registry:
                 """
                 SELECT d.accession, d.source, d.download_status, d.local_path,
                        d.title, d.cancer_type, d.platform, d.sample_count,
-                       d.recommended_action, d.created_at
+                       d.recommended_action, d.created_at,
+                       d.disease_groups, d.sample_level_annotation
                 FROM query_dataset_map m
                 JOIN datasets d ON m.accession = d.accession
                 WHERE m.task_id = ?

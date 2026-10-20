@@ -85,6 +85,9 @@ _LIST_FIELDS = (
     "sample_count", "year", "download_status", "local_path",
     "sample_metadata_path", "file_size_bytes", "sample_type",
     "paper_pmid", "paper_doi", "updated_at",
+    # eligibility inputs — downstream platforms parse control counts from
+    # disease_groups (COMPARATOR-NOT-EVIDENCED gates without it)
+    "disease_groups", "sample_level_annotation",
 )
 
 
@@ -246,6 +249,9 @@ def get_task_result(task_id: str, exclude_limit: int = 0) -> Dict[str, Any]:
             "sample_count": it.get("sample_count"),
             "download_status": it.get("download_status"),
             "local_path": translate_path(it.get("local_path")),
+            # eligibility inputs (see _LIST_FIELDS note)
+            "disease_groups": it.get("disease_groups"),
+            "sample_level_annotation": it.get("sample_level_annotation"),
         }
 
     excluded = buckets.get("exclude", [])
