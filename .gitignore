@@ -82,8 +82,12 @@ report_*.json
 report_*.md
 geo_candidates_*.json
 
-# Local docs (working notes — not tracked)
-docs/
+# Local docs (working notes — not tracked), EXCEPT the MCP deliverables
+# (usage guide + reports are for external consumers — must be versioned).
+docs/*
+!docs/mcp_usage_guide.md
+!docs/mcp_phase1_2_report.md
+!docs/mcp_interface_plan.md
 
 # ---- Gold standard (benchmark reproducibility root is tracked; bulky/dirty artifacts are not) ----
 # pool / queries / truth yaml+jsonl ARE tracked (small, version-frozen).
