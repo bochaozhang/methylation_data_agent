@@ -1,8 +1,10 @@
 # MCP 接口 Phase 1+2 实施报告
 
-日期：2026-10-19
+日期：2026-10-19（10-20 上游反馈迭代补记）
 分支：`MCP`（已推送 origin/MCP；main 未动）
-提交：`2bbff73`（Phase 1）→ `ec97629`（Phase 2）→ `2f63c21`（daemon 自愈修复）
+提交链：`2bbff73`（Phase 1）→ `ec97629`（Phase 2）→ `2f63c21`（daemon 自愈修复）
+　→ `5970bc5`（series_matrix OOM 根因修复）→ `53feaff`（文档入库）
+　→ `feb447c`（字段暴露·阻断项）→ `c92ff35`（字段暴露·全量清查）
 设计文档：docs/mcp_interface_plan.md ｜ 使用说明：docs/mcp_usage_guide.md
 
 ---
@@ -100,7 +102,36 @@ data agent 现在是一个标准 MCP 服务：外部 agent 可以 dry-run 预览
 | main 结果 | 48 min 完成：126 exclude / 5 manual_review / 0 新下载（历史已下载数据保持 done，零重下载——缓存修复生效）✓ |
 | aux 结果 | **完成（第五轮，修复后）**：2h03m 零崩溃（前四轮均死于 §5 #5 内存炸弹）。355 候选 → 63 download / 4 manual_review / 288 exclude；GSE51032（前炸弹）845 样本正确判定 exclude(WBC)；tcga-direct 首次触发（1 个 GDC 数据集）；62 个 pending 转异步下载。结果经 MCP `get_task_result` 取回，label=auxiliary ✓ |
 
-## 7. 已知限制与下一步
+## 7. 上游反馈迭代：字段暴露补齐（feb447c + c92ff35，2026-10-20）
+
+上游平台 agent 联调反馈：**MCP 模式下资格判定到不了 eligible**——其硬规则要求从
+`disease_groups` 文本解析 `reported_control_count`（缺失 → `COMPARATOR-NOT-EVIDENCED` →
+候选最多 inconclusive），而下载/物化门要求 eligible。旧 CLI 模式能跑通 solely 因为直接读
+SQLite；MCP 只能走接口 → 全部候选卡死。10 候选 smoke：0 eligible / 8 inconclusive，主因
+即字段缺失。
+
+**第一轮（feb447c）**：`disease_groups` + `sample_level_annotation` 加入
+`DatasetResponse`、`get_datasets_by_task_id` SELECT（不加它任务桶永远是 None）、MCP
+list/桶条目。
+
+**第二轮全量清查（c92ff35）**：datasets 31 列逐一比对，再补 1 个 bug + 6 个缺口：
+
+| 字段 | 库内行数 | 性质 |
+|---|---|---|
+| `sample_metadata_path` | 76 | **bug**：MCP 自 Phase 1 宣称返回但 DatasetResponse 从未携带 → 静默 None。三处修复（含路径翻译），与 `sample_level_annotation=yes` 配对 |
+| `stage_treatment` | 56 | 与 disease_groups 同类的资格输入（SPEC 分期/治疗标准） |
+| `recommended_action` + `reason` | 84 | 最后判定 verdict + 一句话理由，数据集粒度端点原先拿不到 |
+| `notes` | 84 | SPEC 警示（pooled、泛癌需拆子集、样本数与文章不符）——直接影响平台资格 |
+| `available_file_type` | 6 | phase-2a 文件形态证据 |
+| `TaskResponse.intent` | — | 解析后的 intent_json——复合查询消费方核对实际运行的结构化意图 |
+
+**有意不暴露**（留档）：`checksum_md5`（0 行）、`usable`（可从 recommended_action 派生）、
+`datasets.task_id/raw_query`（任务作用域溯源，走任务端点）、`samples.characteristics_json`
+（批量明细，样本级详情在 sample_metadata.csv / gsm 缓存）。
+
+实测三路全通：`get_dataset`、`get_task_result` 桶、`get_task_status`（label + intent）。
+
+## 8. 已知限制与下一步
 
 - ~~filter 内存炸弹~~ **已修复**（`5970bc5`，见 §5 #5；355 候选任务验证通过）
 - **Phase 3（未做）**：approve/reject 写操作 tool（`MCP_ALLOW_WRITES` 开关）、远程消费方
