@@ -98,7 +98,7 @@ MCP 层校验后序列化为 intent_json 随任务提交；同时生成一句人
    - [x] submit_query / submit_compound_query（main+auxiliary 默认 label，各接受 query 或 intent）/ get_task_result（verdict 分桶 download/manual_review 全量、exclude 默认只计数，local_path 翻译）/ cancel_task
 5. **护栏**
    - [x] 去重（见 API）；compound 重放等价 intent → 两个 task_id 均命中去重
-   - [~] max_candidates 评估：filter_node 对全部候选逐个判定（无截断点）；截断需要 pre-filter 排序依据，**暂缓**，待 verdict cache（caching_audit #4）落地后成本问题自然缓解
+   - [~] max_candidates 评估：filter_node 对全部候选逐个判定（无截断点）；截断需要 pre-filter 排序依据，**暂缓**（注：verdict cache 已确定不做——SPEC 更新必须即时反映到判定，见 §6 #4）
 6. **测试**（新增 15 个：test_registry_task_columns / test_api_query_submit / test_pipeline_structured_parse；全量 206 = 191+15，3F+20E 与基线一致）
    - 结构化 intent 幂等性有专门测试（API 存 normalized，parse_node 再 normalize 一次，结果不变）
 
@@ -125,7 +125,7 @@ MCP 层校验后序列化为 intent_json 随任务提交；同时生成一句人
 | 1 | dry-run 在 webui 容器内执行时长（NCBI esearch 经代理） | Phase 1 实测定同步 vs 后台任务 → 已实测 ~50s，同步可接受 |
 | 2 | 136 verdict 的 result_json 体量大，MCP 响应超限 | MCP 层默认摘要（每 verdict 截 reason），`full=true` 才全文 |
 | 3 | 同一 GSE 被主/辅两个 task 同时判 download | 已天然解决：datasets 按 accession 去重 + dest-exists 跳过（caa6939），样本级归属看 query_sample_map / sample_metadata.csv 逐 task 列 |
-| 4 | verdict cache（caching_audit backlog #4）对外部消费方价值翻倍 | 建议排在 Phase 2 之后尽快做 |
+| 4 | ~~verdict cache（caching_audit backlog #4）~~ **确定不做（设计决定，2026-10-20）**：每次重新 LLM 判定是故意设计——判定标准在 skill 的 SPEC.md 里，SPEC 更新后 verdict 必须跟着变，缓存违背"SPEC 是唯一事实源" | 无需行动；重复查询的 token 成本为固有代价 |
 | 5 | mcp SDK 版本更迭快 | 锁 requirements.txt 版本；Phase 1 只依赖最小特性（tool + stdio） |
 | 6 | **检索失败语义**（2026-10-19 事故）：GEO search 网络失败（如代理死）被静默吞掉 → pipeline"成功"完成 0 候选空任务（aux 首次重跑即中招）。应改为 search 失败 → 任务 fail（区分"真 0 结果"与"检索出错"） | **非 MCP 待办**（涉及 pipeline/SearchSkill 语义，用户拍板暂缓）；当前专注 MCP。缓解措施已做：隧道改 autossh + systemd（methy-proxy.service，跳板 34.26.3.123，断线自动重连 + 开机自启），降低复发概率 |
 

@@ -185,7 +185,7 @@ list_datasets(status="done", limit=50)
 | **去重** | 提交时若存在等价的 pending/running 任务（规范化 intent 相等，或自由文本 query 全等），返回既有 task_id 且 `deduplicated=true`（不新建）。想强制重跑传 `force=true`。已 done 的任务不会被去重命中 |
 | 任务可协作式取消 | `cancel_task`：pending 立即取消；running → `cancel_requested`，worker 在每个候选判定边界检查标志并停止（在飞的单个候选判定需先完成，通常秒级~2 分钟）。已产生的部分 GSM 判定记录保留（任务作用域），但不会触发 register/下载。worker 崩溃时自愈逻辑会直接把 `cancel_requested` 落成 `cancelled`（不会复活已取消任务） |
 | worker 故障自愈 | worker 重启会把遗留 `running` 的孤儿任务自动拉回 `pending` 重跑 |
-| verdict 随机性 | filter 判定是 LLM 调用（无 verdict cache），同一查询两次跑的边缘判定可能不同（download↔manual_review 浮动属正常） |
+| verdict 随机性 | filter 判定是 LLM 调用（**故意不做 verdict cache**——判定标准在 SPEC.md，SPEC 更新后 verdict 必须跟着变），同一查询两次跑的边缘判定可能不同（download↔manual_review 浮动属正常）；SPEC 变更后重跑即可得到新标准的判定 |
 | 已下载数据不重下 | 重复查询同一 GSE 零重复下载（dest-exists 跳过 + 状态不降级） |
 | TCGA | 样本类型为液体（cfdna/plasma/serum/wbc/whole_blood）时自动跳过 TCGA；组织类型（tumor/adjacent/normal）才走 GDC |
 | 检索失败静默 | 已知限制：代理/网络故障时检索返回 0 候选，任务会"成功"完成但结果为空——结果为 0 时请检查 `health` 与 dry-run（修复在计划中） |

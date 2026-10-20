@@ -173,7 +173,8 @@ unknown 桶，消费方只能保守跳过。**属实**：全库唯一 NULL 行�
 - **Phase 3（未做）**：approve/reject 写操作 tool（`MCP_ALLOW_WRITES` 开关）、远程消费方
   （streamable HTTP transport + token 鉴权）、提交侧并发/配额护栏
 - **Phase 4（未做）**：配套 SKILL.md（教 agent "dry-run→submit→poll→取路径" 工作流）
-- **verdict cache**（caching_audit #4）：本次事故中它的缺失被放大四倍——四轮重跑重复判
-  定 ~1200 次；有了它，OOM 重跑可从断点近似恢复。建议最优先排期
+- **verdict cache：确定不做（设计决定，2026-10-20）**——每次重新 LLM 判定是故意设计：
+  判定标准的主战场在 skill 的 SPEC.md（用户维护），SPEC 更新后 verdict 必须跟着变，缓存会
+  违背"SPEC 是唯一事实源"的原则。重复查询/重跑的 token 成本为此设计的固有代价
 - **检索失败静默**：见 §5 #4，语义修复待拍板
 - get_task_result 的 exclude 默认只计数（防上下文溢出），需要全量时 `exclude_limit`
