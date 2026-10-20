@@ -66,6 +66,7 @@ class TaskResponse(BaseModel):
     status: str
     label: Optional[str] = None
     deduplicated: bool = False   # True: existing equivalent task returned, nothing created
+    intent: Optional[Dict[str, Any]] = None   # structured SearchIntent actually used (parsed intent_json)
     created_at: str
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
@@ -91,6 +92,7 @@ class DatasetResponse(BaseModel):
     title: Optional[str] = None
     download_status: str
     local_path: Optional[str] = None
+    sample_metadata_path: Optional[str] = None   # per-sample CSV (host-visible after MCP translation)
     paper_pmid: Optional[str] = None
     paper_doi: Optional[str] = None
     discovered_by: str
@@ -103,6 +105,16 @@ class DatasetResponse(BaseModel):
     disease_groups: Optional[str] = None
     # "yes" | "no" | "unclear" — per-sample annotation availability.
     sample_level_annotation: Optional[str] = None
+    # Staging / treatment status (e.g. "early-stage, pre-surgical") — another
+    # SPEC match criterion platforms gate on.
+    stage_treatment: Optional[str] = None
+    # Last-judgment verdict ("download"|"exclude"|"manual_review") + one-line
+    # reason + SPEC caveats (pooled, count mismatch, ...) from the filter LLM.
+    recommended_action: Optional[str] = None
+    reason: Optional[str] = None
+    notes: Optional[str] = None
+    # File-form evidence from the phase-2a preview (e.g. "series_matrix").
+    available_file_type: Optional[str] = None
     no_pubmed_link: bool = False
     created_at: str
     updated_at: str

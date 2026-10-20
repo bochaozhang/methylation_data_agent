@@ -148,6 +148,12 @@ def _is_heartbeat_alive(ts: Optional[str]) -> bool:
 
 
 def _task_to_response(task: dict, deduplicated: bool = False) -> TaskResponse:
+    intent = None
+    if task.get("intent_json"):
+        try:
+            intent = json.loads(task["intent_json"])
+        except Exception:
+            intent = None
     return TaskResponse(
         task_id=task["task_id"],
         agent_type=task["agent_type"],
@@ -155,6 +161,7 @@ def _task_to_response(task: dict, deduplicated: bool = False) -> TaskResponse:
         status=task["status"],
         label=task.get("label"),
         deduplicated=deduplicated,
+        intent=intent,
         created_at=task["created_at"],
         started_at=task.get("started_at"),
         finished_at=task.get("finished_at"),
@@ -175,6 +182,7 @@ def _dataset_to_response(d: dict) -> DatasetResponse:
         title=d.get("title"),
         download_status=d["download_status"],
         local_path=d.get("local_path"),
+        sample_metadata_path=d.get("sample_metadata_path"),
         paper_pmid=d.get("paper_pmid"),
         paper_doi=d.get("paper_doi"),
         discovered_by=d["discovered_by"],
@@ -184,6 +192,11 @@ def _dataset_to_response(d: dict) -> DatasetResponse:
         sample_type=d.get("sample_type"),
         disease_groups=d.get("disease_groups"),
         sample_level_annotation=d.get("sample_level_annotation"),
+        stage_treatment=d.get("stage_treatment"),
+        recommended_action=d.get("recommended_action"),
+        reason=d.get("reason"),
+        notes=d.get("notes"),
+        available_file_type=d.get("available_file_type"),
         no_pubmed_link=bool(d.get("no_pubmed_link", 0)),
         created_at=d["created_at"],
         updated_at=d["updated_at"],
