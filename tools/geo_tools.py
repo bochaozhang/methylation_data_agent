@@ -8,6 +8,7 @@ Uses NCBI E-utilities REST API to:
   - Verify accession numbers exist in NCBI databases (for LLM hallucination filtering)
 """
 import re
+import threading
 import time
 import xml.etree.ElementTree as ET
 from typing import Any, Dict, List, Optional, Tuple
@@ -94,9 +95,26 @@ class GEOClient:
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": "MethyAgent/1.0 (methylation data collector)"})
         self._rate_limit_delay = 0.11 if api_key else 0.34  # seconds between requests
+        # Global (cross-thread) rate limiter: the filter loop and the batch
+        # metadata fetch call _get from several threads — per-call sleeps would
+        # multiply the actual request rate by the thread count and violate the
+        # NCBI limit (3 rps without key / 10 with). One shared pacing clock
+        # keeps the aggregate rate at 1/_rate_limit_delay regardless of threads.
+        self._rate_lock = threading.Lock()
+        self._last_req_at = 0.0
         if proxy:
             self.session.proxies = {"http": proxy, "https": proxy}
             logger.info(f"GEOClient using proxy: {proxy}")
+
+    def _throttle(self) -> None:
+        """Pace requests globally: aggregate rate ≤ 1/_rate_limit_delay across threads."""
+        with self._rate_lock:
+            now = time.monotonic()
+            wait = self._rate_limit_delay - (now - self._last_req_at)
+            if wait > 0:
+                time.sleep(wait)
+                now = time.monotonic()
+            self._last_req_at = now
 
     def _get(self, endpoint: str, params: Dict) -> requests.Response:
         """
@@ -111,7 +129,7 @@ class GEOClient:
         if self.api_key:
             params["api_key"] = self.api_key
         url = f"{self.base_url}/{endpoint}"
-        time.sleep(self._rate_limit_delay)
+        self._throttle()
         resp = self.session.get(url, params=params, timeout=30)
 
         # Detect NCBI abuse redirect — requests follows the 302 automatically,
@@ -445,10 +463,11 @@ class GEOClient:
         if not accessions:
             return []
 
-        all_meta = []
+        batches = [accessions[i:i + batch_size]
+                   for i in range(0, len(accessions), batch_size)]
 
-        for i in range(0, len(accessions), batch_size):
-            batch = accessions[i : i + batch_size]
+        def _fetch_batch(batch: List[str]) -> List[Dict[str, Any]]:
+            meta: List[Dict[str, Any]] = []
 
             # Step 1: batch esearch — one OR query for all accessions
             term = " OR ".join(f"{acc}[Accession]" for acc in batch)
@@ -464,13 +483,12 @@ class GEOClient:
                 logger.warning(f"batch_get_series_metadata esearch failed: {e}")
                 # Fall back to individual fetches
                 for acc in batch:
-                    meta = self.get_series_metadata(acc)
-                    all_meta.append(meta)
-                continue
+                    meta.append(self.get_series_metadata(acc))
+                return meta
 
             if not uids:
                 logger.warning(f"batch_get_series_metadata: no UIDs for batch {batch}")
-                continue
+                return meta
 
             # Step 2: batch esummary — one call for all UIDs
             try:
@@ -483,9 +501,8 @@ class GEOClient:
             except Exception as e:
                 logger.warning(f"batch_get_series_metadata esummary failed: {e}")
                 for acc in batch:
-                    meta = self.get_series_metadata(acc)
-                    all_meta.append(meta)
-                continue
+                    meta.append(self.get_series_metadata(acc))
+                return meta
 
             # Build accession → uid map from results
             acc_to_data: Dict[str, Any] = {}
@@ -499,12 +516,20 @@ class GEOClient:
                     acc_norm = f"GSE{acc_norm}" if acc_norm.isdigit() else acc_norm
                 acc_to_data[acc_norm] = (uid, item)
 
+            # Fetch supplementary-file listings for the whole batch in parallel
+            # (per-listing RTT through the proxy dominates; these hit GEO FTP
+            # directly, not the rate-limited eutils).
+            present = [a.upper() for a in batch if a.upper() in acc_to_data]
+            with ThreadPoolExecutor(max_workers=8) as supp_ex:
+                supp_map = dict(zip(
+                    present, supp_ex.map(self._get_supplementary_urls, present)))
+
             # Parse metadata for each requested accession
             for acc in batch:
                 acc_upper = acc.upper()
                 if acc_upper not in acc_to_data:
                     logger.warning(f"batch_get_series_metadata: {acc} not in esummary result")
-                    all_meta.append({"accession": acc, "error": "not_found"})
+                    meta.append({"accession": acc, "error": "not_found"})
                     continue
 
                 uid, data = acc_to_data[acc_upper]
@@ -570,9 +595,9 @@ class GEOClient:
                     or 0
                 )
 
-                supp_files = self._get_supplementary_urls(acc_upper)
+                supp_files = supp_map.get(acc_upper, [])
 
-                all_meta.append({
+                meta.append({
                     "accession": acc_upper,
                     "title": title,
                     "summary": summary[:500] if summary else "",
@@ -586,6 +611,23 @@ class GEOClient:
                     "supplementary_files": supp_files,
                     "source": "GEO",
                 })
+            return meta
+
+        # Parallel across batches: proxy RTT dominates each call, so threads
+        # hide it (the per-accession supplementary-listing fetches inside each
+        # batch benefit too). executor.map yields in submission order → the
+        # ranked esearch order is preserved. The global _throttle keeps the
+        # eutils request rate compliant regardless of thread count.
+        from concurrent.futures import ThreadPoolExecutor
+        max_workers = min(4, len(batches))
+        if max_workers <= 1:
+            all_meta: List[Dict[str, Any]] = []
+            for b in batches:
+                all_meta.extend(_fetch_batch(b))
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                all_meta = [m for batch_meta in ex.map(_fetch_batch, batches)
+                            for m in batch_meta]
 
         logger.info(f"batch_get_series_metadata: fetched {len(all_meta)}/{len(accessions)} records")
         return all_meta

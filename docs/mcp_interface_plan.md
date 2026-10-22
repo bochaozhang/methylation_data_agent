@@ -122,7 +122,7 @@ MCP 层校验后序列化为 intent_json 随任务提交；同时生成一句人
 
 | # | 事项 | 处置 |
 |---|---|---|
-| 1 | dry-run 在 webui 容器内执行时长（NCBI esearch 经代理） | Phase 1 实测定同步 vs 后台任务 → 已实测 ~50s，同步可接受 |
+| 1 | dry-run 在 webui 容器内执行时长（NCBI esearch 经代理） | ~~实测 ~50s~~ → **2026-10-22 已优化到 ~10-15s**（低于 CC 默认 MCP tool 超时 30s）：`_get` 改全局线程安全限速器（顺带修复 filter 3 线程并发下限速被放大的潜在违规）+ batch 元数据批次并行 + supp 目录列表批内 8 路并行；CC 消费方超时兜底 `MCP_TOOL_TIMEOUT` 已写入使用说明 |
 | 2 | 136 verdict 的 result_json 体量大，MCP 响应超限 | MCP 层默认摘要（每 verdict 截 reason），`full=true` 才全文 |
 | 3 | 同一 GSE 被主/辅两个 task 同时判 download | 已天然解决：datasets 按 accession 去重 + dest-exists 跳过（caa6939），样本级归属看 query_sample_map / sample_metadata.csv 逐 task 列 |
 | 4 | ~~verdict cache（caching_audit backlog #4）~~ **确定不做（设计决定，2026-10-20）**：每次重新 LLM 判定是故意设计——判定标准在 skill 的 SPEC.md 里，SPEC 更新后 verdict 必须跟着变，缓存违背"SPEC 是唯一事实源" | 无需行动；重复查询的 token 成本为固有代价 |

@@ -39,7 +39,7 @@ data agent 现在是一个标准 MCP 服务：外部 agent 可以 dry-run 预览
 
 | 层 | 改动 |
 |---|---|
-| api | `POST /search/dry-run`：query（LLM parse）或 intent（确定性）→ parse + geo-search，无判定无写入；同步 handler 跑 FastAPI threadpool（实测 ~50s 不阻塞事件循环） |
+| api | `POST /search/dry-run`：query（LLM parse）或 intent（确定性）→ parse + geo-search，无判定无写入；同步 handler 跑 FastAPI threadpool（初测 ~50s；2026-10-22 并行化后 ~10-15s，低于 CC 默认 MCP tool 超时）|
 | compose | webui 服务补 `NCBI_PROXY`（dry-run 出网） |
 | mcp_server/ | 新包：server.py / api_client.py / paths.py / \_\_main\_\_.py；stdio；`mcp>=2.3,<3`（注意 mcp 2.x 将 FastMCP 改名 `MCPServer`） |
 | tools | search_datasets / get_task_status / list_datasets（裁剪 llm_evidence 等大字段）/ get_dataset（全量）/ health |

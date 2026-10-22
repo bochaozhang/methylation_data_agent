@@ -39,7 +39,11 @@ claude mcp add methyagent -- \
 |---|---|---|
 | `MCP_API_BASE` | `http://localhost:80` | REST API 地址（远程部署时改这里） |
 | `MCP_DATA_HOST_PATH` | `<repo>/data` | 数据目录的宿主机路径（路径翻译用） |
-| `MCP_API_TIMEOUT` | `300` | 每请求超时秒数（dry-run 检索约 50s，勿低于 120） |
+| `MCP_API_TIMEOUT` | `300` | 每请求超时秒数（dry-run 实测 ~10-15s，网络差时留余量，勿低于 60） |
+
+> **Claude Code 消费方注意**：CC 的 MCP tool 调用默认超时 30s。dry-run 并行化后实测
+> ~10-15s（2026-10-22 前 ~50-60s 会超时）。若你的代理链路慢仍超时，在启动 claude 的
+> 环境设置 `MCP_TOOL_TIMEOUT=120000`（毫秒）。
 
 ### 不用 MCP，直接 REST
 
@@ -49,7 +53,7 @@ MCP 是 REST 的薄适配层，所有能力都有等价 HTTP 端点（见 §8）
 
 | Tool | 类型 | 用途 | 耗时 |
 |---|---|---|---|
-| `search_datasets` | 只读 | **dry-run**：parse + GEO 检索，返回候选 GSE 列表，不判定不入库 | ~50s |
+| `search_datasets` | 只读 | **dry-run**：parse + GEO 检索，返回候选 GSE 列表，不判定不入库 | ~10-15s |
 | `submit_query` | 提交 | 提交一个完整任务（自由文本或结构化 intent） | 立即返回 |
 | `submit_compound_query` | 提交 | 一次提交 main + auxiliary 两个带 label 的任务 | 立即返回 |
 | `get_task_status` | 只读 | 任务状态 + 完成时的 result 摘要 | 快 |
