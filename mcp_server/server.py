@@ -14,7 +14,10 @@ Tools:
                             training vs validation data) — two labeled tasks
     get_task_status         one pipeline task by ID
     get_task_result         finished-task verdict buckets + file paths
-    cancel_task             cancel a pending task
+    cancel_task             cancel a task (pending immediate; running cooperative)
+    list_awaiting_approval  manual_review datasets + the LLM's evidence
+    approve_dataset         approve → queued for download   (write, gated)
+    reject_dataset          reject → skipped, never downloaded (write, gated)
     list_datasets           browse the registry (optionally by download_status)
     get_dataset             full record for one accession, incl. file paths
     health                  backend heartbeat + registry stats
@@ -34,6 +37,7 @@ Register with Claude Code:
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -61,6 +65,8 @@ server = MCPServer(
         "— a full pipeline task takes ~1 hour (search → per-dataset LLM "
         "filter → register → async download); (3) poll get_task_status; "
         "(4) get_task_result for the verdict buckets and file paths. "
+        "manual_review datasets need an approval decision: "
+        "list_awaiting_approval → approve_dataset / reject_dataset. "
         "Duplicate submissions of an equivalent active task are deduplicated "
         "server-side (deduplicated=true means an existing task was returned). "
         "Paths returned are host-side; read data files directly from disk. "
@@ -285,6 +291,60 @@ def cancel_task(task_id: str) -> Dict[str, Any]:
     typically finalized within seconds to ~2 minutes). Wrong submissions can
     be stopped instead of burning a full ~1h run."""
     return _api().post(f"/tasks/{task_id}/cancel")
+
+
+# --------------------------------------------------------------------------- #
+#  Review queue (write tools, gated by MCP_ALLOW_WRITES)                      #
+# --------------------------------------------------------------------------- #
+
+def _require_writes() -> None:
+    """Write-tool gate. Default ON: these carry no more authority than
+    submit_query (same unauthenticated localhost API). Set MCP_ALLOW_WRITES=0
+    to hide-freeze approve/reject when exposing the server to untrusted
+    remote consumers."""
+    if os.environ.get("MCP_ALLOW_WRITES", "1").strip().lower() in ("0", "false", "no"):
+        raise PermissionError(
+            "Write tools are disabled (MCP_ALLOW_WRITES=0); "
+            "approve/reject must go through the REST API or Web UI."
+        )
+
+
+@server.tool()
+def list_awaiting_approval() -> Dict[str, Any]:
+    """Datasets waiting for an approval decision (filter outcome =
+    manual_review). Each item carries the LLM's reasoning + evidence — read
+    it before approving. Approve → queued for download; reject → skipped."""
+    out = _api().get("/review")
+    items = []
+    for it in out.get("items", []):
+        it.setdefault("outcome", it.get("recommended_action"))
+        items.append(it)
+    return {"total": out.get("total"), "items": items}
+
+
+@server.tool()
+def approve_dataset(accession: str, note: str = "") -> Dict[str, Any]:
+    """Approve a manual_review dataset → clears the review flag and queues it
+    for download (the download worker picks it up on its next poll).
+
+    Args:
+        accession: e.g. "GSE312185" (must currently be pending review).
+        note: Optional reviewer note stored in the download log.
+    """
+    _require_writes()
+    return _api().post(f"/review/{accession}/approve", json={"note": note} if note else {})
+
+
+@server.tool()
+def reject_dataset(accession: str, note: str = "") -> Dict[str, Any]:
+    """Reject a manual_review dataset → marked skipped, never downloaded.
+
+    Args:
+        accession: e.g. "GSE312185" (must currently be pending review).
+        note: Optional reviewer note stored in the download log.
+    """
+    _require_writes()
+    return _api().post(f"/review/{accession}/reject", json={"note": note} if note else {})
 
 
 @server.tool()

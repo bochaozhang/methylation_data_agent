@@ -55,6 +55,8 @@ MCP 是 REST 的薄适配层，所有能力都有等价 HTTP 端点（见 §8）
 | `get_task_status` | 只读 | 任务状态 + 完成时的 result 摘要 | 快 |
 | `get_task_result` | 只读 | 判定分桶（download/manual_review/exclude）+ 文件路径 | 快 |
 | `cancel_task` | 写 | 取消任务：pending 立即取消；**running 协作式取消**（worker 在候选边界检查标志，秒级~2 分钟内停下） | 快 |
+| `list_awaiting_approval` | 只读 | 待审批清单（manual_review 数据集 + LLM 判定证据与理由） | 快 |
+| `approve_dataset` / `reject_dataset` | 写 | 批准（→ 入下载队列）/ 拒绝（→ skipped 永不下载）；可选 note 存档。默认开启，`MCP_ALLOW_WRITES=0` 可冻结写工具 | 快 |
 | `list_datasets` | 只读 | 浏览注册表（可按 download_status 过滤） | 快 |
 | `get_dataset` | 只读 | 单个数据集全量记录（含路径 + LLM 判定证据） | 快 |
 | `health` | 只读 | 后端心跳 + 注册表统计 | 快 |
@@ -164,8 +166,9 @@ get_task_result(task_id)      # done 后：
 }
 ```
 
-`manual_review` 的数据集需要人工确认后才进入下载（审批走 REST `POST /review/{acc}/approve`，
-MCP 写操作是 Phase 3）。
+`manual_review` 的数据集需要确认后才进入下载：`list_awaiting_approval` 查看清单与 LLM 证据 →
+`approve_dataset`（入下载队列）或 `reject_dataset`（skipped）。写工具默认开启，远端暴露时可设
+`MCP_ALLOW_WRITES=0` 冻结。
 
 ### 5.5 找数据文件
 

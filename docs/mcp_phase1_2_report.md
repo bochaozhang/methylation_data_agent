@@ -170,8 +170,10 @@ unknown 桶，消费方只能保守跳过。**属实**：全库唯一 NULL 行�
 ## 8. 已知限制与下一步
 
 - ~~filter 内存炸弹~~ **已修复**（`5970bc5`，见 §5 #5；355 候选任务验证通过）
-- **Phase 3（未做）**：approve/reject 写操作 tool（`MCP_ALLOW_WRITES` 开关）、远程消费方
-  （streamable HTTP transport + token 鉴权）、提交侧并发/配额护栏
+- **Phase 3（部分完成）**：~~approve/reject 写操作 tool~~ ✅ 已加（2026-10-22，第四轮上游需求）：
+  `list_awaiting_approval` + `approve_dataset` + `reject_dataset`（12 个 tool）；写工具门控
+  `MCP_ALLOW_WRITES` **默认开**（与 submit_query 同权限面——同一无鉴权 localhost API，门控供远端
+  暴露时收紧）。剩余：远程消费方（streamable HTTP transport + token 鉴权）、提交侧并发/配额护栏
 - **Phase 4（未做）**：配套 SKILL.md（教 agent "dry-run→submit→poll→取路径" 工作流）
 - **verdict cache：确定不做（设计决定，2026-10-20）**——每次重新 LLM 判定是故意设计：
   判定标准的主战场在 skill 的 SPEC.md（用户维护），SPEC 更新后 verdict 必须跟着变，缓存会
