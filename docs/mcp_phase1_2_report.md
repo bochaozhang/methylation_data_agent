@@ -4,7 +4,8 @@
 分支：`MCP`（已推送 origin/MCP；main 未动）
 提交链：`2bbff73`（Phase 1）→ `ec97629`（Phase 2）→ `2f63c21`（daemon 自愈修复）
 　→ `5970bc5`（series_matrix OOM 根因修复）→ `53feaff`（文档入库）
-　→ `feb447c`（字段暴露·阻断项）→ `c92ff35`（字段暴露·全量清查）
+　→ `feb447c`（字段暴露·阻断项）→ `c92ff35`（字段暴露·全量清查）→ `9ea2848`（协作式取消）
+　→ `21c778a`（TCGA 判定语义）→ `bd76ce2`（审批 tool）→ `dcccd73`（dry-run 提速）
 设计文档：docs/mcp_interface_plan.md ｜ 使用说明：docs/mcp_usage_guide.md
 
 ---
@@ -166,6 +167,28 @@ unknown 桶，消费方只能保守跳过。**属实**：全库唯一 NULL 行�
 
 已知小瑕疵留档：同 accession 多平台组 upsert 时 disease_groups 会被后写组覆盖（本次回填用聚合
 绕过）；pipeline 侧聚合留作小改进。测试 +4（`test_tcga_records.py`），共 228，基线不变。
+
+### 7.3 审批队列 tool（第四轮反馈，bd76ce2）
+
+上游反馈：manual_review 数据集只能走 REST/Web UI 审批，MCP 消费方在审批门前是死路。加 3 个
+tool（共 12 个）：`list_awaiting_approval`（队列 + LLM 证据）/ `approve_dataset`（→ 入下载队列）/
+`reject_dataset`（→ skipped）。写门控 `MCP_ALLOW_WRITES` **默认开**（与 submit_query 同权限面；
+与原计划"默认关"的偏差及理由记录于 §8）。首次批量实战：17 项待审一次清零（3 批准全部下载成功，
+其中 GSE97923 命中 773 样本已处理 ctDNA 数据）。
+
+附带事故（已恢复）：该测试模块首版在 **import 时**重绑共享 `api.main`，discover 全量导入时与
+其他模块的 tearDownModule 重载碰撞，4 行合成数据写进生产库——已删除，测试改为 setUpClass 绑定。
+同族第二次事故；规则固化：**共享模块的重绑只能在 setUpClass，绝不在 import 时**。
+
+### 7.4 dry-run 超时（第五轮反馈，dcccd73）
+
+上游反馈：`search_datasets` 耗时超 CC 默认 MCP tool 超时（30s）。插桩定位（136 accessions）：
+大 esearch 4s + eutils 批次调用**单次 ~5s**（代理延迟）+ 136 个 supp 目录列表批内串行（0.44s/个）。
+
+修复三处（`GEOClient`）：`_get` 改**全局线程安全限速器**（顺带修复 filter 3 线程并发下限速被
+线程数放大的潜在 NCBI 违规）；批次间 4 路并行（`executor.map` 保序，检索排名不变）；supp 列表
+批内 8 路并行（GEO FTP，非限速 eutils）。**实测：search 阶段 60s → 7-9s（候选逐一致）；端到端
+dry-run 14.4s**。生产任务同路径免费提速。CC 消费方兜底 `MCP_TOOL_TIMEOUT` 已写入使用说明。
 
 ## 8. 已知限制与下一步
 
