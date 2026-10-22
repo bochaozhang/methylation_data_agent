@@ -129,6 +129,7 @@ MCP 层校验后序列化为 intent_json 随任务提交；同时生成一句人
 | 5 | mcp SDK 版本更迭快 | 锁 requirements.txt 版本；Phase 1 只依赖最小特性（tool + stdio） |
 | 6 | **检索失败语义**（2026-10-19 事故）：GEO search 网络失败（如代理死）被静默吞掉 → pipeline"成功"完成 0 候选空任务（aux 首次重跑即中招）。应改为 search 失败 → 任务 fail（区分"真 0 结果"与"检索出错"） | **非 MCP 待办**（涉及 pipeline/SearchSkill 语义，用户拍板暂缓）；当前专注 MCP。缓解措施已做：隧道改 autossh + systemd（methy-proxy.service，跳板 34.26.3.123，断线自动重连 + 开机自启），降低复发概率 |
 | 7 | **filter LLM 截断无重试**（2026-10-22，审批队列清理时发现）：3/17 待审项的 reason 是 `filter_error: Could not parse response content as the length limit was reached`——LLM 输出被 completion 上限截断，JSON 解析失败，判定直接降级 manual_review（不是真实判定）。 | **待办（skill 层）**：geo_filter 捕获 length-limit 截断后重试一次（如压缩 reasoning 要求/提高 max_tokens 再问）；重试仍失败才降级 manual_review 并在 reason 里区分"截断失败"与"证据不足" |
+| 8 | **提交者自编码标题 → cancer 列 unclear**（2026-10-22，GSE97923 实例）：`_gsm_cancer_map` 是确定性关键词映射，只读 GSM 结构化字段（characteristics/source_name）；当提交者把病种写进自己发明的 sample-title 编码（如 `COAD.ct-511`）而 characteristics 只填 "cell-free DNA" 时，773 行全部落 `unclear`——样本粒度病例/对照标签缺失（Tier-2 工作时已识别的残留缺口，GSE97923 首次大规模撞上）。另发现 gsm_metadata_cache 里 title 字段为空（efetch 路径未带回），解码的原始材料也缺。 | **待办**：(a) resolve 时把 sample title 存进 gsm cache（原始材料）；(b) 每高价值 GSE 调一次 LLM 解码标题模式 → 映射规则套用全部 GSM（对齐 Tier-2 做法）；(c) 高价值数据集（如 GSE97923, n=773）可先人工映射。注意：不阻塞下载与逐任务判定，只影响样本粒度分析选样 |
 
 ## 7. 建议排期
 
