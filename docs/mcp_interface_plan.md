@@ -128,6 +128,7 @@ MCP 层校验后序列化为 intent_json 随任务提交；同时生成一句人
 | 4 | ~~verdict cache（caching_audit backlog #4）~~ **确定不做（设计决定，2026-10-20）**：每次重新 LLM 判定是故意设计——判定标准在 skill 的 SPEC.md 里，SPEC 更新后 verdict 必须跟着变，缓存违背"SPEC 是唯一事实源" | 无需行动；重复查询的 token 成本为固有代价 |
 | 5 | mcp SDK 版本更迭快 | 锁 requirements.txt 版本；Phase 1 只依赖最小特性（tool + stdio） |
 | 6 | **检索失败语义**（2026-10-19 事故）：GEO search 网络失败（如代理死）被静默吞掉 → pipeline"成功"完成 0 候选空任务（aux 首次重跑即中招）。应改为 search 失败 → 任务 fail（区分"真 0 结果"与"检索出错"） | **非 MCP 待办**（涉及 pipeline/SearchSkill 语义，用户拍板暂缓）；当前专注 MCP。缓解措施已做：隧道改 autossh + systemd（methy-proxy.service，跳板 34.26.3.123，断线自动重连 + 开机自启），降低复发概率 |
+| 7 | **filter LLM 截断无重试**（2026-10-22，审批队列清理时发现）：3/17 待审项的 reason 是 `filter_error: Could not parse response content as the length limit was reached`——LLM 输出被 completion 上限截断，JSON 解析失败，判定直接降级 manual_review（不是真实判定）。 | **待办（skill 层）**：geo_filter 捕获 length-limit 截断后重试一次（如压缩 reasoning 要求/提高 max_tokens 再问）；重试仍失败才降级 manual_review 并在 reason 里区分"截断失败"与"证据不足" |
 
 ## 7. 建议排期
 
