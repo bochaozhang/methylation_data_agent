@@ -138,6 +138,13 @@ services:
       - methynet
     depends_on:
       - webui
+    healthcheck:
+      # 401 from /mcp means the endpoint is alive AND auth is enforced.
+      test: ["CMD-SHELL", "curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:8081/mcp -H 'Accept: application/json, text/event-stream' -d '{}' | grep -qE '401|400|406'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
     logging:
       driver: "json-file"
       options:
