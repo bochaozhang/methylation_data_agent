@@ -68,21 +68,21 @@ class SearchSkill:
     # ------------------------------------------------------------------ #
 
     def _semantic_search(self, intent: Dict[str, Any], query: str) -> List[Dict[str, Any]]:
+        """Deterministic recall. Raises GEOSearchError when the esearch itself
+        failed (dead proxy / NCBI block) so the TASK fails loudly instead of
+        "succeeding" with 0 candidates (2026-10-19 incident). A successful
+        esearch that matches nothing is a legitimate empty recall."""
         if not query:
             return []
-        try:
-            accessions = self.geo_client.search_gse(query, max_results=2000)
-            if not accessions:
-                return []
-            return self.geo_client.filter_methylation_datasets(
-                accessions,
-                platform_filter=intent.get("platform"),
-                year_start=intent.get("year_start"),
-                year_end=intent.get("year_end"),
-            )
-        except Exception as e:
-            logger.error(f"geo-search semantic failed: {e}")
+        accessions = self.geo_client.search_gse(query, max_results=2000)
+        if not accessions:
             return []
+        return self.geo_client.filter_methylation_datasets(
+            accessions,
+            platform_filter=intent.get("platform"),
+            year_start=intent.get("year_start"),
+            year_end=intent.get("year_end"),
+        )
 
     def _fetch_by_accessions(self, accessions: List[str]) -> List[Dict[str, Any]]:
         results: List[Dict[str, Any]] = []

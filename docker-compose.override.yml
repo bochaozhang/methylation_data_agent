@@ -43,6 +43,13 @@ services:
       LOG_LEVEL: "DEBUG"
       POLL_INTERVAL: "3"
 
+  mcp:
+    volumes:
+      - .:/app
+      - ./registry:/app/registry
+    environment:
+      LOG_LEVEL: "debug"
+
   webui:
     command: >
       uvicorn api.main:app

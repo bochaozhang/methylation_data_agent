@@ -1,0 +1,20 @@
+# Build context hygiene — the image needs CODE ONLY.
+# Runtime state (data/, registry/) is bind-mounted by docker-compose, and the
+# 2026-10-26 ENOSPC crash was caused by uploading the 40GB data/ dir (plus
+# registry WAL, logs, .venv, .git) as build context on every build.
+data/
+registry/
+logs/
+logs.txt
+.venv/
+.git/
+.claude/
+__pycache__/
+**/__pycache__/
+*.pyc
+docs/
+gold/
+*.tar.gz
+.env
+.mypy_cache/
+.pytest_cache/

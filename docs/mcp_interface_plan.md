@@ -106,12 +106,14 @@ MCP 层校验后序列化为 intent_json 随任务提交；同时生成一句人
 
 验收（已达成）：compound 提交返回 main/aux 两个 task_id + label；worker 日志 `Claimed ... label='main' structured=True` + `parse: method=structured cancer=COAD`；filter 用的 intent 正确（cfdna/plasma/serum）；等价重放 deduplicated=true 返回原 id；cancel_task 取消 pending 任务生效。
 
-### Phase 3 — 写操作 + 远程消费方
+### Phase 3 — 写操作 + 远程消费方 ✅ 2026-10-26 完成
 
-- [ ] approve/reject tool（`MCP_ALLOW_WRITES` 开关，默认只读）
-- [ ] streamable HTTP transport：mcp_server 入容器或独立 service，bearer token 鉴权（compose 增服务）
-- [ ] 提交侧成本护栏：并发任务上限 / 每 token 配额（复用去重机制）
-- [ ] 远程文件分发需求此时再评估（只读共享盘 / 对象存储 / 按需打包端点）
+- [x] approve/reject tool（`bd76ce2`；`MCP_ALLOW_WRITES` 门控**默认开**——与 submit_query 同权限面，供远端收紧）
+- [x] streamable HTTP transport：`methyagent-mcp` 容器（compose 服务，:8081，stateless 可扩副本）+ **Bearer token 鉴权**（`.env` 的 `MCP_TOKEN`，常量时间比较，无 token 即 401；无 MCP_TOKEN 时本地开发放行并警告）。stdio 本地路径不变
+- [x] 提交侧护栏：`MAX_ACTIVE_TASKS`（默认 3，env 可调）——活跃任务满载时 `POST /query` 429"queue saturated"；`force` 不绕过（资源护栏）；去重命中仍可返回（不加负载）
+- [~] 远程文件分发：暂不需要（当前远程消费方取元数据/路径即可）；届时再评估共享盘/打包端点
+
+**事故记录（build 崩溃）**：部署时 `docker compose build` 反复 ENOSPC + Claude Code 崩（写日志失败）。根因：**无 .dockerignore**——每次 build 把 40GB `data/` + registry WAL + logs + .venv 全部上传为构建上下文，dockerd 暂存区撑爆磁盘（也解释了 build 巨慢）。修复：新增 .dockerignore（data/registry/logs/.venv/.git/gold/docs 等），build 秒级完成；顺手 `docker builder prune`（682MB）+ 清掉 5 年前遗留的 centos:7 镜像（按用户要求只留一周内）。
 
 ### Phase 4 — 配套 SKILL.md（可选）
 
@@ -127,7 +129,7 @@ MCP 层校验后序列化为 intent_json 随任务提交；同时生成一句人
 | 3 | 同一 GSE 被主/辅两个 task 同时判 download | 已天然解决：datasets 按 accession 去重 + dest-exists 跳过（caa6939），样本级归属看 query_sample_map / sample_metadata.csv 逐 task 列 |
 | 4 | ~~verdict cache（caching_audit backlog #4）~~ **确定不做（设计决定，2026-10-20）**：每次重新 LLM 判定是故意设计——判定标准在 skill 的 SPEC.md 里，SPEC 更新后 verdict 必须跟着变，缓存违背"SPEC 是唯一事实源" | 无需行动；重复查询的 token 成本为固有代价 |
 | 5 | mcp SDK 版本更迭快 | 锁 requirements.txt 版本；Phase 1 只依赖最小特性（tool + stdio） |
-| 6 | **检索失败语义**（2026-10-19 事故）：GEO search 网络失败（如代理死）被静默吞掉 → pipeline"成功"完成 0 候选空任务（aux 首次重跑即中招）。应改为 search 失败 → 任务 fail（区分"真 0 结果"与"检索出错"） | **非 MCP 待办**（涉及 pipeline/SearchSkill 语义，用户拍板暂缓）；当前专注 MCP。缓解措施已做：隧道改 autossh + systemd（methy-proxy.service，跳板 34.26.3.123，断线自动重连 + 开机自启），降低复发概率 |
+| 6 | **检索失败语义**（2026-10-19 事故）：GEO search 网络失败（如代理死）被静默吞掉 → pipeline"成功"完成 0 候选空任务（aux 首次重跑即中招）。 | **✅ 已修（2026-10-26）**：`GEOSearchError`——primary 瞬时失败走 fallback，两轮都败或 NCBI 封禁即 raise；SearchSkill 不再吞异常 → run_database_agent re-raise → daemon `fail_task`。esearch 成功但零匹配仍是合法 0 召回（区分"检索出错"与"真 0 结果"）。测试 +6 |
 | 7 | **filter LLM 截断无重试**（2026-10-22，审批队列清理时发现）：3/17 待审项的 reason 是 `filter_error: Could not parse response content as the length limit was reached`——LLM 输出被截断，JSON 解析失败，判定直接降级 manual_review（不是真实判定）。 | **✅ 已修（2026-10-26）**：截断（端点总 token 预算，max_tokens 参数解不了）→ 压缩输入重问一次（8 个代表 GSM / 摘要 1000 字 / 精简 directive，语义不变）→ 仍败才降级且 reason 标 `filter_error_truncated` 区别于 `filter_error`。真实验证：曾截断的 GSE289742 现拿到真实 exclude（COPD 全血 cfDNA，非目标）。测试 +4 |
 | 8 | **提交者自编码标题 → cancer 列 unclear**（2026-10-22，GSE97923 实例）：`_gsm_cancer_map` 是确定性关键词映射，只读 GSM 结构化字段（characteristics/source_name）；当提交者把病种写进自己发明的 sample-title 编码（如 `COAD.ct-511`）而 characteristics 只填 "cell-free DNA" 时，773 行全部落 `unclear`——样本粒度病例/对照标签缺失（Tier-2 工作时已识别的残留缺口，GSE97923 首次大规模撞上）。另发现 gsm_metadata_cache 里 title 字段为空（efetch 路径未带回），解码的原始材料也缺。 | **待办**：(a) resolve 时把 sample title 存进 gsm cache（原始材料）；(b) 每高价值 GSE 调一次 LLM 解码标题模式 → 映射规则套用全部 GSM（对齐 Tier-2 做法）；(c) 高价值数据集（如 GSE97923, n=773）可先人工映射。注意：不阻塞下载与逐任务判定，只影响样本粒度分析选样 |
 

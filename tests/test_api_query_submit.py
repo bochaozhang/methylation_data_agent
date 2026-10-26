@@ -116,6 +116,38 @@ class TestSubmitQuery(unittest.TestCase):
         self.assertEqual(r2.status_code, 201)
         self.assertNotEqual(r2.json()["task_id"], tid)
 
+    def test_active_task_quota_429(self):
+        """Phase-3 guardrail: refuse new submissions once the active queue
+        is at MAX_ACTIVE_TASKS; `force` does NOT bypass (resource guard)."""
+        api_main.MAX_ACTIVE_TASKS = 2
+        try:
+            # Fill the queue: one running (claimed), one pending.
+            client.post("/query", json={"query": "quota q one"})
+            api_main.get_registry().claim_task("database")
+            client.post("/query", json={"query": "quota q two"})
+
+            r = client.post("/query", json={"query": "quota q three"})
+            self.assertEqual(r.status_code, 429)
+            self.assertIn("queue saturated", r.json()["detail"])
+
+            # force bypasses dedup, not the quota.
+            r = client.post("/query", json={"query": "quota q three", "force": True})
+            self.assertEqual(r.status_code, 429)
+
+            # Dedup hit is still served under saturation (no new load added).
+            r = client.post("/query", json={"query": "quota q two"})
+            self.assertEqual(r.status_code, 200)
+            self.assertTrue(r.json()["deduplicated"])
+
+            # Free a slot → submission works again.
+            reg = api_main.get_registry()
+            tid = reg.list_active_tasks()[0]["task_id"]
+            reg.complete_task(tid, result={})
+            r = client.post("/query", json={"query": "quota q three"})
+            self.assertEqual(r.status_code, 201)
+        finally:
+            api_main.MAX_ACTIVE_TASKS = 3
+
 
 if __name__ == "__main__":
     unittest.main()

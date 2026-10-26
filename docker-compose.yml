@@ -112,6 +112,39 @@ services:
         max-file: "5"
 
   # ----------------------------------------------------------
+  # mcp — streamable-HTTP MCP endpoint for REMOTE agents
+  # (stdio for local Claude Code stays: claude mcp add ... __main__.py)
+  # Auth: set MCP_TOKEN in .env — without it the endpoint is OPEN.
+  # ----------------------------------------------------------
+  mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: methyagent:latest
+    container_name: methyagent-mcp
+    command: python mcp_server/__main__.py --http --host 0.0.0.0 --port 8081
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      MCP_API_BASE: "http://webui:80"       # container-to-container
+      MCP_DATA_HOST_PATH: "/app/data"       # remote consumers see container paths
+      MCP_TOKEN: "${MCP_TOKEN:-}"
+      MAX_ACTIVE_TASKS: "${MAX_ACTIVE_TASKS:-3}"
+    ports:
+      - "8081:8081"
+    volumes:
+      - ./registry:/app/registry
+    networks:
+      - methynet
+    depends_on:
+      - webui
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  # ----------------------------------------------------------
   # webui — FastAPI dashboard + REST API
   # Exposes port 8080; writes tasks to the shared SQLite queue
   # ----------------------------------------------------------

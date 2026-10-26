@@ -204,6 +204,25 @@ SPEC 不变），仍败才降级且 reason 标 `filter_error_truncated`（区别
 ~1200 次浪费判定的教训）。`task_queue` 加 `requeue_count`（迁移已跑生产库）；孤儿回收超过
 3 次即标 `failed`（error 说明疑似崩溃循环、修因后可重提），不再复活。测试 +3。
 
+### 7.6 检索失败语义 + Phase 3 收官（2026-10-26）
+
+**检索失败语义（backlog §6-6，用户拍板后实施）**：`GEOSearchError`（geo_tools）——primary
+瞬时失败保留一次 fallback 机会，两轮都败或 NCBI abuse 封禁即 raise；`SearchSkill` 不再吞
+异常 → `run_database_agent` re-raise → daemon `fail_task`。**esearch 成功但零匹配仍是合法
+0 召回**（"检索出错"与"真 0 结果"从此可区分）。测试 +6。
+
+**Phase 3 剩余项完成**：`methyagent-mcp` 容器（streamable HTTP :8081，stateless）+ Bearer
+token（`.env` 的 `MCP_TOKEN`，常量时间比较；实测 401/401/200+initialize 三连）+ 提交配额
+`MAX_ACTIVE_TASKS=3`（满载 429，force 不绕过，去重命中仍放行）。测试 +6（auth 中间件
+4 例 + 配额 1 例，另修 2 个测试自身后在 Py3.12/ASGI 规范下的 bug）。Phase 3 至此**全部
+完成**，仅剩 Phase 4（SKILL.md）。
+
+**部署日事故（ENOSPC）**：`docker compose build` 把磁盘写爆、Claude Code 跟着崩（写
+transcript 失败）。根因是**没有 .dockerignore**——40GB `data/` + registry WAL + logs +
+.venv 每次全量上传为构建上下文。修复：新增 .dockerignore，build 从分钟级到秒级；清理
+build cache（682MB）与一周前旧镜像（按用户策略，含 5 年前的 centos:7）。教训：凡带大
+数据目录的仓库，.dockerignore 是第一道运维防线。
+
 ## 8. 已知限制与下一步
 
 - ~~filter 内存炸弹~~ **已修复**（`5970bc5`，见 §5 #5；355 候选任务验证通过）

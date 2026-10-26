@@ -77,6 +77,16 @@ SAMPLE_GROUP_KEYWORDS: Dict[str, List[str]] = {
 # Samples not matching any group above are assigned to "unknown"
 
 
+class GEOSearchError(RuntimeError):
+    """The GEO esearch itself failed (network / proxy / NCBI block).
+
+    Deliberately distinct from a legitimate empty result: an empty idlist
+    after a SUCCESSFUL esearch is a real zero-recall query; this error means
+    we could not search at all. Callers must fail the task on this — the
+    2026-10-19 incident had a dead proxy silently produce a "successful"
+    0-candidate run."""
+
+
 class GEOClient:
     """
     Client for NCBI GEO E-utilities API.
@@ -199,16 +209,16 @@ class GEOClient:
             logger.info(f"GEO search (gds) '{query[:60]}' → {len(uids)} UIDs")
         except RuntimeError as e:
             # NCBI abuse redirect — retrying with the same key will not help.
-            logger.error(
-                f"GEO search blocked by NCBI (abuse redirect). "
-                f"Check NCBI_API_KEY validity and request rate. Detail: {e}"
-            )
-            return []
+            raise GEOSearchError(
+                f"GEO search blocked by NCBI (abuse redirect); check "
+                f"NCBI_API_KEY validity and request rate. Detail: {e}"
+            ) from e
         except Exception as e:
+            # Transient primary failure — the fallback below gets one chance.
             logger.warning(f"GEO search failed: {e}")
             uids = []
 
-        # Fallback: try without Entry Type filter (only for non-abuse failures)
+        # Fallback: try without Entry Type filter
         if not uids:
             try:
                 params2 = {
@@ -220,17 +230,14 @@ class GEOClient:
                 resp2 = self._get("esearch.fcgi", params2)
                 uids = resp2.json().get("esearchresult", {}).get("idlist", [])
                 logger.info(f"GEO search fallback (gds, no filter) → {len(uids)} UIDs")
-            except RuntimeError as e2:
-                logger.error(
-                    f"GEO search fallback also blocked by NCBI (abuse redirect). "
-                    f"Check NCBI_API_KEY validity and request rate. Detail: {e2}"
-                )
-                return []
             except Exception as e2:
-                logger.error(f"GEO search fallback also failed: {e2}")
-                return []
+                raise GEOSearchError(
+                    f"GEO esearch failed on primary and fallback (network/proxy/"
+                    f"NCBI): {e2}"
+                ) from e2
 
         if not uids:
+            # Legitimate zero-recall: the esearch SUCCEEDED and matched nothing.
             return []
 
         # Convert GDS UIDs to GSE accessions via esummary

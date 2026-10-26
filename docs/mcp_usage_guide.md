@@ -45,6 +45,33 @@ claude mcp add methyagent -- \
 > ~10-15s（2026-10-22 前 ~50-60s 会超时）。若你的代理链路慢仍超时，在启动 claude 的
 > 环境设置 `MCP_TOOL_TIMEOUT=120000`（毫秒）。
 
+### 其他 MCP 客户端（支持 stdio）
+
+启动命令同上（任意工作目录可运行）。环境变量：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `MCP_API_BASE` | `http://localhost:80` | REST API 地址（远程部署时改这里） |
+| `MCP_DATA_HOST_PATH` | `<repo>/data` | 数据目录的宿主机路径（路径翻译用） |
+| `MCP_API_TIMEOUT` | `300` | 每请求超时秒数（dry-run 实测 ~10-15s，网络差时留余量，勿低于 60） |
+
+> **Claude Code 消费方注意**：CC 的 MCP tool 调用默认超时 30s。dry-run 并行化后实测
+> ~10-15s（2026-10-22 前 ~50-60s 会超时）。若你的代理链路慢仍超时，在启动 claude 的
+> 环境设置 `MCP_TOOL_TIMEOUT=120000`（毫秒）。
+
+### 远程消费方（streamable HTTP，2026-10-26 起）
+
+服务器常驻 `methyagent-mcp` 容器，端点 `http://<host>:8081/mcp`（stateless，可任意副本
+/负载均衡）。**必须带 Bearer token**（token 在服务端 `.env` 的 `MCP_TOKEN`，找管理员要）：
+
+```bash
+claude mcp add --transport http methyagent http://<host>:8081/mcp \
+  --header "Authorization: Bearer <TOKEN>"
+```
+
+无 token / 错 token 一律 401。注意：远程模式下返回的数据路径是服务端容器路径
+（`/app/data/...`），需要文件本体时另找管理员安排（拷贝/挂载/后续文件分发方案）。
+
 ### 不用 MCP，直接 REST
 
 MCP 是 REST 的薄适配层，所有能力都有等价 HTTP 端点（见 §8），curl/httpx 可直接调用。
@@ -191,7 +218,9 @@ list_datasets(status="done", limit=50)
 |---|---|
 | **去重** | 提交时若存在等价的 pending/running 任务（规范化 intent 相等，或自由文本 query 全等），返回既有 task_id 且 `deduplicated=true`（不新建）。想强制重跑传 `force=true`。已 done 的任务不会被去重命中 |
 | 任务可协作式取消 | `cancel_task`：pending 立即取消；running → `cancel_requested`，worker 在每个候选判定边界检查标志并停止（在飞的单个候选判定需先完成，通常秒级~2 分钟）。已产生的部分 GSM 判定记录保留（任务作用域），但不会触发 register/下载。worker 崩溃时自愈逻辑会直接把 `cancel_requested` 落成 `cancelled`（不会复活已取消任务） |
-| worker 故障自愈 | worker 重启会把遗留 `running` 的孤儿任务自动拉回 `pending` 重跑 |
+| worker 故障自愈 | worker 重启会把遗留 `running` 的孤儿任务自动拉回 `pending` 重跑；同一任务最多被这样复活 3 次，超过即标 `failed`（防崩溃循环烧钱）|
+| 检索失败 → 任务失败 | esearch 本身失败（代理死/NCBI 封禁）会让任务 `failed` 并给出明确错误，**不再**产出"成功完成的 0 候选空任务"；esearch 成功但无匹配仍是合法的 0 召回 |
+| 提交配额 | 活跃（pending+running）任务 ≥ `MAX_ACTIVE_TASKS`（默认 3）时 `POST /query`/`submit_query` 返回 429"queue saturated"；`force` 不绕过（资源护栏，非去重开关）；等任务完成或让管理员调大 env |
 | verdict 随机性 | filter 判定是 LLM 调用（**故意不做 verdict cache**——判定标准在 SPEC.md，SPEC 更新后 verdict 必须跟着变），同一查询两次跑的边缘判定可能不同（download↔manual_review 浮动属正常）；SPEC 变更后重跑即可得到新标准的判定 |
 | 已下载数据不重下 | 重复查询同一 GSE 零重复下载（dest-exists 跳过 + 状态不降级） |
 | TCGA | 样本类型为液体（cfdna/plasma/serum/wbc/whole_blood）时自动跳过 TCGA；组织类型（tumor/adjacent/normal）才走 GDC |

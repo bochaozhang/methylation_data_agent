@@ -68,6 +68,9 @@ from api.models import (  # noqa: E402
 # ---------------------------------------------------------------------------
 REGISTRY_PATH = os.environ.get("REGISTRY_PATH", "./registry/methyagent.db")
 HEARTBEAT_STALE_SECS = int(os.environ.get("HEARTBEAT_STALE_SECS", "120"))
+# Submit-side guardrail: refuse new tasks while this many are pending/running.
+# NOT bypassed by `force` (that skips dedup only) — it is a resource guard.
+MAX_ACTIVE_TASKS = int(os.environ.get("MAX_ACTIVE_TASKS", "3"))
 
 # ---------------------------------------------------------------------------
 # App + templates
@@ -294,6 +297,19 @@ async def submit_query(body: QueryRequest, response: Response):
                 existing = registry.get_task(t["task_id"])
                 response.status_code = 200
                 return _task_to_response(existing, deduplicated=True)
+
+    # ---- concurrency guardrail: cap the active queue ------------------------
+    active = registry.list_active_tasks()
+    if len(active) >= MAX_ACTIVE_TASKS:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"queue saturated: {len(active)} active task(s) >= "
+                f"MAX_ACTIVE_TASKS={MAX_ACTIVE_TASKS}. Wait for tasks to "
+                f"complete (a full task runs ~1h) or raise the limit "
+                f"(env MAX_ACTIVE_TASKS). `force` does not bypass this."
+            ),
+        )
 
     task_id = registry.create_task(
         query=query,
