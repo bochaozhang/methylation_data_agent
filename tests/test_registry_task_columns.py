@@ -165,5 +165,58 @@ class TestRequeueOrphanedTasks(unittest.TestCase):
         self.assertEqual(claimed["task_id"], t_real)
 
 
+class TestRequeueCrashLoopGuard(unittest.TestCase):
+    """2026-10-19 OOM incident: self-heal + recurring crash = infinite rerun
+    loop (~1200 wasted LLM verdicts). Guard: after MAX_ORPHAN_REQUEUES the
+    task is marked failed instead of resurrected again."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.reg = Registry(db_path=str(Path(self.tmp.name) / "reg.db"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _crash_and_restart(self, tid):
+        """Simulate: worker dies mid-task (status stays running), then the
+        startup self-heal requeues."""
+        # Kill: claim leaves it running; simulate the crash by leaving status.
+        # Restart: requeue_orphaned_tasks picks it up.
+        return self.reg.requeue_orphaned_tasks("database")
+
+    def test_cap_marks_failed_after_max_requeues(self):
+        tid = self.reg.create_task(query="crashloop q", agent_type="database")
+        self.reg.claim_task("database")  # → running
+
+        cap = self.reg.MAX_ORPHAN_REQUEUES
+        for i in range(cap):
+            requeued = self._crash_and_restart(tid)
+            self.assertEqual(requeued, [tid])
+            self.assertEqual(self.reg.get_task(tid)["status"], "pending")
+            self.reg.claim_task("database")  # next run claims it again
+
+        # Crash once more beyond the cap → failed, not pending.
+        requeued = self._crash_and_restart(tid)
+        self.assertEqual(requeued, [])
+        task = self.reg.get_task(tid)
+        self.assertEqual(task["status"], "failed")
+        self.assertIn("crash loop", task["error"])
+
+    def test_requeue_count_tracks(self):
+        tid = self.reg.create_task(query="q", agent_type="database")
+        self.reg.claim_task("database")
+        self.reg.requeue_orphaned_tasks("database")
+        self.assertEqual(self.reg.get_task(tid)["requeue_count"], 1)
+
+    def test_completed_task_count_irrelevant(self):
+        """A task that completes normally is unaffected by the counter."""
+        tid = self.reg.create_task(query="q", agent_type="database")
+        self.reg.claim_task("database")
+        self.reg.requeue_orphaned_tasks("database")
+        self.reg.claim_task("database")
+        self.reg.complete_task(tid, result={"ok": True})
+        self.assertEqual(self.reg.get_task(tid)["status"], "done")
+
+
 if __name__ == "__main__":
     unittest.main()

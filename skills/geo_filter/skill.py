@@ -415,6 +415,75 @@ def _safe_json(raw: str) -> Tuple[Dict[str, Any], str]:
     raise json.JSONDecodeError("geo_filter: could not parse JSON", stripped, 0)
 
 
+def _invoke_filter_llm(
+    llm: Any, user_msg: str, acc: str, gsm_details: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """One LLM call → normalised verdict (invoke → JSON parse → normalise)."""
+    response = llm.invoke([
+        SystemMessage(content=SYSTEM_PROMPT),
+        HumanMessage(content=user_msg),
+    ])
+    raw = response.content if isinstance(response.content, str) else str(response.content)
+    verdict, json_tier = _safe_json(raw)
+    verdict["_json_parse_tier"] = json_tier
+    if json_tier != "clean":
+        logger.info(
+            f"geo_filter {acc}: JSON parse needed '{json_tier}' recovery "
+            f"(json_mode off, or model wrapped/truncated the JSON)"
+        )
+
+    usage = _extract_usage(response)
+    if usage.get("cached_tokens"):
+        logger.debug(f"geo_filter {acc}: cached_tokens={usage['cached_tokens']}")
+    verdict = _normalise_verdict(verdict, gsm_details)
+    _expand_gsm_includes(verdict, gsm_details)
+    verdict["_usage"] = usage
+    verdict["_evidence"] = {
+        "gsm_groups": group_summary(gsm_details),
+        "n_representative_gsm": len(gsm_details),
+        "had_abstract": None,  # filled by caller when known
+        "geo_sample_count": None,
+    }
+    logger.info(
+        f"geo_filter {acc}: outcome={verdict.get('outcome')} "
+        f"sample={verdict.get('confirmed_sample_type')} "
+        f"reason={(verdict.get('reason') or '')[:80]}"
+    )
+    return verdict
+
+
+def _compact_user_msg(
+    ds: Dict[str, Any], intent: Dict[str, Any],
+    gsm_details: List[Dict[str, Any]], abstract: Optional[str], acc: str,
+) -> str:
+    """Slimmer retry prompt for endpoint-budget truncation: fewer GSMs,
+    trimmed evidence, explicit brevity directive. Semantics unchanged —
+    same request, same SPEC, just less to read and tighter to write."""
+    pmids = ds.get("pubmed_ids", [])
+    msg = (
+        f"=== USER REQUEST ===\n{_intent_block(intent)}\n\n"
+        f"=== GEO DATASET METADATA ===\n"
+        f"GEO Accession: {acc}\n"
+        f"Title: {ds.get('title', '')[:150]}\n"
+        f"Summary: {ds.get('summary', '')[:300]}\n"
+        f"Platform: {ds.get('platform_canonical') or ds.get('platforms', [])}\n"
+        f"Sample count (GEO): {ds.get('sample_count')}\n"
+        f"Cancer type (GEO): {ds.get('cancer_type')}\n"
+        f"PubMed IDs: {pmids}\n\n"
+        f"=== REPRESENTATIVE GSM SAMPLES (subset) ===\n"
+        f"{_gsm_block(gsm_details[:8])}\n"
+    )
+    if abstract:
+        msg += f"\n=== PUBMED ABSTRACT (PMID {pmids[0] if pmids else '?'}, excerpt) ===\n{abstract[:1000]}\n"
+    msg += (
+        "\n=== CONCISE RETRY ===\n"
+        "The previous attempt exceeded the output token budget. Apply the SAME "
+        "procedure and output contract, but keep the reasoning chain compact "
+        "(≤120 words) and every string field brief. Do not drop required fields.\n"
+    )
+    return msg
+
+
 def filter_dataset(
     llm: Any,
     ds: Dict[str, Any],
@@ -460,45 +529,43 @@ def filter_dataset(
         user_msg += f"\n=== PUBMED ABSTRACT (PMID {pmids[0] if pmids else '?'}) ===\n{abstract[:2500]}\n"
 
     try:
-        response = llm.invoke([
-            SystemMessage(content=SYSTEM_PROMPT),
-            HumanMessage(content=user_msg),
-        ])
-        raw = response.content if isinstance(response.content, str) else str(response.content)
-        verdict, json_tier = _safe_json(raw)
-        verdict["_json_parse_tier"] = json_tier
-        if json_tier != "clean":
-            logger.info(
-                f"geo_filter {acc}: JSON parse needed '{json_tier}' recovery "
-                f"(json_mode off, or model wrapped/truncated the JSON)"
-            )
-
-        # Capture token usage + API-returned model (for the per-query CSV log).
-        usage = _extract_usage(response)
-        if usage.get("cached_tokens"):
-            logger.debug(f"geo_filter {acc}: cached_tokens={usage['cached_tokens']}")
-        verdict = _normalise_verdict(verdict, gsm_details)
-        # Expand per-combo gsm_includes back to per-GSM (LLM saw deduped combos)
-        _expand_gsm_includes(verdict, gsm_details)
-        verdict["_usage"] = usage
-        # Evidence snapshot (logged so a human can see WHAT the model was given
-        # alongside HOW it reasoned — e.g. all-unknown GSM groups + no abstract
-        # = weak evidence that often explains a bad verdict).
-        verdict["_evidence"] = {
-            "gsm_groups": group_summary(gsm_details),
-            "n_representative_gsm": len(gsm_details),
-            "had_abstract": bool(abstract),
-            "geo_sample_count": ds.get("sample_count"),
-        }
-        logger.info(
-            f"geo_filter {acc}: outcome={verdict.get('outcome')} "
-            f"sample={verdict.get('confirmed_sample_type')} "
-            f"reason={(verdict.get('reason') or '')[:80]}"
-        )
+        verdict = _invoke_filter_llm(llm, user_msg, acc, gsm_details)
+        verdict["_evidence"]["had_abstract"] = bool(abstract)
+        verdict["_evidence"]["geo_sample_count"] = ds.get("sample_count")
         return verdict
 
     except Exception as e:
-        logger.warning(f"geo_filter {acc}: LLM/parse error — {e} — manual_review (conservative)")
+        # Truncation retry (backlog §6-7, 2026-10-22): the endpoint's total
+        # (prompt+completion) token budget truncates long outputs — the JSON
+        # parse then fails and the verdict used to degrade to a bogus
+        # manual_review ("filter_error"). Retry ONCE with a compact prompt
+        # (fewer representative GSMs, trimmed evidence, explicit brevity
+        # directive) before giving up.
+        if "length limit" in str(e):
+            logger.warning(
+                f"geo_filter {acc}: response truncated (length limit) — "
+                f"retrying once with compact prompt"
+            )
+            compact_msg = _compact_user_msg(ds, intent, gsm_details, abstract, acc)
+            try:
+                verdict = _invoke_filter_llm(llm, compact_msg, acc, gsm_details)
+                verdict["_evidence"]["had_abstract"] = bool(abstract)
+                verdict["_evidence"]["geo_sample_count"] = ds.get("sample_count")
+                verdict["_truncation_retried"] = True
+                return verdict
+            except Exception as e2:
+                e = e2  # fall through to the conservative verdict, marked truncated
+
+        if "length limit" in str(e):
+            logger.warning(
+                f"geo_filter {acc}: truncation persisted after compact retry — "
+                f"manual_review (conservative)"
+            )
+            err_prefix = "filter_error_truncated"
+        else:
+            logger.warning(f"geo_filter {acc}: LLM/parse error — {e} — manual_review (conservative)")
+            err_prefix = "filter_error"
+
         return {
             "outcome": "manual_review",
             "recommended_action": "manual_review",
@@ -513,9 +580,9 @@ def filter_dataset(
             "download_tier": None,
             "flags": "",
             "exclude_reason": None,
-            "reason": f"filter_error: {e}",
-            "notes": f"filter_error: {e}",
-            "reasoning": f"filter_error: {e}",
+            "reason": f"{err_prefix}: {e}",
+            "notes": f"{err_prefix}: {e}",
+            "reasoning": f"{err_prefix}: {e}",
             "gsm_includes": [],
             "_json_parse_tier": "failed",
         }

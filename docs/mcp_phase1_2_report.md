@@ -85,7 +85,7 @@ data agent 现在是一个标准 MCP 服务：外部 agent 可以 dry-run 预览
 | 2 | **孤儿任务**（10-16→10-19）：aux 任务跑一半遇容器重启，永远停在 `running`，worker 空转 2.5 天 | claim 只认 pending，重启杀死的任务无人回收 | `requeue_orphaned_tasks()` 启动自愈（2f63c21），已实测生效 |
 | 3 | **心跳行竞态**（10-19）：自愈把 `heartbeat_database` 也 requeue 成 pending，短暂可被 claim | 心跳行存在 task_queue 里且 status=running | requeue 与 claim_task 双向排除 `heartbeat_%`；`update_heartbeat` 的 REPLACE 30s 内自愈了现场 |
 | 4 | **检索静默失败**（10-19）：隧道死后重跑 aux，0 候选"成功"完成 | 代理死 → esearch 异常被吞 → 空结果；且隧道本身是无人看管的 `ssh -f` | 隧道改 **autossh + systemd**（`methy-proxy.service`，跳板 34.26.3.123，断线重连+开机自启）；**检索失败语义**（失败应 fail 任务）记为待办，暂缓（专注 MCP） |
-| 5 | **filter 阶段 13GB 内存炸弹 → 宿主机 OOM**（10-19，**已修复** `5970bc5`）：355 候选的组织类任务四轮全量重跑，每轮都在**第 303-307 个判定**附近被全局 OOM-killer 处决（dmesg：anon-rss 13.4GB；正常过滤全程仅 ~500MB）。自愈机制每次正确回收重跑 → 形成"崩溃→重跑→再崩溃"的**西西弗斯循环**（每轮浪费 ~300 次 LLM 判定） | **根因**：`fetch_series_matrix_sample_info` 把整个 series_matrix 读入内存（`resp.content` + `gzip.decompress` + `.decode` + `splitlines` ≈ 4 份并发副本）。芯片系列的 series_matrix 内嵌全量 β 矩阵——**GSE51032** 的达 3.1GB 压缩 / ~10GB 解压 → 13.4GB 峰值。它死于 resolve 中途 → 缓存永不落盘 → 每轮重跑必撞。**修复**：流式 + 增量 gunzip，读到 `!series_matrix_table_begin`（元数据都在矩阵表前）即停 + 64MB 解压上限兜底。**验证**：GSE51032 从必死变为 1.4s / 76.6MB 拿到 845 样本完整标注并正确判定 exclude（WBC）；aux 第五轮 2h03m 零崩溃跑完 355 候选。附带收益：所有大系列 resolve 只读文件头 | 防御性待办（未做）：requeue 加次数上限（如 3 次后标 failed），避免任何崩溃循环被自愈放大 |
+| 5 | **filter 阶段 13GB 内存炸弹 → 宿主机 OOM**（10-19，**已修复** `5970bc5`）：355 候选的组织类任务四轮全量重跑，每轮都在**第 303-307 个判定**附近被全局 OOM-killer 处决（dmesg：anon-rss 13.4GB；正常过滤全程仅 ~500MB）。自愈机制每次正确回收重跑 → 形成"崩溃→重跑→再崩溃"的**西西弗斯循环**（每轮浪费 ~300 次 LLM 判定） | **根因**：`fetch_series_matrix_sample_info` 把整个 series_matrix 读入内存（`resp.content` + `gzip.decompress` + `.decode` + `splitlines` ≈ 4 份并发副本）。芯片系列的 series_matrix 内嵌全量 β 矩阵——**GSE51032** 的达 3.1GB 压缩 / ~10GB 解压 → 13.4GB 峰值。它死于 resolve 中途 → 缓存永不落盘 → 每轮重跑必撞。**修复**：流式 + 增量 gunzip，读到 `!series_matrix_table_begin`（元数据都在矩阵表前）即停 + 64MB 解压上限兜底。**验证**：GSE51032 从必死变为 1.4s / 76.6MB 拿到 845 样本完整标注并正确判定 exclude（WBC）；aux 第五轮 2h03m 零崩溃跑完 355 候选。附带收益：所有大系列 resolve 只读文件头 | ~~防御性待办：requeue 加次数上限~~ **已修（10-26）**：`requeue_count` 超 3 次标 failed，杜绝崩溃循环被自愈放大（见 §7.5）|
 
 ## 6. 生产验证（compound 查询端到端）
 
@@ -189,6 +189,20 @@ tool（共 12 个）：`list_awaiting_approval`（队列 + LLM 证据）/ `appro
 线程数放大的潜在 NCBI 违规）；批次间 4 路并行（`executor.map` 保序，检索排名不变）；supp 列表
 批内 8 路并行（GEO FTP，非限速 eutils）。**实测：search 阶段 60s → 7-9s（候选逐一致）；端到端
 dry-run 14.4s**。生产任务同路径免费提速。CC 消费方兜底 `MCP_TOOL_TIMEOUT` 已写入使用说明。
+
+### 7.5 可靠性双修（2026-10-26，自主排项）
+
+**截断重试（backlog §6-7）**：filter LLM 响应被端点总 token 预算截断（prompt+completion
+合计 ~8-11k；`max_tokens` 参数解不了）→ JSON 解析失败 → 静默降级伪 manual_review。修复：
+截断时**压缩输入重问一次**（8 个代表 GSM、摘要截 1000 字、显式精简 directive——语义与
+SPEC 不变），仍败才降级且 reason 标 `filter_error_truncated`（区别于 `filter_error`）。
+真实验证：曾截断的 GSE289742 现产出真实 exclude 判定（64 COPD + 64 对照全血 cfDNA，非目标
+疾病）。测试 +4（重试恢复带 `_truncation_retried` 标记、压缩消息更短且含 directive、持续
+截断区分标记、非截断错误仍单次调用）。
+
+**requeue 次数上限（§5 #5 遗留防御项）**：自愈 + 周期性崩溃 = 无限重跑烧钱（OOM 事故四轮
+~1200 次浪费判定的教训）。`task_queue` 加 `requeue_count`（迁移已跑生产库）；孤儿回收超过
+3 次即标 `failed`（error 说明疑似崩溃循环、修因后可重提），不再复活。测试 +3。
 
 ## 8. 已知限制与下一步
 

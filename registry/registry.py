@@ -25,6 +25,10 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+
+from utils.logger import get_logger
+
+logger = get_logger(__name__)
 from typing import Any, Dict, List, Optional
 
 
@@ -152,7 +156,8 @@ class Registry:
                     result_json TEXT,
                     error       TEXT,
                     label       TEXT,      -- sub-task role, e.g. 'main'/'auxiliary' (compound queries)
-                    intent_json TEXT       -- structured SearchIntent; parse_node uses it directly (no LLM parse)
+                    intent_json TEXT,      -- structured SearchIntent; parse_node uses it directly (no LLM parse)
+                    requeue_count INTEGER DEFAULT 0  -- orphan-requeue count; capped to stop crash loops
                 );
             """)
 
@@ -272,6 +277,8 @@ class Registry:
             # task_queue v2 columns (compound-query label + structured intent)
             "ALTER TABLE task_queue ADD COLUMN label TEXT",
             "ALTER TABLE task_queue ADD COLUMN intent_json TEXT",
+            # crash-loop guard for the orphan-requeue self-heal
+            "ALTER TABLE task_queue ADD COLUMN requeue_count INTEGER DEFAULT 0",
         ]
         with self._get_conn() as conn:
             for sql in migrations:
@@ -1123,6 +1130,11 @@ class Registry:
             rows = conn.execute(sql, params).fetchall()
             return [dict(r) for r in rows]
 
+    # After this many orphan requeues a task is marked failed instead — the
+    # 2026-10-19 OOM crash loop showed self-heal + crash = infinite reruns
+    # burning LLM tokens (4 full runs ≈ 1200 wasted verdicts).
+    MAX_ORPHAN_REQUEUES = 3
+
     def requeue_orphaned_tasks(self, agent_type: str) -> List[str]:
         """
         Requeue 'running' tasks of this worker's claimable types back to
@@ -1134,6 +1146,10 @@ class Registry:
         predecessor (e.g. container restart mid-task) and would otherwise be
         stuck forever — claim_task only ever looks at 'pending'.
 
+        Crash-loop guard: each requeue increments requeue_count; at
+        MAX_ORPHAN_REQUEUES the task is marked failed instead of being
+        resurrected again (resubmit explicitly if another try is wanted).
+
         Download-only workers must NOT call this: they would requeue tasks a
         live query worker is legitimately executing.
         """
@@ -1142,6 +1158,7 @@ class Registry:
             "literature": ("literature", "both"),
         }.get(agent_type, (agent_type,))
         placeholders = ",".join("?" * len(claimable))
+        now = datetime.now(timezone.utc).isoformat()
         with self._lock:
             with self._get_conn() as conn:
                 # Honor pending cancellation requests even if the worker died:
@@ -1153,25 +1170,49 @@ class Registry:
                         WHERE status = 'cancel_requested'
                           AND agent_type IN ({placeholders})
                           AND task_id NOT LIKE 'heartbeat_%'""",
-                    (datetime.now(timezone.utc).isoformat(),) + claimable,
+                    (now,) + claimable,
                 )
                 rows = conn.execute(
-                    f"""SELECT task_id FROM task_queue
+                    f"""SELECT task_id, requeue_count FROM task_queue
                         WHERE status = 'running'
                           AND agent_type IN ({placeholders})
                           AND task_id NOT LIKE 'heartbeat_%'""",
                     claimable,
                 ).fetchall()
-                ids = [r["task_id"] for r in rows]
-                if ids:
-                    id_ph = ",".join("?" * len(ids))
+                requeue_ids, failed_ids = [], []
+                for r in rows:
+                    if (r["requeue_count"] or 0) >= self.MAX_ORPHAN_REQUEUES:
+                        failed_ids.append(r["task_id"])
+                    else:
+                        requeue_ids.append(r["task_id"])
+
+                if requeue_ids:
+                    id_ph = ",".join("?" * len(requeue_ids))
                     conn.execute(
                         f"""UPDATE task_queue
-                            SET status = 'pending', started_at = NULL, error = NULL
+                            SET status = 'pending', started_at = NULL, error = NULL,
+                                requeue_count = requeue_count + 1
                             WHERE task_id IN ({id_ph})""",
-                        ids,
+                        requeue_ids,
                     )
-                return ids
+                if failed_ids:
+                    id_ph = ",".join("?" * len(failed_ids))
+                    crash_msg = (
+                        f"requeued {self.MAX_ORPHAN_REQUEUES}x without completing — "
+                        "suspected crash loop (worker repeatedly died under this task); "
+                        "investigate worker logs, fix the cause, then resubmit"
+                    )
+                    conn.execute(
+                        f"""UPDATE task_queue
+                            SET status = 'failed', finished_at = ?, error = ?
+                            WHERE task_id IN ({id_ph})""",
+                        (now, crash_msg) + tuple(failed_ids),
+                    )
+                    logger.warning(
+                        f"requeue_orphaned_tasks: crash-loop guard fired for "
+                        f"{failed_ids} (marked failed after {self.MAX_ORPHAN_REQUEUES} requeues)"
+                    )
+                return requeue_ids
 
     def complete_task(self, task_id: str, result: Any = None) -> None:
         """Mark a task as done and store the result JSON."""
