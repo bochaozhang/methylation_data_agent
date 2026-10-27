@@ -1,19 +1,23 @@
 # MethyAgent
 
-双 Agent 甲基化数据自动采集系统：自然语言查询 → GEO/TCGA 检索 → 三态过滤（download / manual_review / exclude，GSM 样本级判定）→ 自动下载 → 下载后核验（列数 / GSM→列映射 / 疾病分组）→ SQLite 注册表全程追踪。
+双 Agent 甲基化数据自动采集系统：自然语言或结构化 intent 查询 → GEO/TCGA 检索 → 三态过滤（download / manual_review / exclude，GSM 样本级判定）→ 自动下载 → 下载后核验（列数 / GSM→列映射 / 疾病分组）→ SQLite 注册表全程追踪。
+
+全部能力同时以 **MCP 协议**暴露（13 个 tool：dry-run 预览、复合查询提交、审批、样本标题解码等），外部 LLM agent（Claude Code 等）即插即用——见下文 [MCP 接口](#mcp-接口供其他-agent-调用)。
 
 ## 系统架构
 
 ```
-用户 query（CLI 或 HTTP API）
-      │
-      ▼
+用户 / 外部 agent
+   │  CLI · HTTP API · MCP（stdio 本地 / streamable HTTP :8081 远程）
+   ▼
 ┌──────────────────────────────────────────────────────┐
 │  task_queue（SQLite）                                  │
 │    agent1-query  : 搜索 → 过滤 → 注册（download→pending）│
 │    agent1-download: 轮询 pending → 下载 → 核验 → done   │
 │    agent2        : PubMed/PMC 文献挖掘补充              │
 │    webui         : FastAPI（端口 80）提交/审批/看板      │
+│    mcp           : MCP server（:8081 远程入口，转 webui  │
+│                    REST；本地 stdio 直连同一 API）       │
 └──────────────────────────────────────────────────────┘
       │                                    │
       ▼                                    ▼
@@ -37,14 +41,16 @@ cd methylation_data_agent
 # 1. 配置密钥
 cp .env.example .env
 # 编辑 .env，至少填：ZHIPU_API_KEY（LLM）、NCBI_API_KEY（GEO 检索）
-#   可选：GEO_EMAIL、GDC_TOKEN（TCGA 受控数据）
+#   可选：GEO_EMAIL、GDC_TOKEN（TCGA 受控数据）、
+#         MCP_TOKEN（远程 MCP 端点鉴权，对外开放 :8081 时必填）、
+#         MAX_ACTIVE_TASKS（提交配额，默认 3）
 
 # 2. 建目录（compose bind mount 需要）
 mkdir -p registry data
 
-# 3. 起服务（首次会自动 build 镜像，python:3.11-slim）
+# 3. 起服务（首次会自动 build 镜像，python:3.11-slim；共 5 个服务）
 docker compose up -d
-docker compose ps          # webui healthy 即就绪
+docker compose ps          # webui healthy 即就绪（mcp 服务为远程 agent 端点 :8081）
 
 # 4. 健康检查
 curl -s http://localhost/health
@@ -124,14 +130,32 @@ curl -s -X POST http://localhost/query -H "Content-Type: application/json" \
   -d '{"query":"结直肠癌和非癌对照的血浆cfDNA甲基化数据","agent_type":"database"}'
 # download 桶注册即 pending，下载 worker 自动下载
 
-# 方式 B：CLI（本地或容器内）
+# 方式 B：结构化 intent（推荐给程序调用方；跳过 LLM parse，确定性、不丢信息）
+curl -s -X POST http://localhost/query -H "Content-Type: application/json" -d '{
+  "intent": {"mode": "semantic",
+             "cancer_type": {"display": "colorectal cancer", "tcga_code": "COAD"},
+             "sample_types": ["cfdna", "plasma", "serum"],
+             "notes": "case vs healthy controls"},
+  "agent_type": "database", "label": "main"}'
+# intent 字段完整定义见 docs/mcp_usage_guide.md §7；label 标记子任务角色（main/auxiliary）
+
+# 方式 C：CLI（本地或容器内）
 python main.py --query "breast cancer WGBS methylation 2022-2023" --agent db-only
 python main.py --query "下载GEO编号GSE124600的所有数据"
 docker exec -w /app methyagent-agent1-query python main.py --query "..." --agent db-only
 ```
 
-**两种方式的差异**：CLI（legacy 编排）跑完过滤后数据集停在 `awaiting_approval`，
-需再触发下载：
+提交前可先 dry-run 预览召回（只 parse + 检索，不判定不落库，~10-15s）；
+任务可取消（pending 立即；running 协作式，worker 在候选边界停下）：
+
+```bash
+curl -s -X POST http://localhost/search/dry-run -H "Content-Type: application/json" \
+  -d '{"query":"结直肠癌血浆cfDNA甲基化","max_candidates":20}'
+curl -s -X POST http://localhost/tasks/<task_id>/cancel
+```
+
+**HTTP 与 CLI 的差异**：CLI（legacy 编排）跑完过滤后数据集停在 `awaiting_approval`，
+需再触发下载；HTTP/MCP（skills 编排）download 桶注册即 pending、自动下载。CLI 需：
 
 ```bash
 sqlite3 registry/methyagent.db "UPDATE datasets SET download_status='pending'
@@ -212,6 +236,65 @@ data/
 
 ---
 
+## MCP 接口（供其他 Agent 调用）
+
+外部 agent（Claude Code、其他 LLM agent）经 **MCP 协议**使用本系统的全部能力：
+dry-run 预览 → 提交（单条 / 复合）→ 轮询 → 取判定分桶与文件路径 → 审批 manual_review 项。
+MCP 是 REST 的薄适配层，不经 MCP 也可用等价 HTTP 端点（对照表见使用指南）。
+
+### 接入方式
+
+```bash
+# 本地 Claude Code（stdio，推荐）
+claude mcp add methyagent -- \
+  /path/to/methylation_data_agent/.venv/bin/python \
+  /path/to/methylation_data_agent/mcp_server/__main__.py
+
+# 远程消费方（streamable HTTP，Bearer token 鉴权；token = 服务端 .env 的 MCP_TOKEN）
+claude mcp add --transport http methyagent http://<host>:8081/mcp \
+  --header "Authorization: Bearer <TOKEN>"
+```
+
+配套 **Claude Code skill**：`claude_skill/methyagent/SKILL.md`（教工作流 + 工具速查），
+复制/链接到 `~/.claude/skills/` 即插即用。
+
+### 13 个 tool
+
+| 场景 | Tool |
+|---|---|
+| 预览 | `search_datasets`（dry-run，~10-15s，无副作用） |
+| 提交 | `submit_query`（query 或结构化 intent）/ `submit_compound_query`（main+auxiliary） |
+| 跟踪 | `get_task_status` / `get_task_result`（三桶 + 宿主机路径）/ `cancel_task` |
+| 审批 | `list_awaiting_approval` / `approve_dataset` / `reject_dataset` |
+| 数据 | `list_datasets` / `get_dataset` / `decode_sample_titles`（解码提交者自编码样本标题） |
+| 其他 | `health` |
+
+### 复合查询（训练 + 验证数据）
+
+主数据（训练）与辅数据（验证）**拆成两个带 label 的子任务**提交，不要合成一条 query
+（实测合并会丢辅检索子句）。task 边界 = 子任务边界，注册表按 task 记录样本级归属：
+
+```
+submit_compound_query(
+  main={"intent": {"cancer_type": {"display": "colorectal cancer", "tcga_code": "COAD"},
+                   "sample_types": ["cfdna", "plasma", "serum"]}},
+  auxiliary={"intent": {"cancer_type": {...同上},
+                        "sample_types": ["tumor", "adjacent"]}})
+→ {"main": {"task_id": ...}, "auxiliary": {"task_id": ...}}   # 各自独立检索与判定
+```
+
+### 关键语义
+
+- **去重**：等价 pending/running 任务（规范化 intent 相等或 query 全等）返回既有 task_id
+  （`deduplicated=true`）；`force` 可绕过
+- **配额**：活跃任务 ≥ `MAX_ACTIVE_TASKS`（默认 3）→ 429，`force` 不绕过（资源护栏）
+- **verdict 故意不缓存**：判定标准在 `skills/geo_filter/SPEC.md`，SPEC 更新后重跑即得新判定
+- **文件不走 MCP 传输**：返回宿主机路径，直接读盘（远程模式返回容器路径，需另行安排取文件）
+- 详细字段参考、坑与 REST 等价端点：**`docs/mcp_usage_guide.md`**（设计与迭代史：
+  `docs/mcp_interface_plan.md`、`docs/mcp_phase1_2_report.md`）
+
+---
+
 ## 数据处理管线（当前行为）
 
 ```
@@ -247,7 +330,7 @@ query → parse（规则 + LLM）→ intent
 
 | 表 | 粒度 | 说明 |
 |----|------|------|
-| `task_queue` | task | 提交的查询（status、result_json） |
+| `task_queue` | task | 提交的查询（status、result_json、label 子任务角色、intent_json 结构化意图） |
 | `datasets` | GSE | 主表：元数据、`recommended_action`（download/manual_review/exclude）、`download_status`（pending/downloading/done/failed/no_file/awaiting_approval/skipped）、local_path、reason 等 |
 | `samples` | (GSE,GSM) | 每 GSM 的 source_name/group/cancer/characteristics_json |
 | `query_sample_map` | (task,GSE,GSM) | **每次查询对每个样本的判定**（verdict + reason）；task↔GSE↔GSM 权威多对多表 |
@@ -261,7 +344,7 @@ query → parse（规则 + LLM）→ intent
 ```
 methylation_data_agent/
 ├── main.py                     # CLI 入口
-├── docker-compose.yml          # 4 服务（override 文件为开发热载配置）
+├── docker-compose.yml          # 5 服务（override 文件为开发热载配置）
 ├── Dockerfile                  # python:3.11-slim 单镜像
 ├── config/
 │   ├── settings.yaml           # 主配置
@@ -277,7 +360,9 @@ methylation_data_agent/
 │   ├── geo_download/           # 下载 + 核验（verify.py / archive_extract.py）
 │   └── adaptive_evidence/      # manual_review 自取证（bind_tools agent）
 ├── tools/                      # geo_tools / tcga_tools / pubmed_tools /
-│                               # download_tools（断点续传）/ parser_tools
+│                               # download_tools（断点续传）/ title_decode
+├── mcp_server/                 # MCP server（13 tool；stdio + HTTP/Bearer）
+├── claude_skill/methyagent/    # Claude Code 消费方即插即用 SKILL.md
 ├── registry/registry.py        # SQLite 注册表
 ├── api/                        # FastAPI（main.py + templates/）
 ├── scripts/agent_daemon.py     # 常驻 worker 入口（query/download/literature 模式）
@@ -294,10 +379,11 @@ methylation_data_agent/
 
 ## 注意事项
 
-- **改代码后必须重启容器**：`docker compose restart agent1-query agent1-download agent2`（bind mount 热载文件，但 daemon 常驻进程不重读代码）
-- **NCBI 限流**：无 API key 3 req/s、有 key 10 req/s；连续抓 100+ GSM 页面可能触发 abuse-redirect（表现为静默 miss），大批量分批跑
+- **改代码后必须重启容器**：`docker compose restart agent1-query agent1-download agent2 mcp`（bind mount 热载文件，但 daemon 常驻进程不重读代码）
+- **NCBI 限流**：无 API key 3 req/s、有 key 10 req/s；连续抓 100+ GSM 页面可能触发 abuse-redirect（表现为静默 miss），大批量分批跑。出网走 SOCKS5 代理（`NCBI_PROXY`，默认 `socks5h://172.17.0.1:1080`），代理挂了 esearch 会失败 → 任务明确 `failed`（区分"检索出错"与"真 0 结果"）
 - **磁盘**：per-sample 测序数据集单 GSE 可达 17GB，批量查询前 `df -h`
-- **成本**：一次 query（~136 候选）消耗约 130 万 LLM token
+- **成本**：一次 query（~136 候选）消耗约 130 万 LLM token；提交配额 `MAX_ACTIVE_TASKS`（默认 3）防失控
+- **worker 崩溃自愈**：重启时孤儿 running 任务自动拉回 pending 重跑，同一任务最多复活 3 次，超过标 failed（防崩溃循环烧钱）
 - 下载引擎带断点续传（`.part` + Range），中断重跑自动续
 - TCGA 公开数据（Level 3）无需 token；受控数据需 dbGaP 授权（`GDC_TOKEN`）
 - `cancer_synonyms.yaml` 可独立扩充，加癌种同义词不用改代码
