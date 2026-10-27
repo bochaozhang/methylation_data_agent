@@ -1,11 +1,13 @@
 # MCP 接口 Phase 1+2 实施报告
 
-日期：2026-10-19（10-20 上游反馈迭代补记）
+日期：2026-10-19（10-20 至 10-27 上游反馈与收尾迭代补记）
 分支：`MCP`（已推送 origin/MCP；main 未动）
 提交链：`2bbff73`（Phase 1）→ `ec97629`（Phase 2）→ `2f63c21`（daemon 自愈修复）
 　→ `5970bc5`（series_matrix OOM 根因修复）→ `53feaff`（文档入库）
 　→ `feb447c`（字段暴露·阻断项）→ `c92ff35`（字段暴露·全量清查）→ `9ea2848`（协作式取消）
 　→ `21c778a`（TCGA 判定语义）→ `bd76ce2`（审批 tool）→ `dcccd73`（dry-run 提速）
+　→ `392f743`（截断重试+requeue 上限）→ `03084bb`（检索失败语义+Phase 3 收官）
+　→ `e31de07`（mcp 健康检查）→ `6d1c4c2`（Phase 4 SKILL + 标题解码）
 设计文档：docs/mcp_interface_plan.md ｜ 使用说明：docs/mcp_usage_guide.md
 
 ---
@@ -14,8 +16,9 @@
 
 data agent 现在是一个标准 MCP 服务：外部 agent 可以 dry-run 预览召回（秒级、免费）、
 提交结构化或自由文本检索任务、用 label 区分复合查询的子任务（训练/验证数据不混）、
-轮询状态并取回判定分组与宿主机文件路径。9 个 tool，REST API 全程薄适配，pipeline 语义
-零改动（唯一 pipeline 改动是 parse 的结构化直通分支）。
+轮询状态并取回判定分组与宿主机文件路径、审批 manual_review 数据集、解码提交者自编码
+样本标题。**13 个 tool**（本地 stdio + 远程 streamable HTTP 两种接入），REST API 全程
+薄适配，pipeline 语义改动仅三处（parse 结构化直通 / 检索失败 fail / TCGA 判定语义）。
 
 ## 2. 架构与数据流
 
@@ -76,6 +79,10 @@ data agent 现在是一个标准 MCP 服务：外部 agent 可以 dry-run 预览
 全量 suite：**210 个测试，3 failures + 20 errors——与 MCP 工作开始前的基线完全一致**
 （既有问题：test_geo_download_skill 癌种子集漂移 3F；test_llm_extractor 硬编码容器路径 20E），
 零新增失败。运行方式：`.venv/bin/python -m unittest discover -s tests`。
+
+> **2026-10-27 更新**：后续迭代累计新增至 **262 个测试**（审批 6、检索失败语义 6、
+> auth/配额 6、截断重试 4、requeue 上限 3、并行批次 3、TCGA 记录 4、标题解码 6 等），
+> 基线始终 3F+20E 不变。
 
 ## 5. 事故记录（全部当日发现当日修复）
 
@@ -223,16 +230,30 @@ transcript 失败）。根因是**没有 .dockerignore**——40GB `data/` + reg
 build cache（682MB）与一周前旧镜像（按用户策略，含 5 年前的 centos:7）。教训：凡带大
 数据目录的仓库，.dockerignore 是第一道运维防线。
 
-## 8. 已知限制与下一步
+### 7.7 Phase 4 SKILL.md + 标题解码（2026-10-27，backlog #2/#3）
 
-- ~~filter 内存炸弹~~ **已修复**（`5970bc5`，见 §5 #5；355 候选任务验证通过）
-- **Phase 3（部分完成）**：~~approve/reject 写操作 tool~~ ✅ 已加（2026-10-22，第四轮上游需求）：
-  `list_awaiting_approval` + `approve_dataset` + `reject_dataset`（12 个 tool）；写工具门控
-  `MCP_ALLOW_WRITES` **默认开**（与 submit_query 同权限面——同一无鉴权 localhost API，门控供远端
-  暴露时收紧）。剩余：远程消费方（streamable HTTP transport + token 鉴权）、提交侧并发/配额护栏
-- **Phase 4（未做）**：配套 SKILL.md（教 agent "dry-run→submit→poll→取路径" 工作流）
-- **verdict cache：确定不做（设计决定，2026-10-20）**——每次重新 LLM 判定是故意设计：
-  判定标准的主战场在 skill 的 SPEC.md（用户维护），SPEC 更新后 verdict 必须跟着变，缓存会
-  违背"SPEC 是唯一事实源"的原则。重复查询/重跑的 token 成本为此设计的固有代价
-- **检索失败静默**：见 §5 #4，语义修复待拍板
+**Phase 4 完成**：`claude_skill/methyagent/SKILL.md`——MCP 优先的上游技能（工作流 +
+关键规则 + 13 工具速查），复制/链接进 `~/.claude/skills/` 即插即用；旧 pre-MCP 草稿
+（教 curl/CLI）保留作历史。**MCP 计划四个 Phase 至此全部落地。**
+
+**提交者自编码标题解码（backlog §6-8）**：三件套——(a) efetch 路径持久化 title 进 gsm
+缓存 + `get_sample_titles`（esummary 两调用）+ 旧缓存回填；(b) `tools/title_decode.py`
+一次 LLM 调用解码标题模式（digits→N 聚类 + 数据集上下文）→ `query_cancer/normal/other`
+规则确定性套用全部样本；(c) REST `POST /datasets/{acc}/decode-titles`（dry-run 默认）+
+MCP `decode_sample_titles`（第 13 个 tool）。**实战 GSE97923**：773 title 回填缓存 →
+单一模式 `COAD.ct-N → query_cancer`（高置信；caveat 准确指出对照在泛癌父系列的兄弟子
+系列）→ apply 后 773 行 registry 更新；顺带发现其 sample_metadata.csv 是 0 字节空文件
+（10-22 隔离流程产物），从 registry 重建 773 行。
+
+## 8. 已知限制与下一步（2026-10-27 更新）
+
+- **Phase 3 ✅ 完成**（10-22 审批 tool；10-26 远程 streamable HTTP + Bearer 鉴权 +
+  `MAX_ACTIVE_TASKS` 配额；`e31de07` 修 mcp 容器健康检查）
+- **Phase 4 ✅ 完成**（10-27 SKILL.md，见 §7.7）
+- **MCP 主线全部收尾**；遗留均为非 MCP 事项：
+  - verdict cache：**设计性不做**（SPEC 唯一事实源，2026-10-20 用户决定）
+  - 非 MCP 旧线：gold standard 人工 κ + 首次评测；geo_download Phase-2 的 ⑥；
+    orchestrator_v2（他人）
 - get_task_result 的 exclude 默认只计数（防上下文溢出），需要全量时 `exclude_limit`
+- 远程消费方的文件分发（若将来需要）：共享盘 / 打包端点，按需再议
+

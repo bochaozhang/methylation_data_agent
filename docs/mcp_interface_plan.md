@@ -1,7 +1,7 @@
 # MethyAgent MCP 接口计划
 
-日期：2026-10-16
-状态：**Phase 1 + Phase 2 已落地（2026-10-16，MCP 分支）**；Phase 3-4 待实施
+日期：2026-10-16（最后更新 2026-10-27）
+状态：**全部完成**——Phase 1（10-16）｜Phase 2（10-16）｜Phase 3（10-22 审批 tool，10-26 远程 HTTP+鉴权+配额）｜Phase 4（10-27 SKILL.md）；§6 待办 #6/#7/#8 均已闭环，#4 verdict cache 为设计性不做
 关联：docs/caching_audit.md（缓存与去重）、registry GSM 粒度表、api/main.py（现有 REST）
 
 ---
@@ -94,7 +94,7 @@ MCP 层校验后序列化为 intent_json 随任务提交；同时生成一句人
 3. **pipeline**
    - [x] parse 逻辑提取为模块级 `_parse_query_intent(raw, json_llm, intent_json)`（优先级 intent_json → LLM → rules；structured 路径不触碰 LLM）；parse_node 调用之
    - [x] Agent1State 加 intent_json 字段；run_agent1_pipeline / run_database_agent / daemon claim 链路传参；legacy 分支忽略 intent_json
-4. **MCP tools**（共 9 个）
+4. **MCP tools**（Phase 2 时共 9 个；现为 13 个——10-22 加审批 3 个，10-27 加标题解码 1 个）
    - [x] submit_query / submit_compound_query（main+auxiliary 默认 label，各接受 query 或 intent）/ get_task_result（verdict 分桶 download/manual_review 全量、exclude 默认只计数，local_path 翻译）/ cancel_task
 5. **护栏**
    - [x] 去重（见 API）；compound 重放等价 intent → 两个 task_id 均命中去重

@@ -215,6 +215,20 @@ list_datasets(status="done", limit=50)
 `sample_metadata.csv`（样本级元数据 + 各 task 的逐样本判定）、`gsm_metadata_cache.json`。
 下载是异步的：任务 done 后 `download_status` 可能仍在 `downloading`，用 `get_dataset` 追踪。
 
+### 5.6 解码提交者自编码的样本标题（2026-10-27 起）
+
+部分提交者把病种只写进样本标题编码（如 GSE97923 的 `COAD.ct-511`），结构化字段为空 →
+所有样本 `cancer=unclear`，样本粒度无法分病例/对照。此时：
+
+```
+decode_sample_titles("GSE97923")              # dry-run：返回模式→分类提案 + 置信度 + caveats
+decode_sample_titles("GSE97923", apply=True)  # 确认后落库：samples 表 + CSV + disease_groups
+```
+
+一次 LLM 调用产出规则，确定性套用到全部样本；**务必先读 dry-run 的 patterns 和 caveats**
+再 apply。实测：GSE97923 → 773 样本 `COAD.ct-N → query_cancer`（高置信，并正确指出健康
+对照位于该泛癌父系列的兄弟子系列）。
+
 ## 6. 语义与坑
 
 | 事项 | 行为 |
