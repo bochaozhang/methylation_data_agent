@@ -115,10 +115,12 @@ MCP 层校验后序列化为 intent_json 随任务提交；同时生成一句人
 
 **事故记录（build 崩溃）**：部署时 `docker compose build` 反复 ENOSPC + Claude Code 崩（写日志失败）。根因：**无 .dockerignore**——每次 build 把 40GB `data/` + registry WAL + logs + .venv 全部上传为构建上下文，dockerd 暂存区撑爆磁盘（也解释了 build 巨慢）。修复：新增 .dockerignore（data/registry/logs/.venv/.git/gold/docs 等），build 秒级完成；顺手 `docker builder prune`（682MB）+ 清掉 5 年前遗留的 centos:7 镜像（按用户要求只留一周内）。
 
-### Phase 4 — 配套 SKILL.md（可选）
+### Phase 4 — 配套 SKILL.md ✅ 2026-10-27 完成
 
-- [ ] 一份使用技能文档（"先 dry-run → submit → 轮询 → approve → 拿路径"工作流 + 字段说明），
-      供 Claude Code 用户 `claude mcp add` 后即插即用；skill 只教流程，能力全在 MCP
+- [x] `claude_skill/methyagent/SKILL.md`：MCP 优先的工作流技能（dry-run → 提交/复合 → 轮询 →
+      审批 → 拿路径 + 13 工具速查 + 关键规则），供 Claude Code 用户复制/链接到
+      `~/.claude/skills/` 即插即用；能力全在 MCP，skill 只教流程。旧版 pre-MCP 草稿
+      （docs/claude_skill_methyagent.md，教 curl/CLI）保留作历史参考
 
 ## 6. 风险与开放问题
 
@@ -131,7 +133,7 @@ MCP 层校验后序列化为 intent_json 随任务提交；同时生成一句人
 | 5 | mcp SDK 版本更迭快 | 锁 requirements.txt 版本；Phase 1 只依赖最小特性（tool + stdio） |
 | 6 | **检索失败语义**（2026-10-19 事故）：GEO search 网络失败（如代理死）被静默吞掉 → pipeline"成功"完成 0 候选空任务（aux 首次重跑即中招）。 | **✅ 已修（2026-10-26）**：`GEOSearchError`——primary 瞬时失败走 fallback，两轮都败或 NCBI 封禁即 raise；SearchSkill 不再吞异常 → run_database_agent re-raise → daemon `fail_task`。esearch 成功但零匹配仍是合法 0 召回（区分"检索出错"与"真 0 结果"）。测试 +6 |
 | 7 | **filter LLM 截断无重试**（2026-10-22，审批队列清理时发现）：3/17 待审项的 reason 是 `filter_error: Could not parse response content as the length limit was reached`——LLM 输出被截断，JSON 解析失败，判定直接降级 manual_review（不是真实判定）。 | **✅ 已修（2026-10-26）**：截断（端点总 token 预算，max_tokens 参数解不了）→ 压缩输入重问一次（8 个代表 GSM / 摘要 1000 字 / 精简 directive，语义不变）→ 仍败才降级且 reason 标 `filter_error_truncated` 区别于 `filter_error`。真实验证：曾截断的 GSE289742 现拿到真实 exclude（COPD 全血 cfDNA，非目标）。测试 +4 |
-| 8 | **提交者自编码标题 → cancer 列 unclear**（2026-10-22，GSE97923 实例）：`_gsm_cancer_map` 是确定性关键词映射，只读 GSM 结构化字段（characteristics/source_name）；当提交者把病种写进自己发明的 sample-title 编码（如 `COAD.ct-511`）而 characteristics 只填 "cell-free DNA" 时，773 行全部落 `unclear`——样本粒度病例/对照标签缺失（Tier-2 工作时已识别的残留缺口，GSE97923 首次大规模撞上）。另发现 gsm_metadata_cache 里 title 字段为空（efetch 路径未带回），解码的原始材料也缺。 | **待办**：(a) resolve 时把 sample title 存进 gsm cache（原始材料）；(b) 每高价值 GSE 调一次 LLM 解码标题模式 → 映射规则套用全部 GSM（对齐 Tier-2 做法）；(c) 高价值数据集（如 GSE97923, n=773）可先人工映射。注意：不阻塞下载与逐任务判定，只影响样本粒度分析选样 |
+| 8 | **提交者自编码标题 → cancer 列 unclear**（2026-10-22，GSE97923 实例）：`_gsm_cancer_map` 是确定性关键词映射，只读 GSM 结构化字段（characteristics/source_name）；当提交者把病种写进自己发明的 sample-title 编码（如 `COAD.ct-511`）而 characteristics 只填 "cell-free DNA" 时，773 行全部落 `unclear`——样本粒度病例/对照标签缺失（Tier-2 工作时已识别的残留缺口，GSE97923 首次大规模撞上）。 | **✅ 已修（2026-10-27）**：(a) efetch 路径持久化 title 进 gsm cache + 新增 `get_sample_titles`（esummary 两调用）+ 缓存回填；(b) `tools/title_decode.py`：一次 LLM 调用解码标题模式（digits→N 聚类 + 数据集上下文）→ 规则确定性套用全部 GSM；REST `POST /datasets/{acc}/decode-titles`（dry-run 默认）+ MCP `decode_sample_titles`。**实战**：GSE97923 → 773 title 回填缓存、单一模式 `COAD.ct-N → query_cancer`（高置信，caveat 正确指出对照在兄弟系列）、apply 后 samples 表 773 行 + CSV 重生成（原 CSV 为 0 字节空文件，从 registry 重建） |
 
 ## 7. 建议排期
 

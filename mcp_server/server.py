@@ -348,6 +348,28 @@ def reject_dataset(accession: str, note: str = "") -> Dict[str, Any]:
 
 
 @server.tool()
+def decode_sample_titles(accession: str, apply: bool = False) -> Dict[str, Any]:
+    """Decode submitter-coded sample titles → per-GSM cancer classes.
+
+    Some GEO submitters encode the disease group ONLY in sample titles
+    (e.g. GSE97923's 'COAD.ct-511'), leaving the structured fields empty —
+    every sample then shows cancer=unclear. One LLM call maps the distinct
+    title patterns to query_cancer / normal / other and the rule applies to
+    ALL samples deterministically.
+
+    Dry-run by default (proposed mapping + pattern notes + confidence);
+    apply=true persists to the sample registry and sample_metadata.csv and
+    refreshes the dataset's disease_groups. Read the proposed patterns and
+    caveats before applying.
+
+    Args:
+        accession: e.g. "GSE97923".
+        apply: False = propose only; True = persist.
+    """
+    return _api().post(f"/datasets/{accession}/decode-titles", json={"apply": apply})
+
+
+@server.tool()
 def list_datasets(status: str = "", limit: int = 50) -> Dict[str, Any]:
     """List datasets in the registry, newest-updated first.
 

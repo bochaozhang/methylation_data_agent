@@ -1,12 +1,14 @@
 # MethyAgent MCP 接口使用说明（上游 Agent 接入指南）
 
-日期：2026-10-19
-适用版本：MCP 分支 Phase 1+2（9 个 tool）
+日期：2026-10-19（10-26/27 增补远程接入、审批、解码）
+适用版本：MCP 分支（13 个 tool）
 配套文档：docs/mcp_interface_plan.md（设计与实施报告）
 
----
+> **Phase 4 配套 Skill**：`claude_skill/methyagent/SKILL.md`——给上游 Claude Code
+> agent 的即插即用技能（教工作流）。安装：把目录复制/链接到 `~/.claude/skills/`（用户级）
+> 或项目 `.claude/skills/`（项目级），配合 MCP server 连接使用。
 
-## 1. 这是什么
+---
 
 MethyAgent 是一个 DNA 甲基化数据检索 agent：给它一个自然语言或结构化的检索意图，它会
 在 GEO（和 TCGA/GDC）中召回候选数据集，用 LLM 按 SPEC 规则逐个判定可用性（download /
@@ -88,6 +90,7 @@ MCP 是 REST 的薄适配层，所有能力都有等价 HTTP 端点（见 §8）
 | `cancel_task` | 写 | 取消任务：pending 立即取消；**running 协作式取消**（worker 在候选边界检查标志，秒级~2 分钟内停下） | 快 |
 | `list_awaiting_approval` | 只读 | 待审批清单（manual_review 数据集 + LLM 判定证据与理由） | 快 |
 | `approve_dataset` / `reject_dataset` | 写 | 批准（→ 入下载队列）/ 拒绝（→ skipped 永不下载）；可选 note 存档。默认开启，`MCP_ALLOW_WRITES=0` 可冻结写工具 | 快 |
+| `decode_sample_titles` | 写 | 解码提交者自编码样本标题（如 `COAD.ct-N`）→ 全样本 cancer 分类；默认 dry-run 提案，`apply=True` 落库（samples 表 + CSV + disease_groups） | ~10s（含一次 LLM）|
 | `list_datasets` | 只读 | 浏览注册表（可按 download_status 过滤） | 快 |
 | `get_dataset` | 只读 | 单个数据集全量记录（含路径 + LLM 判定证据） | 快 |
 | `health` | 只读 | 后端心跳 + 注册表统计 | 快 |

@@ -1023,6 +1023,35 @@ class GEOClient:
     #  Full GSM metadata fetch (no sampling cap)                          #
     # ------------------------------------------------------------------ #
 
+    def get_sample_titles(self, accession: str) -> Dict[str, str]:
+        """
+        ALL per-sample titles via ONE esearch + ONE esummary call (no efetch).
+        Returns {gsm: title}. Cheap source for title-decoding when the gsm
+        cache predates title persistence.
+        """
+        try:
+            resp = self._get("esearch.fcgi", {
+                "db": "gds", "term": f"{accession}[Accession]", "retmode": "json",
+            })
+            uids = resp.json().get("esearchresult", {}).get("idlist", [])
+            gse_uid = next((u for u in uids if u.startswith("200")),
+                           uids[0] if uids else None)
+            if not gse_uid:
+                return {}
+            sum_resp = self._get("esummary.fcgi",
+                                 {"db": "gds", "id": gse_uid, "retmode": "json"})
+            data = sum_resp.json().get("result", {}).get(gse_uid, {})
+            out: Dict[str, str] = {}
+            for s in data.get("samples", []):
+                if isinstance(s, dict):
+                    gsm = s.get("accession", "").upper()
+                    if gsm:
+                        out[gsm] = s.get("title", "")
+            return out
+        except Exception as e:
+            logger.warning(f"get_sample_titles({accession}) failed: {e}")
+            return {}
+
     def get_all_gsm_metadata(
         self,
         accession: str,
@@ -1107,6 +1136,10 @@ class GEOClient:
             results = []
             for s in all_samples:
                 gsm = s["gsm"]
+                # Keep the esummary title on every record — submitter-coded
+                # disease info often lives ONLY there (2026-10-22 GSE97923:
+                # COAD.ct-N codes; without titles the cancer mapper is blind).
+                title = s.get("title", "")
                 try:
                     fetch_resp = self._get("efetch.fcgi", {
                         "db": "gsm",
@@ -1115,13 +1148,15 @@ class GEOClient:
                         "retmode": "xml",
                     })
                     details = self._parse_gsm_miniml(gsm, fetch_resp.text)
+                    details["title"] = title
                     details["group"] = gsm_to_group.get(gsm, "unknown")
                     results.append(details)
                 except Exception as e:
                     logger.debug(f"get_all_gsm_metadata: efetch failed for {gsm}: {e}")
                     results.append({
                         "gsm": gsm,
-                        "source_name": s.get("title", ""),
+                        "title": title,
+                        "source_name": title,
                         "molecule": "",
                         "characteristics": {},
                         "group": gsm_to_group.get(gsm, "unknown"),

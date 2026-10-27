@@ -54,6 +54,15 @@ class ReviewDecision(BaseModel):
     )
 
 
+class DecodeTitlesRequest(BaseModel):
+    """POST /datasets/{accession}/decode-titles — decode submitter-coded titles."""
+    apply: bool = Field(
+        default=False,
+        description="False: propose only. True: persist to samples.cancer + "
+                    "CSV cancer column + disease_groups.",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Response models
 # ---------------------------------------------------------------------------

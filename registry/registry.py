@@ -671,6 +671,36 @@ class Registry:
             ).fetchall()
             return [dict(r) for r in rows]
 
+    def update_samples_cancer(self, accession: str,
+                              gsm_class: Dict[str, str]) -> int:
+        """
+        Overwrite samples.cancer per GSM (title-decode apply path).
+        Returns the number of rows changed.
+        """
+        changed = 0
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            with self._get_conn() as conn:
+                for gsm, cancer in gsm_class.items():
+                    cur = conn.execute(
+                        "UPDATE samples SET cancer = ?, updated_at = ? "
+                        "WHERE accession = ? AND gsm = ?",
+                        (cancer, now, accession, gsm),
+                    )
+                    changed += cur.rowcount
+        return changed
+
+    def update_disease_groups(self, accession: str, text: str) -> None:
+        """Title-decode apply path: overwrite datasets.disease_groups."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            with self._get_conn() as conn:
+                conn.execute(
+                    "UPDATE datasets SET disease_groups = ?, updated_at = ? "
+                    "WHERE accession = ?",
+                    (text, now, accession),
+                )
+
     def get_datasets_by_task_id(self, task_id: str) -> List[Dict]:
         """Return all datasets for a given task_id (via query_dataset_map)."""
         with self._get_conn() as conn:

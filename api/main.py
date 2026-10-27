@@ -61,6 +61,7 @@ from api.models import (  # noqa: E402
     ApprovalListResponse,
     ApprovalRequest,
     ApprovalResponse,
+    DecodeTitlesRequest,
 )
 
 # ---------------------------------------------------------------------------
@@ -492,6 +493,68 @@ async def get_dataset(accession: str):
     if d is None:
         raise HTTPException(status_code=404, detail=f"Dataset '{accession}' not found.")
     return _dataset_to_response(d)
+
+
+@app.post("/datasets/{accession}/decode-titles")
+def decode_dataset_titles(accession: str, body: DecodeTitlesRequest):
+    """
+    Decode submitter-coded sample titles (backlog §6-8): ONE LLM call maps
+    distinct title patterns (e.g. 'COAD.ct-N') to cancer classes
+    (query_cancer / normal / other); the rule applies to all GSMs.
+    dry-run by default; apply=true persists to the registry + CSV.
+    """
+    registry = get_registry()
+    d = registry.get(accession)
+    if d is None:
+        raise HTTPException(status_code=404, detail=f"Dataset '{accession}' not found.")
+
+    from tools.title_decode import (
+        apply_decoded, decode_titles, load_titles,
+        merge_titles_into_cache,
+    )
+    data_dir = os.environ.get("DATA_DIR", "./data")
+
+    samples = load_titles(accession, data_dir)
+    titles_backfilled = 0
+    if not samples:
+        # Cache predates title persistence — fetch titles (2 API calls) and
+        # backfill the cache so future decodes are offline.
+        geo = _get_search_skill().geo_client
+        titles = geo.get_sample_titles(accession)
+        titles_backfilled = merge_titles_into_cache(accession, data_dir, titles)
+        samples = load_titles(accession, data_dir)
+
+    out = decode_titles(_json_llm_for_decode(), d, samples)
+    if out.get("error"):
+        raise HTTPException(status_code=422, detail=out["error"])
+
+    result: Dict[str, Any] = {
+        "accession": accession,
+        "applied": False,
+        "confidence": out.get("confidence"),
+        "caveats": out.get("caveats", ""),
+        "n_classified": out.get("n_classified"),
+        "n_total": out.get("n_total"),
+        "titles_backfilled_into_cache": titles_backfilled,
+        "patterns": out.get("patterns", []),
+        "proposed_disease_groups": out.get("disease_groups"),
+    }
+
+    if body.apply:
+        counts = apply_decoded(registry, accession, data_dir,
+                               out.get("gsm_class") or {})
+        dg = out.get("disease_groups")
+        if dg:
+            registry.update_disease_groups(accession, dg)
+        result["applied"] = True
+        result["updated_rows"] = counts
+    return result
+
+
+def _json_llm_for_decode() -> Any:
+    """json-mode LLM for the decode call (reuses the dry-run singletons)."""
+    _get_search_skill()  # initializes _json_llm
+    return _json_llm
 
 
 @app.get("/query-datasets")
