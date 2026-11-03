@@ -87,6 +87,25 @@ class GEOSearchError(RuntimeError):
     0-candidate run."""
 
 
+class GEOPageBlockedError(RuntimeError):
+    """NCBI redirected a GSM page scrape to the abuse/misuse page.
+
+    The Tier-3 incident (GSE186007): after ~100 consecutive GSM page fetches
+    NCBI 302s to misuse.ncbi.nlm.nih.gov; requests follows it, the response is
+    a 200 HTML page, and without this check the scraper returned None —
+    indistinguishable from "this GSM has no file" — silently degrading the
+    download to a partial set (caught only downstream by the Phase-2
+    column-count verify). Raised after backoff retries are exhausted, or
+    immediately while the cooldown from a recent block is still active."""
+
+
+# Tier-3 GSM page scrape: backoff sleeps between abuse-redirect retries, and
+# how long subsequent scrapes fast-fail after a block. The cooldown avoids
+# re-paying the full backoff ladder for every GSM in a large set.
+_GSM_SCRAPE_BACKOFFS = (30.0, 60.0)
+_GSM_SCRAPE_BLOCK_COOLDOWN = 120.0
+
+
 class GEOClient:
     """
     Client for NCBI GEO E-utilities API.
@@ -112,6 +131,9 @@ class GEOClient:
         # keeps the aggregate rate at 1/_rate_limit_delay regardless of threads.
         self._rate_lock = threading.Lock()
         self._last_req_at = 0.0
+        # Tier-3 GSM page scrape: monotonic time until which scrapes fast-fail
+        # after an NCBI abuse block (see fetch_gsm_supplementary_file).
+        self._gsm_blocked_until = 0.0
         if proxy:
             self.session.proxies = {"http": proxy, "https": proxy}
             logger.info(f"GEOClient using proxy: {proxy}")
@@ -1533,17 +1555,53 @@ class GEOClient:
 
         Scrapes https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={gsm}
         for supplementary file URLs (e.g., "supplementary file", "download full table").
-        Returns {gsm, url, filename} or None.
+        Returns {gsm, url, filename} or None (page fetched fine, no supp file on it).
+
+        Raises:
+            GEOPageBlockedError: NCBI served the abuse/misuse page and backoff
+                retries did not recover, or the scrape cooldown from a recent
+                block is still active. Distinct from None on purpose: the
+                caller must fail the dataset, NOT record "no file".
         """
         url = f"https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={gsm_accession}"
-        try:
-            time.sleep(self._rate_limit_delay)
-            resp = self.session.get(url, timeout=15)
-            resp.raise_for_status()
-            html = resp.text
-        except Exception as e:
-            logger.debug(f"fetch_gsm_supplementary_file({gsm_accession}): {e}")
-            return None
+        if time.monotonic() < self._gsm_blocked_until:
+            raise GEOPageBlockedError(
+                f"GSM scrape cooldown active for {gsm_accession}: NCBI abuse "
+                f"redirect seen recently, skipping backoff ladder")
+
+        html = None
+        for attempt in range(len(_GSM_SCRAPE_BACKOFFS) + 1):
+            try:
+                time.sleep(self._rate_limit_delay)
+                resp = self.session.get(url, timeout=15)
+            except Exception as e:
+                logger.debug(f"fetch_gsm_supplementary_file({gsm_accession}): {e}")
+                return None
+            # Detect the NCBI abuse redirect (same predicate as _get): requests
+            # follows the 302 automatically, so a 200 here can still be the
+            # misuse page — parseable HTML with zero supp links, i.e. exactly
+            # the silent-miss failure mode without this check.
+            if "misuse.ncbi.nlm.nih.gov" in resp.url or "abuse.shtml" in resp.url:
+                self._gsm_blocked_until = time.monotonic() + _GSM_SCRAPE_BLOCK_COOLDOWN
+                if attempt < len(_GSM_SCRAPE_BACKOFFS):
+                    backoff = _GSM_SCRAPE_BACKOFFS[attempt]
+                    logger.warning(
+                        f"fetch_gsm_supplementary_file({gsm_accession}): NCBI abuse "
+                        f"redirect (attempt {attempt + 1}); backing off {backoff:.0f}s")
+                    time.sleep(backoff)
+                    continue
+                raise GEOPageBlockedError(
+                    f"NCBI abuse redirect for {gsm_accession} page scrape persisted "
+                    f"after {len(_GSM_SCRAPE_BACKOFFS)} backoff retries")
+            # Page served normally — any block has recovered.
+            self._gsm_blocked_until = 0.0
+            try:
+                resp.raise_for_status()
+                html = resp.text
+                break
+            except Exception as e:
+                logger.debug(f"fetch_gsm_supplementary_file({gsm_accession}): {e}")
+                return None
 
         try:
             from bs4 import BeautifulSoup

@@ -50,7 +50,7 @@ from skills.geo_download.verify import (
 )
 from skills.geo_filter.file_inspect import inspect_matrix_head
 from tools.download_tools import DownloadEngine, build_geo_download_tasks
-from tools.geo_tools import GEOClient
+from tools.geo_tools import GEOClient, GEOPageBlockedError
 from utils.llm_factory import get_llm
 from utils.logger import get_logger
 
@@ -202,6 +202,17 @@ class DownloadSkill:
                         logger.debug(f"geo-download {acc}: no supp file for {gsm_id}")
                 if not tasks:
                     logger.warning(f"geo-download {acc}: Tier 3 found no GSM supp files")
+        except GEOPageBlockedError as e:
+            # Tier-3 GSM scrape blocked by NCBI (abuse redirect; backoff retries
+            # exhausted or cooldown active). Fail the dataset loudly — pressing
+            # on would either record "no_file" for a dataset that has files
+            # (GSE186007 incident) or download a partial set that the Phase-2
+            # column-count verify then quarantines. A clean failed outcome can
+            # be re-run once NCBI cools down (dest-exists keeps finished files).
+            logger.error(f"geo-download {acc}: NCBI blocked Tier-3 GSM scrape: {e}")
+            return self._result(acc, [], [], "failed", flags,
+                                notes=f"ncbi_blocked (tier-3 gsm scrape): {e}",
+                                subset_path=None)
         except Exception as e:
             logger.error(f"geo-download: build tasks failed for {acc}: {e}")
             return self._result(acc, [], [], "failed", flags,
