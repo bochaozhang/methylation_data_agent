@@ -38,6 +38,11 @@ USER methyagent
 # ---- Default command (overridden per service in docker-compose.yml) ----
 CMD ["python", "scripts/agent_daemon.py", "--agent", "database"]
 
-# ---- Health check (used by webui service) ----
+# ---- Health check ----
+# Default probe: is the registry writable by this uid? The worker daemons
+# serve no HTTP port, so an endpoint probe is meaningless for them; the real
+# failure mode this catches is WAL/-shm re-owned by a host-side DB opener
+# (2026-11-02 incident: daemons ran ~30h unable to write anything).
+# webui/mcp override this with their own endpoint probes in docker-compose.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
-    CMD curl -f http://localhost:8080/health || exit 1
+    CMD python scripts/healthcheck_registry.py

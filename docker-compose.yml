@@ -44,6 +44,14 @@ services:
       - ./data:/app/data
     networks:
       - methynet
+    healthcheck:
+      # Worker daemons serve no HTTP port — probe registry writability
+      # instead (catches WAL/-shm re-owned by a host-side DB opener).
+      test: ["CMD", "python", "scripts/healthcheck_registry.py"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
     logging:
       driver: "json-file"
       options:
@@ -75,6 +83,14 @@ services:
       - ./data:/app/data
     networks:
       - methynet
+    healthcheck:
+      # Worker daemons serve no HTTP port — probe registry writability
+      # instead (catches WAL/-shm re-owned by a host-side DB opener).
+      test: ["CMD", "python", "scripts/healthcheck_registry.py"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
     logging:
       driver: "json-file"
       options:
@@ -105,6 +121,14 @@ services:
       - ./data:/app/data
     networks:
       - methynet
+    healthcheck:
+      # Worker daemons serve no HTTP port — probe registry writability
+      # instead (catches WAL/-shm re-owned by a host-side DB opener).
+      test: ["CMD", "python", "scripts/healthcheck_registry.py"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
     logging:
       driver: "json-file"
       options:
