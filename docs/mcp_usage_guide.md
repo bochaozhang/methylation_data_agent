@@ -10,6 +10,8 @@
 
 ---
 
+## 1. 简介
+
 MethyAgent 是一个 DNA 甲基化数据检索 agent：给它一个自然语言或结构化的检索意图，它会
 在 GEO（和 TCGA/GDC）中召回候选数据集，用 LLM 按 SPEC 规则逐个判定可用性（download /
 manual_review / exclude），把可用数据下载到本地，并在注册表中维护数据集与样本级归属。
@@ -32,20 +34,6 @@ claude mcp add methyagent -- \
   /home/ubuntu/bochaozhang/methylation_data_agent/.venv/bin/python \
   /home/ubuntu/bochaozhang/methylation_data_agent/mcp_server/__main__.py
 ```
-
-### 其他 MCP 客户端（支持 stdio）
-
-启动命令同上（任意工作目录可运行）。环境变量：
-
-| 变量 | 默认 | 说明 |
-|---|---|---|
-| `MCP_API_BASE` | `http://localhost:80` | REST API 地址（远程部署时改这里） |
-| `MCP_DATA_HOST_PATH` | `<repo>/data` | 数据目录的宿主机路径（路径翻译用） |
-| `MCP_API_TIMEOUT` | `300` | 每请求超时秒数（dry-run 实测 ~10-15s，网络差时留余量，勿低于 60） |
-
-> **Claude Code 消费方注意**：CC 的 MCP tool 调用默认超时 30s。dry-run 并行化后实测
-> ~10-15s（2026-10-22 前 ~50-60s 会超时）。若你的代理链路慢仍超时，在启动 claude 的
-> 环境设置 `MCP_TOOL_TIMEOUT=120000`（毫秒）。
 
 ### 其他 MCP 客户端（支持 stdio）
 
