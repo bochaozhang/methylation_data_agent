@@ -332,6 +332,11 @@ def run_pending_downloads(registry: Registry) -> None:
                 "cancer_type": ds.get("cancer_type") or meta.get("cancer_type"),
                 # sample-type context for Tier-2 LLM file selection (plasma vs tissue, etc.)
                 "sample_type": ds.get("sample_type"),
+                # tech-type context for the SPEC Phase-2 cross-check in file
+                # selection (same upstream fields the filter prompt uses).
+                "platforms": ds.get("platforms")
+                    or ([ds["platform_canonical"]] if ds.get("platform_canonical") else []),
+                "technology": ds.get("technology"),
                 "raw_query": ds.get("raw_query"),
                 "flags": ds.get("notes") or "",
                 "available_file_type": ds.get("available_file_type"),

@@ -3,7 +3,10 @@
 Covers:
   - _junk_filter (demoted inspect_matrix_head): drop only README/empty/p-value tables;
     keep MCTA-Seq count matrices, beta matrices, series_matrix.
-  - _llm_select_files (LLM sample-type selection) with a FakeLLM.
+  - _llm_select_files (LLM sample-type + SPEC Phase-2 file-type selection) with a
+    FakeLLM: new annotation fields, SPEC category tokens, mixed-semantics warning,
+    parse-retry-once-then-fallback.
+  - SPEC Phase-2 heading-slice loader (single source + fail-fast).
   - _select_relevant_files conservative fallback (no LLM / parse error / keep-none).
   - _target_sample_summary.
 """
@@ -12,10 +15,17 @@ import json
 import os
 import tempfile
 import unittest
+from pathlib import Path
 
 import pandas as pd
 
-from skills.geo_download.skill import DownloadSkill
+from skills.geo_download.skill import (
+    DownloadSkill,
+    _FILE_SELECTION_SYSTEM_PROMPT,
+    _SPEC_PHASE2,
+    _SPEC_PHASE2_HEADING,
+    _load_spec_phase2_section,
+)
 
 
 def _write_gz(path: str, text: str) -> str:
@@ -47,6 +57,17 @@ class FakeLLM:
 
     def invoke(self, messages):
         return _Resp(json.dumps(self._payload))
+
+
+class SequenceLLM:
+    """Returns raw strings in order (for parse-retry tests); counts invokes."""
+    def __init__(self, raw_outputs):
+        self._outputs = list(raw_outputs)
+        self.calls = 0
+
+    def invoke(self, messages):
+        self.calls += 1
+        return _Resp(self._outputs.pop(0))
 
 
 def _make_skill(llm=None):
@@ -125,6 +146,8 @@ class TestLLMSelectFiles(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_llm_keeps_plasma_drops_tissue(self):
+        # Old-shape verdict JSON (no data_form/value_semantics fields) must still
+        # work: data_form normalizes to "other", sample_type lands in its own key.
         payload = {"reasoning": "plasma file matches cfDNA query; tissue does not",
                    "files": [
                        {"name": "sumP_plasma.txt.gz", "keep": True,
@@ -136,18 +159,163 @@ class TestLLMSelectFiles(unittest.TestCase):
         rec = {"raw_query": "CRC cfDNA methylation", "sample_type": "cfdna",
                "cancer_type": "colorectal cancer", "title": "CRC cfDNA"}
         # Use the real entry point _select_relevant_files (junk-filter + LLM + commit).
-        kept, discarded, note, forced = skill._select_relevant_files(
+        kept, discarded, note, forced, warn = skill._select_relevant_files(
             "GSETEST",
             [_done_result(self.plasma), _done_result(self.tissue)],
             rec, None)
         self.assertEqual(len(kept), 1)
         self.assertEqual(len(discarded), 1)
         self.assertIsNone(forced)  # normal path, not the fallback
+        self.assertIsNone(warn)
         self.assertTrue(os.path.exists(self.plasma))
         self.assertFalse(os.path.exists(self.tissue))  # deleted on commit
-        self.assertEqual(kept[0]["data_form"], "plasma")
+        self.assertEqual(kept[0]["data_form"], "other")  # NOT the sample_type label
+        self.assertEqual(kept[0]["sample_type"], "plasma")
         self.assertIn("selected 1/2", note)
         self.assertIn("cfDNA", note)  # reasoning surfaced in the note
+
+    def test_llm_select_parses_new_fields(self):
+        payload = {"reasoning": "MCTA-Seq counts, plasma only",
+                   "files": [
+                       {"name": "sumP_plasma.txt.gz", "keep": True,
+                        "sample_type": "plasma", "data_form": "paired_counts",
+                        "value_semantics": "normalized_assay_signal",
+                        "merge_scope": "within_assay_only",
+                        "reason": "plasma MCTA-Seq count pairs"},
+                   ]}
+        skill = _make_skill(FakeLLM(payload))
+        rec = {"raw_query": "CRC cfDNA methylation", "sample_type": "cfdna",
+               "cancer_type": "colorectal cancer", "title": "CRC cfDNA",
+               "platforms": ["Illumina NovaSeq"], "technology": "MCTA"}
+        kept, discarded, note, forced, warn = skill._select_relevant_files(
+            "GSETEST", [_done_result(self.plasma)], rec, None)
+        self.assertEqual(len(kept), 1)
+        r = kept[0]
+        self.assertEqual(r["data_form"], "paired_counts")
+        self.assertEqual(r["value_semantics"], "normalized_assay_signal")
+        self.assertEqual(r["merge_scope"], "within_assay_only")
+        self.assertEqual(r["sample_type"], "plasma")
+        self.assertNotEqual(r["data_form"], r["sample_type"])  # de-abused
+        self.assertIsNone(forced)
+        self.assertIsNone(warn)  # single semantics → no warning
+
+    def test_llm_select_type_drop_with_spec_token(self):
+        panel = _write_gz(
+            os.path.join(self.dir, "panel_markers.txt.gz"),
+            "marker\tPcrc90\tPn43\ncg1\t0.2\t0.1\ncg2\t0.3\t0.2\n")
+        payload = {"reasoning": "panel too small",
+                   "files": [
+                       {"name": "panel_markers.txt.gz", "keep": False,
+                        "sample_type": "plasma", "data_form": "other",
+                        "reason": "small preset panel (<500 regions): targeted_panel"},
+                       {"name": "sumP_plasma.txt.gz", "keep": True,
+                        "sample_type": "plasma", "data_form": "region_matrix",
+                        "reason": "plasma region matrix"},
+                   ]}
+        skill = _make_skill(FakeLLM(payload))
+        kept, discarded, note, forced, warn = skill._select_relevant_files(
+            "GSETEST",
+            [_done_result(self.plasma), _done_result(panel)],
+            {"sample_type": "cfdna"}, None)
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(len(discarded), 1)
+        self.assertEqual(discarded[0].get("spec_category"), "targeted_panel")
+        self.assertIsNone(forced)  # type-drop is the feature, not a fallback
+        self.assertFalse(os.path.exists(panel))  # committed
+
+    def test_mixed_value_semantics_report_only(self):
+        # Two kept files spanning standard_level + normalized_assay_signal →
+        # warning note + warn flag, but NO forced outcome (report-only).
+        beta2 = _write_gz(
+            os.path.join(self.dir, "beta2.txt.gz"),
+            "ID_REF\tPcrc90\tPn43\ncg1\t0.7\t0.2\n")
+        payload = {"reasoning": "both plasma; different assay semantics",
+                   "files": [
+                       {"name": "sumP_plasma.txt.gz", "keep": True,
+                        "sample_type": "plasma", "data_form": "paired_counts",
+                        "value_semantics": "normalized_assay_signal",
+                        "merge_scope": "within_assay_only",
+                        "reason": "MCTA counts"},
+                       {"name": "beta2.txt.gz", "keep": True,
+                        "sample_type": "plasma", "data_form": "merged_beta_matrix",
+                        "value_semantics": "standard_level",
+                        "merge_scope": "standard_level",
+                        "reason": "beta matrix"},
+                   ]}
+        skill = _make_skill(FakeLLM(payload))
+        kept, discarded, note, forced, warn = skill._select_relevant_files(
+            "GSETEST",
+            [_done_result(self.plasma), _done_result(beta2)],
+            {"sample_type": "cfdna"}, None)
+        self.assertEqual(len(kept), 2)
+        self.assertEqual(warn, "mixed_value_semantics")
+        self.assertIn("mixed value_semantics", note)
+        self.assertIn("WARNING", note)
+        self.assertIsNone(forced)  # report-only, never a forced outcome
+
+    def test_llm_parse_fail_retries_once_then_falls_back(self):
+        good = json.dumps({"reasoning": "plasma",
+                           "files": [{"name": "sumP_plasma.txt.gz", "keep": True,
+                                      "sample_type": "plasma",
+                                      "data_form": "region_matrix",
+                                      "reason": "plasma"}]})
+        # garbage → garbage: retry consumed, then raise → conservative fallback.
+        llm = SequenceLLM(["not json {{{", "still not json"])
+        skill = _make_skill(llm)
+        kept, discarded, note, forced, warn = skill._select_relevant_files(
+            "GSETEST", [_done_result(self.plasma)], {}, None)
+        self.assertEqual(llm.calls, 2)  # initial + one compact retry
+        self.assertEqual(len(kept), 1)  # fallback: keep all non-junk
+        self.assertEqual(forced, "manual_review_file_selection")
+        self.assertTrue(os.path.exists(self.plasma))
+
+        # garbage → valid JSON: retry succeeds, no fallback.
+        os.remove(self.plasma)
+        self.plasma = _write_gz(
+            os.path.join(self.dir, "sumP_plasma.txt.gz"),
+            "ID_REF\tPcrc90\tPn43\nr1\t0.2\t0.1\nr2\t0.3\t0.2\n")
+        llm2 = SequenceLLM(["not json {{{", good])
+        skill2 = _make_skill(llm2)
+        kept2, discarded2, note2, forced2, warn2 = skill2._select_relevant_files(
+            "GSETEST", [_done_result(self.plasma)], {}, None)
+        self.assertEqual(llm2.calls, 2)
+        self.assertEqual(len(kept2), 1)
+        self.assertIsNone(forced2)  # retry rescued the call — no manual_review
+        self.assertEqual(kept2[0]["data_form"], "region_matrix")
+
+
+class TestSpecPhase2Section(unittest.TestCase):
+    def test_slice_content(self):
+        self.assertTrue(_SPEC_PHASE2.startswith(_SPEC_PHASE2_HEADING))
+        self.assertIn("IDAT", _SPEC_PHASE2)            # do-not-keep list present
+        self.assertIn("targeted_panel", _SPEC_PHASE2)  # SPEC category token present
+        self.assertIn("within_assay_only", _SPEC_PHASE2)
+        self.assertNotIn("\n## 核心原则", _SPEC_PHASE2)  # next section excluded
+        # Single source: the composed prompt embeds the slice verbatim.
+        self.assertIn(_SPEC_PHASE2, _FILE_SELECTION_SYSTEM_PROMPT)
+
+    def test_missing_heading_raises(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False,
+                                         encoding="utf-8") as f:
+            f.write("# unrelated spec\n\n## something else\n")
+            path = f.name
+        try:
+            with self.assertRaises(RuntimeError) as cm:
+                _load_spec_phase2_section(Path(path))
+            self.assertIn("Phase 2 文件类型判断", str(cm.exception))
+        finally:
+            os.unlink(path)
+
+    def test_section_without_next_heading_runs_to_eof(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False,
+                                         encoding="utf-8") as f:
+            f.write(f"前言\n\n{_SPEC_PHASE2_HEADING}（测试）\n\n- 规则一\n")
+            path = f.name
+        try:
+            s = _load_spec_phase2_section(Path(path))
+            self.assertIn("规则一", s)   # runs to EOF when no following '## '
+        finally:
+            os.unlink(path)
 
 
 class TestSelectRelevantFallback(unittest.TestCase):
@@ -163,7 +331,7 @@ class TestSelectRelevantFallback(unittest.TestCase):
 
     def test_no_llm_keeps_all_nonjunk_and_flags_review(self):
         skill = _make_skill(llm=None)
-        kept, discarded, note, forced = skill._select_relevant_files(
+        kept, discarded, note, forced, warn = skill._select_relevant_files(
             "GSETEST", [_done_result(self.beta)], {}, None)
         self.assertEqual(len(kept), 1)
         self.assertEqual(len(discarded), 0)
@@ -176,7 +344,7 @@ class TestSelectRelevantFallback(unittest.TestCase):
             {"name": "beta.txt.gz", "keep": False, "sample_type": "unknown",
              "reason": "unsure"}]}
         skill = _make_skill(FakeLLM(payload))
-        kept, discarded, note, forced = skill._select_relevant_files(
+        kept, discarded, note, forced, warn = skill._select_relevant_files(
             "GSETEST", [_done_result(self.beta)], {}, None)
         self.assertEqual(len(kept), 1)            # reverted: keep all non-junk
         self.assertEqual(forced, "manual_review_file_selection")
@@ -187,7 +355,7 @@ class TestSelectRelevantFallback(unittest.TestCase):
             def invoke(self, msgs):
                 return _Resp("not json at all {{{")
         skill = _make_skill(BadLLM())
-        kept, discarded, note, forced = skill._select_relevant_files(
+        kept, discarded, note, forced, warn = skill._select_relevant_files(
             "GSETEST", [_done_result(self.beta)], {}, None)
         self.assertEqual(len(kept), 1)
         self.assertEqual(forced, "manual_review_file_selection")

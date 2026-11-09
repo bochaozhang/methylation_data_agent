@@ -66,6 +66,47 @@ _MAP_COVERAGE_REVIEW = 0.5
 # Filename carries a GSM id → one-sample-per-file (Tier-3 .cov/.bed forms).
 _GSM_IN_NAME_RE = re.compile(r"GSM\d+", re.IGNORECASE)
 
+# ---- SPEC Phase-2 file-type criteria (single source, user-maintained) ----
+# The selection prompt embeds the SPEC's「Phase 2 文件类型判断」section verbatim
+# instead of duplicating criteria in code (same philosophy as geo_filter's
+# whole-SPEC embed). Fail-fast at import: a missing section must never silently
+# degrade to a criteria-free prompt.
+_SPEC_PATH = Path(__file__).resolve().parent / "SPEC.md"
+_SPEC_PHASE2_HEADING = "## Phase 2 文件类型判断"
+
+
+def _load_spec_phase2_section(path: Path = _SPEC_PATH) -> str:
+    """Heading-slice the SPEC Phase-2 file-type section, returned verbatim.
+
+    Slice runs from the heading to the next '## ' heading (or EOF). The heading
+    is prefix-matched so a reworded parenthetical suffix still matches.
+    Raises RuntimeError naming the expected heading if SPEC.md lacks it.
+    """
+    text = path.read_text(encoding="utf-8")
+    idx = text.find(_SPEC_PHASE2_HEADING)
+    if idx == -1:
+        raise RuntimeError(
+            f"{path} is missing the required section starting with "
+            f"'{_SPEC_PHASE2_HEADING}' — the SPEC is user-maintained; restore "
+            f"the heading or update _SPEC_PHASE2_HEADING to match it")
+    end = text.find("\n## ", idx + len(_SPEC_PHASE2_HEADING))
+    return text[idx:] if end == -1 else text[idx:end]
+
+
+_SPEC_PHASE2: str = _load_spec_phase2_section()
+
+# Machine-side enums for the selection output contract (SPEC defines the
+# concepts; these literals are the code-side spelling — see output contract).
+_DATA_FORMS = ("merged_beta_matrix", "per_sample_calls", "region_matrix",
+               "paired_counts", "series_matrix", "other")
+_VALUE_SEMANTICS = ("standard_level", "normalized_assay_signal")
+_MERGE_SCOPES = ("standard_level", "within_assay_only")
+# Reporting tokens for type-based drops (criteria text lives in SPEC; these are
+# just the labels echoed into discard records when the LLM cites them).
+_SPEC_CATEGORY_TOKENS = ("targeted_panel", "non_target_modification_5hmC",
+                         "idat_intensity", "sequencing_reads",
+                         "unnormalized_counts", "stats_table", "qc_stats")
+
 
 def _cancer_matches(cancer_type: Optional[str], query_terms: List[str]) -> bool:
     """
@@ -233,16 +274,20 @@ class DownloadSkill:
         # (Tier 3). Now select which to KEEP:
         #   1. junk-filter (demoted inspect_matrix_head) drops clear non-data files
         #      (empty/README, p-value/logFC tables) — NOT a value-range A-level gate.
-        #   2. the LLM picks files whose SAMPLE TYPE matches the query (e.g. plasma
-        #      cfDNA vs tissue), using the query + the target-sample set + each file's
-        #      head. Conservative fallback keeps all non-junk + manual_review.
+        #   2. the LLM picks files matching BOTH the query SAMPLE TYPE (e.g. plasma
+        #      cfDNA vs tissue) AND the SPEC Phase-2 file-type criteria (value
+        #      semantics / data_form / panel scale — criteria sliced verbatim from
+        #      SPEC.md into the prompt). Conservative fallback keeps all non-junk +
+        #      manual_review.
         # This is where "keep which data" is decided now that geo-filter no longer
         # gates on file format (3-state outcome; usability judged post-download).
         discarded: List[Dict[str, Any]] = []
         selection_note = ""
         sel_forced: Optional[str] = None
+        sel_warn: Optional[str] = None
         if tier_used.startswith(("2", "3")):
-            done, discarded, selection_note, sel_forced = self._select_relevant_files(
+            (done, discarded, selection_note, sel_forced, sel_warn
+             ) = self._select_relevant_files(
                 acc, done, rec, sm, download_gsms=download_gsms)
 
         # ---- Phase-2 ①②③: post-download verification ----
@@ -274,8 +319,9 @@ class DownloadSkill:
             column_map=column_map)
         forced_outcome = forced_outcome or sel_forced  # selection fallback may flag review
 
-        files_downloaded = [
-            {
+        files_downloaded = []
+        for r in done:
+            fd = {
                 "name": (r.get("local_path") or "").split("/")[-1],
                 "local_path": r.get("local_path"),
                 "size_bytes": r.get("file_size_bytes"),
@@ -284,11 +330,19 @@ class DownloadSkill:
                 "needs_processing": r.get("needs_processing"),
                 "provenance": {"source_url": r.get("url"), "checksum_md5": r.get("checksum_md5")},
             }
-            for r in done
-        ]
+            # SPEC Phase-2 annotations from the selection LLM (present when the
+            # Tier-2/3 selection ran and the LLM filled them; absent otherwise).
+            for key in ("sample_type", "value_semantics", "merge_scope"):
+                if r.get(key):
+                    fd[key] = r[key]
+            files_downloaded.append(fd)
         outcome = outcome_pre or forced_outcome or (
             "download_success" if done else "failed")
         notes = subset_note + f" [tier={tier_used}]"
+        if sel_warn:
+            # Report-only selection warning (e.g. mixed value_semantics) — flagged
+            # but never a forced outcome (same philosophy as ③ group-gap reports).
+            flags = (flags + ";" if flags else "") + sel_warn
         if selection_note:
             notes += f"; {selection_note}"
         if verify_note:
@@ -574,39 +628,44 @@ class DownloadSkill:
     def _select_relevant_files(
         self, acc: str, done_results: List[Dict[str, Any]], rec: Dict[str, Any],
         sm: Optional[pd.DataFrame], download_gsms: Optional[List[str]] = None,
-    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], str, Optional[str]]:
+    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], str, Optional[str],
+               Optional[str]]:
         """
         Select which downloaded Tier-2 supp files to keep.
 
         1. Junk-filter (demoted inspect_matrix_head): auto-drop clear non-data files
            (empty/README/binary, p-value/logFC statistical tables). NOT a value-range
            A-level gate — MCTA-Seq counts / unusual matrices pass through.
-        2. LLM picks files whose SAMPLE TYPE matches the query (e.g. plasma cfDNA vs
-           tissue), using the query + the target-sample set + each file's head.
-        3. Conservative fallback: no LLM / parse error / LLM keeps none → keep ALL
-           non-junk files and flag manual_review (never silently delete real data).
+        2. LLM picks files matching BOTH the query SAMPLE TYPE (e.g. plasma cfDNA vs
+           tissue) AND the SPEC Phase-2 file-type criteria (value semantics, matrix
+           form, panel scale — criteria sliced from SPEC.md into the prompt).
+        3. Conservative fallback: no LLM / parse error (after one compact retry) /
+           LLM keeps none → keep ALL non-junk files and flag manual_review (never
+           silently delete real data).
 
-        Returns (kept_results, discarded_info, note, forced_outcome).
+        Returns (kept_results, discarded_info, note, forced_outcome, warn_flag).
+        warn_flag is report-only (e.g. mixed_value_semantics) — never a forced
+        outcome.
         """
         candidates, junk = self._junk_filter(acc, done_results)
 
         if not candidates:
-            return [], junk, "all supp files were junk (no data)", None
+            return [], junk, "all supp files were junk (no data)", None, None
 
         if self.llm is None:
             # No LLM → keep everything that isn't obvious junk, flag for review.
             return candidates, junk, (
                 f"no LLM → kept all {len(candidates)} non-junk file(s) (manual_review)"
-            ), "manual_review_file_selection"
+            ), "manual_review_file_selection", None
 
         try:
-            kept, llm_discarded, llm_note = self._llm_select_files(
+            kept, llm_discarded, llm_note, warn_flag = self._llm_select_files(
                 acc, candidates, rec, sm, download_gsms=download_gsms)
         except Exception as exc:
             logger.warning(f"geo-download {acc}: LLM file-selection failed ({exc}) → keep all non-junk")
             return candidates, junk, (
                 f"LLM selection error ({exc}) → kept all {len(candidates)} non-junk (manual_review)"
-            ), "manual_review_file_selection"
+            ), "manual_review_file_selection", None
 
         # Safety: if the LLM kept nothing but candidates existed, don't trust it —
         # revert to keeping all non-junk + flag review. (Files are NOT deleted yet —
@@ -616,7 +675,7 @@ class DownloadSkill:
             return candidates, junk, (
                 f"LLM kept none → kept all {len(candidates)} non-junk (manual_review); "
                 f"{llm_note}"
-            ), "manual_review_file_selection"
+            ), "manual_review_file_selection", None
 
         # Commit: delete the LLM-discarded files now that we're keeping ≥1.
         for d in llm_discarded:
@@ -624,7 +683,7 @@ class DownloadSkill:
         # Strip the local_path from the discard records (provenance keeps md5+url).
         for d in llm_discarded:
             d.pop("local_path", None)
-        return kept, junk + llm_discarded, llm_note, None
+        return kept, junk + llm_discarded, llm_note, None, warn_flag
 
     # -------- junk pre-filter (demoted inspect_matrix_head) ------------- #
 
@@ -676,10 +735,17 @@ class DownloadSkill:
     def _llm_select_files(self, acc: str, candidates: List[Dict[str, Any]],
                           rec: Dict[str, Any], sm: Optional[pd.DataFrame],
                           download_gsms: Optional[List[str]] = None,
-                          ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], str]:
+                          ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]],
+                                     str, Optional[str]]:
         """
-        Ask the LLM which candidate files contain samples matching the query sample
-        type. Returns (kept, discarded, note). Raises on parse/error (caller falls back).
+        Ask the LLM which candidate files to keep, judging BOTH sample type AND
+        SPEC Phase-2 file-type usability (value semantics / data_form / panel
+        scale — criteria embedded in the system prompt from SPEC.md).
+
+        Returns (kept, discarded, note, warn_flag). warn_flag is
+        "mixed_value_semantics" when kept files span conflicting value semantics
+        (report-only — never a forced outcome). Raises on parse/error after ONE
+        compact retry (caller falls back to keep-all + manual_review).
         """
         # Target-sample summary from sample_metadata (the LLM-selected "download" set).
         target_summary = self._target_sample_summary(sm, download_gsms=download_gsms)
@@ -689,31 +755,34 @@ class DownloadSkill:
         for r in candidates:
             name = (r.get("local_path") or "").split("/")[-1]
             name_to_result[name] = r
-            head = _read_head_text(r.get("local_path"), max_lines=8)
+            head = _read_head_text(r.get("local_path"), max_lines=10)
             file_blocks.append(f"--- FILE: {name} ---\n{head}")
         files_text = "\n\n".join(file_blocks)
 
-        user_msg = (
-            f"=== USER REQUEST ===\n"
-            f"raw query: {rec.get('raw_query') or '(not recorded)'}\n"
-            f"requested sample type: {rec.get('sample_type') or '(unspecified)'}\n"
-            f"cancer: {rec.get('cancer_type') or '(unspecified)'}\n\n"
-            f"=== DATASET ===\n"
-            f"accession: {acc}\n"
-            f"title: {(rec.get('title') or '')[:200]}\n"
-            f"data type: {rec.get('data_type') or 'unknown'}\n\n"
-            f"=== TARGET SAMPLES (already selected for this query) ===\n"
-            f"{target_summary}\n\n"
-            f"=== CANDIDATE SUPPLEMENTARY FILES (head of each) ===\n"
-            f"{files_text}\n"
-        )
+        user_msg = _file_selection_user_msg(acc, rec, target_summary, files_text)
 
         resp = self.llm.invoke([
             SystemMessage(content=_FILE_SELECTION_SYSTEM_PROMPT),
             HumanMessage(content=user_msg),
         ])
         raw = resp.content if isinstance(resp.content, str) else str(resp.content)
-        verdict = _safe_json(raw)
+        try:
+            verdict = _safe_json(raw)
+        except Exception:
+            # One compact retry (same contract, less material) before giving up —
+            # mirrors the geo_filter truncation retry (392f743). A second parse
+            # failure raises and the caller's conservative fallback applies.
+            logger.warning(f"geo-download {acc}: selection JSON parse failed "
+                           f"→ one compact retry")
+            compact = _compact_file_selection_user_msg(acc, candidates, rec,
+                                                       target_summary)
+            resp = self.llm.invoke([
+                SystemMessage(content=_FILE_SELECTION_SYSTEM_PROMPT),
+                HumanMessage(content=compact),
+            ])
+            raw = resp.content if isinstance(resp.content, str) else str(resp.content)
+            verdict = _safe_json(raw)
+
         files_verdict = verdict.get("files") or []
         keep_set = {
             str(f.get("name", "")).strip(): f for f in files_verdict
@@ -726,25 +795,49 @@ class DownloadSkill:
             v = keep_set.get(name)
             local_path = r.get("local_path")
             if v and bool(v.get("keep")):
-                r["data_form"] = v.get("sample_type") or v.get("data_form") or "selected"
+                r["data_form"] = (v.get("data_form")
+                                  if v.get("data_form") in _DATA_FORMS else "other")
+                r["sample_type"] = v.get("sample_type") or ""
+                if v.get("value_semantics") in _VALUE_SEMANTICS:
+                    r["value_semantics"] = v["value_semantics"]
+                if v.get("merge_scope") in _MERGE_SCOPES:
+                    r["merge_scope"] = v["merge_scope"]
                 kept.append(r)
                 logger.info(f"geo-download {acc}: LLM keep {name} "
-                            f"({v.get('sample_type', '')}: {v.get('reason', '')})")
+                            f"({v.get('sample_type', '')}; form="
+                            f"{r['data_form']}; {v.get('reason', '')})")
             else:
                 # Classify only — DO NOT delete here. The caller commits deletion only
                 # after the keep-none safety check passes (else we'd lose data on a
                 # bad LLM response that we then revert).
                 reason = (v or {}).get("reason", "not selected by LLM")
                 stype = (v or {}).get("sample_type", "")
-                discarded.append({"name": name, "local_path": local_path,
-                                  "sample_type": stype, "reason": reason,
-                                  "md5": _md5_file(local_path), "source_url": r.get("url")})
-                logger.info(f"geo-download {acc}: LLM discard {name} ({stype}: {reason})")
+                d = {"name": name, "local_path": local_path,
+                     "sample_type": stype, "reason": reason,
+                     "md5": _md5_file(local_path), "source_url": r.get("url")}
+                category = _spec_category(reason)
+                if category:
+                    d["spec_category"] = category
+                discarded.append(d)
+                logger.info(f"geo-download {acc}: LLM discard {name} "
+                            f"({stype}: {reason})")
 
         reasoning = (verdict.get("reasoning") or "").replace("\n", " ")[:200]
         note = (f"LLM selected {len(kept)}/{len(candidates)} file(s)"
                 + (f": {reasoning}" if reasoning else ""))
-        return kept, discarded, note
+
+        # Report-only: kept files spanning conflicting value semantics must not be
+        # merged downstream (SPEC: within_assay_only must not mix with β/M/比例).
+        warn_flag: Optional[str] = None
+        kept_vs = sorted({r["value_semantics"] for r in kept
+                          if r.get("value_semantics")})
+        if len(kept_vs) > 1:
+            warn_flag = "mixed_value_semantics"
+            note += (" WARNING: mixed value_semantics among kept files "
+                     f"({', '.join(kept_vs)}) — per SPEC they must NOT be merged "
+                     f"across merge scopes; within_assay_only files merge only "
+                     f"within the same assay")
+        return kept, discarded, note, warn_flag
 
     @staticmethod
     def _target_sample_summary(sm: Optional[pd.DataFrame],
@@ -996,40 +1089,119 @@ def _safe_json(raw: str) -> Dict[str, Any]:
         raise
 
 
-# System prompt for Tier-2 sample-type-aware supplementary file selection.
-_FILE_SELECTION_SYSTEM_PROMPT = """\
+# System prompt for Tier-2/3 file selection: sample-type match AND SPEC Phase-2
+# file-type usability in ONE call. Criteria text is sliced verbatim from the
+# user-maintained SPEC (single source — do NOT restate rules here); only the
+# machine output contract below is code-side.
+_FILE_SELECTION_ROLE_AND_DUTIES = """\
 You are a bioinformatics curator selecting which GEO supplementary file(s) to KEEP
-for a DNA-methylation analysis.
+for a DNA-methylation analysis. Judge EVERY candidate file on BOTH dimensions:
 
-For each candidate file you are given its decompressed head (header row + first data
-rows). Decide KEEP vs DROP based on whether the file's COLUMNS are samples of the
-type the user requested (e.g. the query wants plasma/cfDNA → keep plasma-sample
-files; DROP tissue-only files even if they are valid methylation matrices).
+(a) SAMPLE TYPE — are the file's COLUMNS samples of the type the user requested
+    (e.g. the query wants plasma/cfDNA → keep plasma-sample files; DROP tissue-only
+    files even if they are valid methylation matrices). Reason from the requested
+    sample type, the TARGET SAMPLES summary (its source_name/group tells you what
+    specimen is wanted), and each file's header — submitter codes often encode
+    specimen (tissue tumor Tcrc/Tnm vs plasma Pcrc/Pn).
+(b) FILE TYPE USABILITY — apply the SPEC Phase 2 criteria below (A-level matrix
+    definition, value semantics, panel scale, do-not-keep list). The user message
+    may include platform / assay-technology context: use it for the SPEC's
+    tech-type cross-check, but the opened file's actual shape and value semantics
+    are the final arbiter on conflict.
 
-Reason from:
-- the requested sample type and the TARGET SAMPLES summary (the sample set already
-  selected for this query — its source_name/group tells you what specimen type is
-  wanted);
-- each file's header: column names often encode submitter codes whose prefix/label
-  indicates specimen (e.g. tissue tumor Tcrc/Tnm vs plasma Pcrc/Pn); use the study
-  design + sample counts to map columns → specimen type;
-- value shape only to reject obvious non-data (a marker list, a differential p-value
-  table with no sample columns). Do NOT reject a file just because values are integer
-  read-counts or a non-0–1 methylation score — those are valid methylation matrices.
+A file failing EITHER dimension is keep=false. When the drop is file-type based,
+cite the SPEC category token in the reason (e.g. `targeted_panel`,
+`non_target_modification_5hmC`). Per KEPT file, fill data_form / value_semantics /
+merge_scope per the SPEC — paired read-counts and normalized assay signals ARE
+keepable (SPEC §1) but must carry their merge_scope annotation.
 
 If multiple files together comprise the requested cohort (e.g. one file per
-processing batch), KEEP all of them. If unsure whether a file matches, prefer KEEP.
+processing batch), KEEP all of them. If unsure about SAMPLE TYPE, prefer KEEP; a
+file that clearly fails the SPEC file-type criteria is still DROP.
+"""
 
+_FILE_SELECTION_OUTPUT_CONTRACT = """\
 Output ONLY valid JSON:
 {
   "reasoning": "<one or two sentences>",
   "files": [
-    {"name": "<exact filename>", "keep": true|false,
+    {"name": "<exact filename>",
+     "keep": true|false,
      "sample_type": "plasma|tissue|wbc|cell_line|mixed|unknown",
-     "reason": "<short reason>"}
+     "data_form": "merged_beta_matrix|per_sample_calls|region_matrix|paired_counts|series_matrix|other",
+     "value_semantics": "standard_level|normalized_assay_signal|null",
+     "merge_scope": "standard_level|within_assay_only|null",
+     "reason": "<short reason; include the SPEC category token for type-based drops>"}
   ]
 }
 """
+
+_FILE_SELECTION_SYSTEM_PROMPT = (
+    _FILE_SELECTION_ROLE_AND_DUTIES + "\n"
+    + _SPEC_PHASE2 + "\n\n"
+    + _FILE_SELECTION_OUTPUT_CONTRACT
+)
+
+
+def _file_selection_user_msg(acc: str, rec: Dict[str, Any], target_summary: str,
+                             files_text: str) -> str:
+    """Full user message for the selection call (heads already rendered)."""
+    platforms = rec.get("platforms") or []
+    return (
+        f"=== USER REQUEST ===\n"
+        f"raw query: {rec.get('raw_query') or '(not recorded)'}\n"
+        f"requested sample type: {rec.get('sample_type') or '(unspecified)'}\n"
+        f"cancer: {rec.get('cancer_type') or '(unspecified)'}\n\n"
+        f"=== DATASET ===\n"
+        f"accession: {acc}\n"
+        f"title: {(rec.get('title') or '')[:200]}\n"
+        f"data type: {rec.get('data_type') or 'unknown'}\n"
+        f"platform(s): {', '.join(platforms) if platforms else '(unknown)'}\n"
+        f"assay technology: {rec.get('technology') or '(unknown)'}\n\n"
+        f"=== TARGET SAMPLES (already selected for this query) ===\n"
+        f"{target_summary}\n\n"
+        f"=== CANDIDATE SUPPLEMENTARY FILES (head of each) ===\n"
+        f"{files_text}\n"
+    )
+
+
+def _compact_file_selection_user_msg(acc: str, candidates: List[Dict[str, Any]],
+                                     rec: Dict[str, Any], target_summary: str) -> str:
+    """Compact retry variant (mirrors geo_filter's truncation retry, 392f743):
+    shorter material per file (≤4 head lines), trimmed title/summary, and an
+    explicit brevity directive. Same sections, same output contract."""
+    file_blocks = []
+    for r in candidates:
+        name = (r.get("local_path") or "").split("/")[-1]
+        file_blocks.append(f"--- FILE: {name} ---\n"
+                           f"{_read_head_text(r.get('local_path'), max_lines=4)}")
+    files_text = "\n\n".join(file_blocks)
+    return (
+        f"=== USER REQUEST ===\n"
+        f"requested sample type: {rec.get('sample_type') or '(unspecified)'}"
+        f" | cancer: {rec.get('cancer_type') or '(unspecified)'}\n\n"
+        f"=== DATASET ===\n"
+        f"accession: {acc} | title: {(rec.get('title') or '')[:120]}\n"
+        f"platform(s): {', '.join(rec.get('platforms') or []) or '(unknown)'}"
+        f" | technology: {rec.get('technology') or '(unknown)'}\n\n"
+        f"=== TARGET SAMPLES ===\n"
+        f"{target_summary[:400]}\n\n"
+        f"=== CANDIDATE SUPPLEMENTARY FILES (head of each) ===\n"
+        f"{files_text}\n\n"
+        f"The previous attempt exceeded the output token budget or produced "
+        f"invalid JSON. Apply the SAME procedure and output contract; keep "
+        f"reasoning under 120 words; every string field brief; do not drop "
+        f"any required per-file field."
+    )
+
+
+def _spec_category(reason: str) -> Optional[str]:
+    """Echo the SPEC category token the LLM cited in a drop reason, if any."""
+    rl = (reason or "").lower()
+    for tok in _SPEC_CATEGORY_TOKENS:
+        if tok.lower() in rl:
+            return tok
+    return None
 
 
 def _dedup_preserve(items: List[str]) -> List[str]:
