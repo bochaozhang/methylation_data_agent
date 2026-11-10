@@ -396,6 +396,32 @@ def get_dataset(accession: str) -> Dict[str, Any]:
 
 
 @server.tool()
+def llm_file_selection(enabled: Optional[bool] = None) -> Dict[str, Any]:
+    """Get (no args) or set (enabled=...) the download file-selection mode.
+
+    OFF (default, legacy): files are selected by the hardcoded sample-type
+    prompt (plasma vs tissue) — the long-standing production behavior.
+    ON (SPEC Phase-2): the LLM additionally judges FILE TYPE usability per
+    skills/geo_download/SPEC.md「Phase 2 文件类型判断」— value semantics
+    (standard_level vs normalized_assay_signal / merge_scope), matrix form
+    (data_form), panel scale — and kept files carry those annotations; a
+    SPEC-based drop cites a category token (e.g. targeted_panel).
+
+    Runtime toggle: workers read it per dataset, so it takes effect from the
+    NEXT dataset onward without a restart. The value persists in the registry
+    and overrides the settings.yaml default; changing SPEC criteria themselves
+    still requires a worker restart (criteria are embedded at process start).
+
+    Args:
+        enabled: Omit to query the current mode; true/false to set it.
+    """
+    _require_writes()
+    if enabled is None:
+        return _api().get("/settings/llm-file-selection")
+    return _api().put("/settings/llm-file-selection", json={"enabled": bool(enabled)})
+
+
+@server.tool()
 def health() -> Dict[str, Any]:
     """Backend health: worker heartbeats + registry dataset counts."""
     return _api().get("/health")

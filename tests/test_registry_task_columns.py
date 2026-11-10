@@ -220,3 +220,25 @@ class TestRequeueCrashLoopGuard(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSettingsKv(unittest.TestCase):
+    """settings kv table: get/set roundtrip + upsert (runtime toggles)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = str(Path(self.tmp.name) / "reg.db")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_roundtrip_and_upsert(self):
+        reg = Registry(db_path=self.db)
+        self.assertIsNone(reg.get_setting("download_llm_file_selection"))
+        self.assertEqual(reg.get_setting("x", default="dflt"), "dflt")
+        reg.set_setting("download_llm_file_selection", "0")
+        self.assertEqual(reg.get_setting("download_llm_file_selection"), "0")
+        reg.set_setting("download_llm_file_selection", "1")   # upsert, not insert
+        self.assertEqual(reg.get_setting("download_llm_file_selection"), "1")
+        reg.set_setting("other_key", "v")                     # coexists
+        self.assertEqual(reg.get_setting("other_key"), "v")

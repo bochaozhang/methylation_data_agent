@@ -38,6 +38,10 @@ class ApiClient:
              params: Optional[dict] = None) -> Any:
         return self._unwrap(self._client.post(path, json=json, params=params))
 
+    def put(self, path: str, json: Optional[Any] = None,
+            params: Optional[dict] = None) -> Any:
+        return self._unwrap(self._client.put(path, json=json, params=params))
+
     @staticmethod
     def _unwrap(resp: httpx.Response) -> Any:
         if resp.status_code >= 400:

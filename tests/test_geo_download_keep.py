@@ -71,9 +71,15 @@ class SequenceLLM:
 
 
 def _make_skill(llm=None):
-    """Bypass DownloadSkill.__init__ (no engine/geo_client/real LLM)."""
+    """Bypass DownloadSkill.__init__ (no engine/geo_client/real LLM).
+
+    llm_file_selection=True: these tests exercise the SPEC Phase-2 path (the
+    switch default is False/legacy — see TestLegacySelection for that side).
+    """
     skill = DownloadSkill.__new__(DownloadSkill)
     skill.llm = llm
+    skill.llm_file_selection = True
+    skill.registry = None
     return skill
 
 
@@ -282,6 +288,124 @@ class TestLLMSelectFiles(unittest.TestCase):
         self.assertEqual(len(kept2), 1)
         self.assertIsNone(forced2)  # retry rescued the call — no manual_review
         self.assertEqual(kept2[0]["data_form"], "region_matrix")
+
+
+class TestLegacySelection(unittest.TestCase):
+    """Switch OFF (the default): pre-⑥ behavior, byte-for-byte."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+        self.plasma = _write_gz(
+            os.path.join(self.dir, "sumP_plasma.txt.gz"),
+            "ID_REF\tPcrc90\tPn43\nr1\t0.2\t0.1\nr2\t0.3\t0.2\n")
+        self.tissue = _write_gz(
+            os.path.join(self.dir, "MePM_tissue.txt.gz"),
+            "ID_REF\tTcrc1\tTnm1\nr1\t12\t5\nr2\t8\t3\n")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _skill(self, llm, flag=False):
+        skill = DownloadSkill.__new__(DownloadSkill)
+        skill.llm = llm
+        skill.llm_file_selection = flag
+        skill.registry = None
+        return skill
+
+    def test_default_off_uses_legacy_prompt_and_abuse(self):
+        # flag False → legacy path: data_form carries the sample_type label
+        # (the historical abuse), no new annotation fields, single invoke.
+        class CountingLLM(FakeLLM):
+            def __init__(self, payload):
+                super().__init__(payload)
+                self.calls = 0
+
+            def invoke(self, messages):
+                self.calls += 1
+                self.last_system = messages[0].content
+                return super().invoke(messages)
+
+        llm = CountingLLM({"reasoning": "plasma keep", "files": [
+            {"name": "sumP_plasma.txt.gz", "keep": True,
+             "sample_type": "plasma", "reason": "plasma cfDNA"},
+            {"name": "MePM_tissue.txt.gz", "keep": False,
+             "sample_type": "tissue", "reason": "tissue"}]})
+        skill = self._skill(llm, flag=False)
+        kept, discarded, note, forced, warn = skill._select_relevant_files(
+            "GSETEST",
+            [_done_result(self.plasma), _done_result(self.tissue)],
+            {"sample_type": "cfdna"}, None)
+        self.assertEqual(llm.calls, 1)                       # no compact retry
+        self.assertIn("Do NOT reject a file just because values are integer",
+                      llm.last_system)                       # legacy prompt verbatim
+        self.assertNotIn("Phase 2 文件类型判断", llm.last_system)  # no SPEC slice
+        self.assertEqual(kept[0]["data_form"], "plasma")     # historical abuse
+        self.assertNotIn("value_semantics", kept[0])
+        self.assertNotIn("merge_scope", kept[0])
+        self.assertNotIn("spec_category", discarded[0])
+        self.assertIsNone(warn)
+        self.assertEqual(forced, None)
+
+    def test_legacy_parse_error_single_attempt_then_fallback(self):
+        # Legacy path has NO retry — one bad response → conservative fallback.
+        class BadLLM:
+            def __init__(self):
+                self.calls = 0
+
+            def invoke(self, msgs):
+                self.calls += 1
+                return _Resp("garbage {{{")
+
+        llm = BadLLM()
+        skill = self._skill(llm, flag=False)
+        kept, discarded, note, forced, warn = skill._select_relevant_files(
+            "GSETEST", [_done_result(self.plasma)], {}, None)
+        self.assertEqual(llm.calls, 1)                       # single attempt
+        self.assertEqual(forced, "manual_review_file_selection")
+        self.assertEqual(len(kept), 1)
+
+
+class TestSelectionSwitchPrecedence(unittest.TestCase):
+    """Registry runtime value (REST/MCP toggle) overrides the config default."""
+
+    class _StubRegistry:
+        def __init__(self, value):
+            self._value = value
+
+        def get_setting(self, key, default=None):
+            if self._value is Exception:
+                raise Exception("boom")
+            return self._value
+
+    def _skill(self, registry, flag=False):
+        skill = DownloadSkill.__new__(DownloadSkill)
+        skill.llm = None
+        skill.llm_file_selection = flag
+        skill.registry = registry
+        return skill
+
+    def test_registry_true_overrides_config_false(self):
+        s = self._skill(self._StubRegistry("1"), flag=False)
+        self.assertTrue(s._spec_selection_enabled())
+
+    def test_registry_false_overrides_config_true(self):
+        s = self._skill(self._StubRegistry("0"), flag=True)
+        self.assertFalse(s._spec_selection_enabled())
+
+    def test_registry_unset_falls_back_to_config(self):
+        s = self._skill(self._StubRegistry(None), flag=False)
+        self.assertFalse(s._spec_selection_enabled())
+        s2 = self._skill(self._StubRegistry(None), flag=True)
+        self.assertTrue(s2._spec_selection_enabled())
+
+    def test_registry_error_falls_back_to_config(self):
+        s = self._skill(self._StubRegistry(Exception), flag=True)
+        self.assertTrue(s._spec_selection_enabled())
+
+    def test_no_registry_falls_back_to_config(self):
+        s = self._skill(None, flag=False)
+        self.assertFalse(s._spec_selection_enabled())
 
 
 class TestSpecPhase2Section(unittest.TestCase):

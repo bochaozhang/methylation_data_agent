@@ -1,7 +1,7 @@
 # MethyAgent MCP 接口使用说明（上游 Agent 接入指南）
 
 日期：2026-10-19（10-26/27 增补远程接入、审批、解码）
-适用版本：MCP 分支（13 个 tool）
+适用版本：MCP 分支（14 个 tool）
 配套文档：docs/mcp_interface_plan.md（设计与实施报告）
 
 > **Phase 4 配套 Skill**：`claude_skill/methyagent/SKILL.md`——给上游 Claude Code
@@ -81,6 +81,7 @@ MCP 是 REST 的薄适配层，所有能力都有等价 HTTP 端点（见 §8）
 | `decode_sample_titles` | 写 | 解码提交者自编码样本标题（如 `COAD.ct-N`）→ 全样本 cancer 分类；默认 dry-run 提案，`apply=True` 落库（samples 表 + CSV + disease_groups） | ~10s（含一次 LLM）|
 | `list_datasets` | 只读 | 浏览注册表（可按 download_status 过滤） | 快 |
 | `get_dataset` | 只读 | 单个数据集全量记录（含路径 + LLM 判定证据） | 快 |
+| `llm_file_selection` | 写 | **运行时开关**下载文件选择模式（见 §5.6）：无参查询；`enabled=true/false` 设置 | 快 |
 | `health` | 只读 | 后端心跳 + 注册表统计 | 快 |
 
 ## 4. 推荐工作流
@@ -217,6 +218,25 @@ decode_sample_titles("GSE97923", apply=True)  # 确认后落库：samples 表 + 
 再 apply。实测：GSE97923 → 773 样本 `COAD.ct-N → query_cancer`（高置信，并正确指出健康
 对照位于该泛癌父系列的兄弟子系列）。
 
+### 5.7 运行时切换下载文件选择模式（2026-11-10 起）
+
+下载链路对 Tier-2/3 候选文件做 LLM 选择时有两种模式，可运行时切换（**不重启、从下一个
+数据集起生效**，落 registry 持久化、覆盖 settings.yaml 默认值）：
+
+```
+llm_file_selection()                  # 查询当前模式 → {enabled, source}
+llm_file_selection(enabled=true)      # 切到 SPEC Phase-2 文件类型判定
+llm_file_selection(enabled=false)     # 切回 legacy 硬编码样本类型判定（默认）
+```
+
+| 模式 | 行为 |
+|---|---|
+| **false（默认，legacy）** | 只按**样本类型**取舍（血浆 vs 组织），硬编码提示词——长期生产行为 |
+| **true（SPEC Phase-2）** | 同时按 `skills/geo_download/SPEC.md`「Phase 2 文件类型判断」判**文件类型可用性**（值语义/矩阵形态/panel 规模）；保留文件带 `value_semantics`/`merge_scope`/`data_form` 标注，类型性丢弃带 `spec_category` token（如 `targeted_panel`）；混合值语义只报告不拦截 |
+
+注意：开关切的是**判定路径**；SPEC 判据文本本身在 worker 启动时嵌入提示词——**改 SPEC.md
+内容仍需重启 worker** 才生效。该工具受 `MCP_ALLOW_WRITES` 门控（与审批写工具同款）。
+
 ## 6. 语义与坑
 
 | 事项 | 行为 |
@@ -259,6 +279,7 @@ decode_sample_titles("GSE97923", apply=True)  # 确认后落库：samples 表 + 
 | cancel_task | `POST /tasks/{id}/cancel` |
 | list_datasets | `GET /datasets?status=&limit=` |
 | get_dataset | `GET /datasets/{accession}` |
+| llm_file_selection | `GET /settings/llm-file-selection`；`PUT /settings/llm-file-selection` `{enabled:bool}` |
 | health | `GET /health` |
 
 注意：REST 返回的路径是容器路径（`/app/data/...`），对应宿主机 `<repo>/data/...`（compose

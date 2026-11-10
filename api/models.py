@@ -295,3 +295,21 @@ class ApprovalResponse(BaseModel):
     approved_count: int
     skipped_count: int
     message: str
+
+
+class FileSelectionSettingRequest(BaseModel):
+    """PUT /settings/llm-file-selection — set the Tier-2/3 file-selection mode."""
+    enabled: bool = Field(
+        description="true = SPEC Phase-2 file-type judgment "
+                    "(skills/geo_download/SPEC.md); false = legacy hardcoded "
+                    "sample-type-only prompt."
+    )
+
+
+class FileSelectionSettingResponse(BaseModel):
+    """GET/PUT /settings/llm-file-selection — current/effective mode."""
+    enabled: bool
+    source: str = Field(
+        description="'registry' (runtime toggle, overrides config) or "
+                    "'config' (settings.yaml default)"
+    )

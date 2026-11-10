@@ -249,6 +249,12 @@ class Registry:
                     ON query_sample_map(task_id);
                 CREATE INDEX IF NOT EXISTS idx_qsm_download
                     ON query_sample_map(task_id, verdict);
+
+                CREATE TABLE IF NOT EXISTS settings (
+                    key         TEXT PRIMARY KEY,
+                    value       TEXT NOT NULL,
+                    updated_at  TEXT NOT NULL
+                );
                 """
             )
 
@@ -290,6 +296,25 @@ class Registry:
     # ------------------------------------------------------------------ #
     #  Core CRUD                                                           #
     # ------------------------------------------------------------------ #
+
+    def get_setting(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        """Runtime setting from the settings kv table (None if unset)."""
+        with self._get_conn() as conn:
+            row = conn.execute(
+                "SELECT value FROM settings WHERE key = ?", (key,)
+            ).fetchone()
+            return row["value"] if row else default
+
+    def set_setting(self, key: str, value: str) -> None:
+        """Upsert a runtime setting (settings kv table)."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._get_conn() as conn:
+            conn.execute(
+                "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+                "updated_at = excluded.updated_at",
+                (key, value, now),
+            )
 
     def exists(self, accession: str) -> bool:
         """Return True if the accession is already registered."""

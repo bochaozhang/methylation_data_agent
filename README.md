@@ -2,7 +2,7 @@
 
 双 Agent 甲基化数据自动采集系统：自然语言或结构化 intent 查询 → GEO/TCGA 检索 → 三态过滤（download / manual_review / exclude，GSM 样本级判定）→ 自动下载 → 下载后核验（列数 / GSM→列映射 / 疾病分组）→ SQLite 注册表全程追踪。
 
-全部能力同时以 **MCP 协议**暴露（13 个 tool：dry-run 预览、复合查询提交、审批、样本标题解码等），外部 LLM agent（Claude Code 等）即插即用——见下文 [MCP 接口](#mcp-接口供其他-agent-调用)。
+全部能力同时以 **MCP 协议**暴露（14 个 tool：dry-run 预览、复合查询提交、审批、样本标题解码、文件选择模式开关等），外部 LLM agent（Claude Code 等）即插即用——见下文 [MCP 接口](#mcp-接口供其他-agent-调用)。
 
 ## 系统架构
 
@@ -258,7 +258,7 @@ claude mcp add --transport http methyagent http://<host>:8081/mcp \
 配套 **Claude Code skill**：`claude_skill/methyagent/SKILL.md`（教工作流 + 工具速查），
 复制/链接到 `~/.claude/skills/` 即插即用。
 
-### 13 个 tool
+### 14 个 tool
 
 | 场景 | Tool |
 |---|---|
@@ -267,6 +267,7 @@ claude mcp add --transport http methyagent http://<host>:8081/mcp \
 | 跟踪 | `get_task_status` / `get_task_result`（三桶 + 宿主机路径）/ `cancel_task` |
 | 审批 | `list_awaiting_approval` / `approve_dataset` / `reject_dataset` |
 | 数据 | `list_datasets` / `get_dataset` / `decode_sample_titles`（解码提交者自编码样本标题） |
+| 运维 | `llm_file_selection`（查询/运行时切换下载文件选择模式：legacy 样本类型判定 ↔ SPEC Phase-2 文件类型判定） |
 | 其他 | `health` |
 
 ### 复合查询（训练 + 验证数据）
@@ -361,7 +362,7 @@ methylation_data_agent/
 │   └── adaptive_evidence/      # manual_review 自取证（bind_tools agent）
 ├── tools/                      # geo_tools / tcga_tools / pubmed_tools /
 │                               # download_tools（断点续传）/ title_decode
-├── mcp_server/                 # MCP server（13 tool；stdio + HTTP/Bearer）
+├── mcp_server/                 # MCP server（14 tool；stdio + HTTP/Bearer）
 ├── claude_skill/methyagent/    # Claude Code 消费方即插即用 SKILL.md
 ├── registry/registry.py        # SQLite 注册表
 ├── api/                        # FastAPI（main.py + templates/）

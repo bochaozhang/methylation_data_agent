@@ -130,6 +130,13 @@ class DownloadSkill:
         self.registry = registry
         dl = config["download"]
         self.output_dir = dl["output_dir"]
+        # SPEC Phase-2 file-type selection switch. DEFAULT OFF: selection uses
+        # the legacy hardcoded sample-type prompt (pre-⑥ production behavior).
+        # True → the SPEC-driven dual-mandate path (file-type usability judged
+        # per skills/geo_download/SPEC.md「Phase 2 文件类型判断」). A registry
+        # runtime value (set via the REST/MCP toggle) overrides this default —
+        # see _spec_selection_enabled().
+        self.llm_file_selection = bool(dl.get("llm_file_selection", False))
         self.downloader = DownloadEngine(
             output_dir=dl["output_dir"],
             max_concurrent=dl["max_concurrent"],
@@ -625,6 +632,20 @@ class DownloadSkill:
     #  Tier-2 file selection (junk filter + LLM sample-type selection)   #
     # ------------------------------------------------------------------ #
 
+    def _spec_selection_enabled(self) -> bool:
+        """Effective file-selection mode: registry runtime value (REST/MCP
+        toggle, takes effect per dataset without a restart) overrides the
+        constructor/config default; absent registry/setting → config default."""
+        if self.registry is not None:
+            try:
+                v = self.registry.get_setting("download_llm_file_selection")
+                if v is not None:
+                    return v.strip().lower() in ("1", "true", "yes", "on")
+            except Exception as exc:
+                logger.debug(f"geo-download: settings read failed ({exc}); "
+                             f"using config default for file selection")
+        return bool(getattr(self, "llm_file_selection", False))
+
     def _select_relevant_files(
         self, acc: str, done_results: List[Dict[str, Any]], rec: Dict[str, Any],
         sm: Optional[pd.DataFrame], download_gsms: Optional[List[str]] = None,
@@ -636,12 +657,15 @@ class DownloadSkill:
         1. Junk-filter (demoted inspect_matrix_head): auto-drop clear non-data files
            (empty/README/binary, p-value/logFC statistical tables). NOT a value-range
            A-level gate — MCTA-Seq counts / unusual matrices pass through.
-        2. LLM picks files matching BOTH the query SAMPLE TYPE (e.g. plasma cfDNA vs
-           tissue) AND the SPEC Phase-2 file-type criteria (value semantics, matrix
-           form, panel scale — criteria sliced from SPEC.md into the prompt).
-        3. Conservative fallback: no LLM / parse error (after one compact retry) /
-           LLM keeps none → keep ALL non-junk files and flag manual_review (never
-           silently delete real data).
+        2. LLM picks files. Mode switch (_spec_selection_enabled):
+           - OFF (default): LEGACY path — hardcoded sample-type-only prompt,
+             pre-⑥ production behavior byte-for-byte.
+           - ON: SPEC path — sample type AND SPEC Phase-2 file-type criteria
+             (value semantics, matrix form, panel scale; criteria sliced from
+             SPEC.md into the prompt), annotations + spec_category tokens.
+        3. Conservative fallback: no LLM / parse error (SPEC path: after one
+           compact retry) / LLM keeps none → keep ALL non-junk files and flag
+           manual_review (never silently delete real data).
 
         Returns (kept_results, discarded_info, note, forced_outcome, warn_flag).
         warn_flag is report-only (e.g. mixed_value_semantics) — never a forced
@@ -659,8 +683,14 @@ class DownloadSkill:
             ), "manual_review_file_selection", None
 
         try:
-            kept, llm_discarded, llm_note, warn_flag = self._llm_select_files(
-                acc, candidates, rec, sm, download_gsms=download_gsms)
+            if self._spec_selection_enabled():
+                (kept, llm_discarded, llm_note, warn_flag
+                 ) = self._llm_select_files(
+                    acc, candidates, rec, sm, download_gsms=download_gsms)
+            else:
+                kept, llm_discarded, llm_note = self._llm_select_files_legacy(
+                    acc, candidates, rec, sm, download_gsms=download_gsms)
+                warn_flag = None
         except Exception as exc:
             logger.warning(f"geo-download {acc}: LLM file-selection failed ({exc}) → keep all non-junk")
             return candidates, junk, (
@@ -731,6 +761,84 @@ class DownloadSkill:
         return kept, junk
 
     # -------- LLM sample-type-aware selection --------------------------- #
+
+    def _llm_select_files_legacy(self, acc: str, candidates: List[Dict[str, Any]],
+                                 rec: Dict[str, Any], sm: Optional[pd.DataFrame],
+                                 download_gsms: Optional[List[str]] = None,
+                                 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], str]:
+        """
+        LEGACY selection (switch OFF, the default): sample-type-only judgment with
+        the pre-⑥ hardcoded prompt. Restored verbatim from b56367c so switch-OFF
+        reproduces the old production behavior byte-for-byte (head=8, no
+        platform/technology context, single invoke, no retry, data_form carries
+        the sample_type label). Do NOT modernize; new work goes in
+        _llm_select_files.
+
+        Returns (kept, discarded, note). Raises on parse/error (caller falls back).
+        """
+        target_summary = self._target_sample_summary(sm, download_gsms=download_gsms)
+
+        file_blocks = []
+        name_to_result: Dict[str, Dict[str, Any]] = {}
+        for r in candidates:
+            name = (r.get("local_path") or "").split("/")[-1]
+            name_to_result[name] = r
+            head = _read_head_text(r.get("local_path"), max_lines=8)
+            file_blocks.append(f"--- FILE: {name} ---\n{head}")
+        files_text = "\n\n".join(file_blocks)
+
+        user_msg = (
+            f"=== USER REQUEST ===\n"
+            f"raw query: {rec.get('raw_query') or '(not recorded)'}\n"
+            f"requested sample type: {rec.get('sample_type') or '(unspecified)'}\n"
+            f"cancer: {rec.get('cancer_type') or '(unspecified)'}\n\n"
+            f"=== DATASET ===\n"
+            f"accession: {acc}\n"
+            f"title: {(rec.get('title') or '')[:200]}\n"
+            f"data type: {rec.get('data_type') or 'unknown'}\n\n"
+            f"=== TARGET SAMPLES (already selected for this query) ===\n"
+            f"{target_summary}\n\n"
+            f"=== CANDIDATE SUPPLEMENTARY FILES (head of each) ===\n"
+            f"{files_text}\n"
+        )
+
+        resp = self.llm.invoke([
+            SystemMessage(content=_FILE_SELECTION_SYSTEM_PROMPT_LEGACY),
+            HumanMessage(content=user_msg),
+        ])
+        raw = resp.content if isinstance(resp.content, str) else str(resp.content)
+        verdict = _safe_json(raw)
+        files_verdict = verdict.get("files") or []
+        keep_set = {
+            str(f.get("name", "")).strip(): f for f in files_verdict
+            if isinstance(f, dict)
+        }
+
+        kept: List[Dict[str, Any]] = []
+        discarded: List[Dict[str, Any]] = []
+        for name, r in name_to_result.items():
+            v = keep_set.get(name)
+            local_path = r.get("local_path")
+            if v and bool(v.get("keep")):
+                r["data_form"] = v.get("sample_type") or v.get("data_form") or "selected"
+                kept.append(r)
+                logger.info(f"geo-download {acc}: LLM keep {name} "
+                            f"({v.get('sample_type', '')}: {v.get('reason', '')})")
+            else:
+                # Classify only — DO NOT delete here. The caller commits deletion only
+                # after the keep-none safety check passes (else we'd lose data on a
+                # bad LLM response that we then revert).
+                reason = (v or {}).get("reason", "not selected by LLM")
+                stype = (v or {}).get("sample_type", "")
+                discarded.append({"name": name, "local_path": local_path,
+                                  "sample_type": stype, "reason": reason,
+                                  "md5": _md5_file(local_path), "source_url": r.get("url")})
+                logger.info(f"geo-download {acc}: LLM discard {name} ({stype}: {reason})")
+
+        reasoning = (verdict.get("reasoning") or "").replace("\n", " ")[:200]
+        note = (f"LLM selected {len(kept)}/{len(candidates)} file(s)"
+                + (f": {reasoning}" if reasoning else ""))
+        return kept, discarded, note
 
     def _llm_select_files(self, acc: str, candidates: List[Dict[str, Any]],
                           rec: Dict[str, Any], sm: Optional[pd.DataFrame],
@@ -1088,6 +1196,43 @@ def _safe_json(raw: str) -> Dict[str, Any]:
             return json.loads(raw[start:end + 1])
         raise
 
+
+# LEGACY prompt — the pre-⑥ hardcoded criteria (sample-type selection only).
+# Kept verbatim (from b56367c) so the switch-OFF path reproduces the old
+# production behavior byte-for-byte. Do NOT edit; new criteria live in SPEC.md.
+_FILE_SELECTION_SYSTEM_PROMPT_LEGACY = """\
+You are a bioinformatics curator selecting which GEO supplementary file(s) to KEEP
+for a DNA-methylation analysis.
+
+For each candidate file you are given its decompressed head (header row + first data
+rows). Decide KEEP vs DROP based on whether the file's COLUMNS are samples of the
+type the user requested (e.g. the query wants plasma/cfDNA → keep plasma-sample
+files; DROP tissue-only files even if they are valid methylation matrices).
+
+Reason from:
+- the requested sample type and the TARGET SAMPLES summary (the sample set already
+  selected for this query — its source_name/group tells you what specimen type is
+  wanted);
+- each file's header: column names often encode submitter codes whose prefix/label
+  indicates specimen (e.g. tissue tumor Tcrc/Tnm vs plasma Pcrc/Pn); use the study
+  design + sample counts to map columns → specimen type;
+- value shape only to reject obvious non-data (a marker list, a differential p-value
+  table with no sample columns). Do NOT reject a file just because values are integer
+  read-counts or a non-0–1 methylation score — those are valid methylation matrices.
+
+If multiple files together comprise the requested cohort (e.g. one file per
+processing batch), KEEP all of them. If unsure whether a file matches, prefer KEEP.
+
+Output ONLY valid JSON:
+{
+  "reasoning": "<one or two sentences>",
+  "files": [
+    {"name": "<exact filename>", "keep": true|false,
+     "sample_type": "plasma|tissue|wbc|cell_line|mixed|unknown",
+     "reason": "<short reason>"}
+  ]
+}
+"""
 
 # System prompt for Tier-2/3 file selection: sample-type match AND SPEC Phase-2
 # file-type usability in ONE call. Criteria text is sliced verbatim from the

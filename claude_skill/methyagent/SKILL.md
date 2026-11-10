@@ -36,7 +36,7 @@ LLM 判定 → 注册 → 异步下载），提交后立即返回 task_id。**�
   `sample_metadata.csv` 是样本级标注表。
 - TCGA 数据走设计信任（direct download 判定），组织类查询自动触发 GDC 直查。
 
-## 工具速查（13 个）
+## 工具速查（14 个）
 
 | 场景 | 工具 |
 |---|---|
@@ -45,6 +45,7 @@ LLM 判定 → 注册 → 异步下载），提交后立即返回 task_id。**�
 | 跟踪 | `get_task_status` / `get_task_result` / `cancel_task` |
 | 审批 | `list_awaiting_approval` / `approve_dataset` / `reject_dataset` |
 | 数据 | `list_datasets` / `get_dataset` / `decode_sample_titles` |
+| 运维 | `llm_file_selection`（查询/切换下载文件选择模式）|
 | 其他 | `health` |
 
 详细字段参考、语义与坑、REST 等价端点：仓库 `docs/mcp_usage_guide.md`。

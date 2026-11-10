@@ -12,6 +12,9 @@ Endpoints:
     GET  /review                        List pending_review datasets
     POST /review/{accession}/approve    Approve a pending dataset
     POST /review/{accession}/reject     Reject a pending dataset
+    GET  /settings/llm-file-selection   Effective download file-selection mode
+    PUT  /settings/llm-file-selection   Toggle it at runtime (registry setting;
+                                        overrides settings.yaml default)
     GET  /health                        Agent heartbeat + registry stats
 
 Environment variables:
@@ -62,6 +65,8 @@ from api.models import (  # noqa: E402
     ApprovalRequest,
     ApprovalResponse,
     DecodeTitlesRequest,
+    FileSelectionSettingRequest,
+    FileSelectionSettingResponse,
 )
 
 # ---------------------------------------------------------------------------
@@ -725,6 +730,61 @@ async def cancel_task(task_id: str):
     else:
         message = "Task could not be cancelled (it may have just finished)."
     return CancelTaskResponse(task_id=task_id, cancelled=cancelled, message=message)
+
+
+_CONFIG_FILE_SELECTION_DEFAULT: Optional[bool] = None
+
+
+def _config_file_selection_default() -> bool:
+    """settings.yaml download.llm_file_selection (default False). Cached."""
+    global _CONFIG_FILE_SELECTION_DEFAULT
+    if _CONFIG_FILE_SELECTION_DEFAULT is None:
+        val = False
+        try:
+            cfg_path = Path(__file__).parent.parent / "config" / "settings.yaml"
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                val = bool(yaml.safe_load(f).get("download", {})
+                           .get("llm_file_selection", False))
+        except Exception as exc:
+            logger.warning(f"settings.yaml unreadable ({exc}); "
+                           f"llm_file_selection defaults to False")
+        _CONFIG_FILE_SELECTION_DEFAULT = val
+    return _CONFIG_FILE_SELECTION_DEFAULT
+
+
+@app.get("/settings/llm-file-selection", response_model=FileSelectionSettingResponse)
+async def get_llm_file_selection():
+    """
+    Effective Tier-2/3 file-selection mode: registry runtime value (set via
+    PUT / this endpoint or the MCP tool) overrides the settings.yaml default.
+    Workers read this per dataset — changes take effect without a restart.
+    """
+    registry = get_registry()
+    v = registry.get_setting("download_llm_file_selection")
+    if v is not None:
+        return FileSelectionSettingResponse(
+            enabled=v.strip().lower() in ("1", "true", "yes", "on"), source="registry")
+    return FileSelectionSettingResponse(
+        enabled=_config_file_selection_default(), source="config")
+
+
+@app.put("/settings/llm-file-selection", response_model=FileSelectionSettingResponse)
+async def set_llm_file_selection(body: FileSelectionSettingRequest):
+    """
+    Toggle the Tier-2/3 file-selection mode at runtime (no worker restart;
+    applies from the next dataset onward).
+
+    enabled=true  → SPEC Phase-2 file-type judgment per
+                    skills/geo_download/SPEC.md「Phase 2 文件类型判断」
+                    (value_semantics / merge_scope / data_form annotations).
+    enabled=false → legacy hardcoded sample-type-only prompt (pre-⑥ behavior).
+
+    Clearing the runtime value (falling back to the config default) is not
+    exposed via REST — set it explicitly to the desired value instead.
+    """
+    registry = get_registry()
+    registry.set_setting("download_llm_file_selection", "1" if body.enabled else "0")
+    return FileSelectionSettingResponse(enabled=body.enabled, source="registry")
 
 
 @app.get("/health", response_model=HealthResponse)
