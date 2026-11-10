@@ -15,6 +15,8 @@ API keys: loaded from `$METHY_ENV_FILE` if set, otherwise `<repo>/.env`. Example
 | `run_arms.sh` | Older two-arm run (review on vs `--no-review`, separate extractions). Confounded by run-to-run nondeterminism; kept for reference |
 | `compare_arms.py` | Aggregates the two arms on shared PMIDs |
 | `inspect_sample_size.py` | Confirms ungrounded `sample_size` values are absent from the source text (raw and comma-formatted) |
+| `build_reviewer_base.py` | Builds `data/eval/reviewer_base.json` for `eval_reviewer.py` from the unreviewed drafts + full source text of the no-review run |
+| `run_reviewer_eval.sh` | Env-loading wrapper for `scripts/eval_reviewer.py --base data/eval/reviewer_base.json` (e.g. `--n-per-type 10`) |
 
 ## Results (Nov 2026, 3 queries × top-15, 45 papers, full text)
 
@@ -23,7 +25,32 @@ API keys: loaded from `$METHY_ENV_FILE` if set, otherwise `<repo>/.env`. Example
 - Reviewer (`tools/extraction_reviewer.py`): changed 1 of 173 values, caught 0 of 27 ungrounded ones.
   The apparent effect in the two-arm run was nondeterminism, not the reviewer.
 
+## Reviewer comparison: planted errors (Nov 2026, glm-5.2, 39 base papers, 10 per type)
+
+`run_reviewer_eval.sh --n-per-type 10` → baseline = `tools/extraction_reviewer.py`, checklist = `tools/checklist_reviewer.py`.
+
+| Planted error | Baseline | Checklist |
+|---|---|---|
+| auc_fabricated | removed 10/10, right flag 0/10 | removed 10/10, right check 10/10 |
+| auc_mislabeled | removed 10/10, right flag 0/10 | removed 10/10, right check 10/10 |
+| sample_type_swap | flagged 2/10 | flagged 10/10 |
+| reference_accession | removed 10/10, flagged 10/10 | removed 10/10, flagged 10/10 |
+| clean (10 untouched) | 0 flags | 4 flagged (see below) |
+| latency | 13 s/record | 31 s/record |
+
+Notes:
+- `eval_reviewer.py` scores recall by flags only (baseline 0.30 vs checklist 1.00). That understates the
+  baseline, which often silently nulls the planted value; the "removed" column scores the outcome instead.
+- The checklist's clean-arm "false positives" were cross-checked against the grounding grades: 3 of 4 are
+  **real** ungrounded sample sizes (derived sums such as 34+33=67 not stated in the text). Of the 10 clean
+  papers, 4 had an ungrounded sample size; checklist flagged 3, baseline 0.
+- 1 true false alarm (PMID 37918207): the string-match backstop overrode the model's PASS and nulled AUCs
+  stored as a composite string ("0.937 (EC), 0.968 (GC), ...") whose numbers do appear in the text.
+- No planted sample-size mutation exists yet, although that is the dominant real-world failure.
+
 ## Next steps
-- Run `scripts/eval_reviewer.py` (planted-error meta-eval) on `tools/checklist_reviewer.py` vs the current reviewer.
+- Add a `sample_size_derived` mutation (replace a stated count with a subgroup sum) to `eval_reviewer.py`.
+- Make the C1 backstop parse numbers out of composite AUC strings before declaring them absent.
+- Re-run both evals, then wire `review_by_checklist` into the pipeline behind a config flag.
 - Move presence checks (sample size stated? AUC stated?) into deterministic code; reserve the LLM for judgment calls.
 - Require a verbatim evidence quote (and shown arithmetic for derived counts) per extracted value.
