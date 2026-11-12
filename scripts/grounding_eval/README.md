@@ -18,14 +18,27 @@ API keys: loaded from `$METHY_ENV_FILE` if set, otherwise `<repo>/.env`. Example
 | `build_reviewer_base.py` | Builds `data/eval/reviewer_base.json` for `eval_reviewer.py` from the unreviewed drafts + full source text of the no-review run |
 | `run_reviewer_eval.sh` | Env-loading wrapper for `scripts/eval_reviewer.py --base data/eval/reviewer_base.json` (e.g. `--n-per-type 10`) |
 
-## Results (Nov 2026, 3 queries × top-15, 45 papers, full text)
+## Results (Nov 2026, 3 queries × top-15 = 45 records, 39 unique papers)
+
+How the papers were chosen and graded:
+- **No curated set and no gold labels.** The 45 records are whatever the agent's own PubMed search returned
+  (top 15 after the stage-1 filter) for three queries. 6 PMIDs appear under two queries, so 39 unique papers.
+  1. `结直肠癌血浆cfDNA甲基化，需要健康对照` (CRC, plasma cfDNA, healthy controls)
+  2. `肝细胞癌血浆cfDNA甲基化数据，要有健康人对照` (HCC, plasma cfDNA, healthy controls)
+  3. `结直肠癌组织和癌旁组织的DNA甲基化数据` (CRC, tumour vs adjacent tissue)
+- **Grading is deterministic string/regex matching** against the text the extractor was shown (no LLM judge).
+  "Grounded" means the value appears in that text (for AUC: near an AUC term). It does not mean the value is
+  correct, and it says nothing about what the extractor missed.
+- **Source text:** 31 records used PMC full text, 14 fell back to the abstract (11 unique papers). The fallback
+  is availability, not a key or rate-limit problem: an `elink pubmed_pmc` check shows 0 of those 11 are in PMC,
+  while all 28 unique full-text papers are.
 
 - Overall grounding 85.8% (169/197) before review, 85.7% after.
 - By field: dataset_ids 100%, sample_type 100%, markers 97%, auc ~76%, **sample_size 50%** (48.9 / 51.1 / 50.0 across three runs).
 - Reviewer (`tools/extraction_reviewer.py`): changed 1 of 173 values, caught 0 of 27 ungrounded ones.
   The apparent effect in the two-arm run was nondeterminism, not the reviewer.
 
-## Reviewer comparison: planted errors (Nov 2026, glm-5.2, 39 base papers, 10 per type)
+## Reviewer comparison: planted errors (Nov 2026, glm-5.2, 39 base papers = the unique papers above, 10 per type)
 
 `run_reviewer_eval.sh --n-per-type 10` → baseline = `tools/extraction_reviewer.py`, checklist = `tools/checklist_reviewer.py`.
 
@@ -49,6 +62,7 @@ Notes:
 - No planted sample-size mutation exists yet, although that is the dominant real-world failure.
 
 ## Next steps
+- Widen the sample: more queries and cancer types, and a small hand-verified set to measure correctness and misses.
 - Add a `sample_size_derived` mutation (replace a stated count with a subgroup sum) to `eval_reviewer.py`.
 - Make the C1 backstop parse numbers out of composite AUC strings before declaring them absent.
 - Re-run both evals, then wire `review_by_checklist` into the pipeline behind a config flag.
