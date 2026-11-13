@@ -19,11 +19,14 @@ Output (state): download_results, download_log
 """
 from __future__ import annotations
 
+import csv
 import hashlib
 import gzip
 import json
 import os
 import re
+import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -49,6 +52,7 @@ from skills.geo_download.verify import (
     quarantine_files,
 )
 from skills.geo_filter.file_inspect import inspect_matrix_head
+from skills.geo_filter.skill import _extract_usage  # cross-skill reuse (path B precedent)
 from tools.download_tools import DownloadEngine, build_geo_download_tasks
 from tools.geo_tools import GEOClient, GEOPageBlockedError
 from utils.llm_factory import get_llm
@@ -137,6 +141,17 @@ class DownloadSkill:
         # runtime value (set via the REST/MCP toggle) overrides this default —
         # see _spec_selection_enabled().
         self.llm_file_selection = bool(dl.get("llm_file_selection", False))
+        # Per-call token accounting for the selection LLM (mirrors the filter's
+        # query_logs CSV; same logging.query_csv gate). One append row per
+        # selection invoke — legacy / spec / spec_retry — at
+        # {output_dir}/file_selection_logs/selections.csv. Attributes are
+        # deliberately absent when __init__ is bypassed (tests) → helper then
+        # only logger.info's, never writes files.
+        self._selection_log_path = (Path(dl["output_dir"]) / "file_selection_logs"
+                                    / "selections.csv")
+        self._selection_csv_enabled = bool(
+            (config.get("logging") or {}).get("query_csv", True))
+        self._selection_log_lock = threading.Lock()
         self.downloader = DownloadEngine(
             output_dir=dl["output_dir"],
             max_concurrent=dl["max_concurrent"],
@@ -646,6 +661,44 @@ class DownloadSkill:
                              f"using config default for file selection")
         return bool(getattr(self, "llm_file_selection", False))
 
+    def _log_selection_usage(self, acc: str, mode: str, resp: Any,
+                             n_candidates: int, n_keep: int, n_drop: int) -> None:
+        """Token accounting for one selection LLM invoke (filter-style).
+
+        logger.info always; CSV row only when __init__ configured the path and
+        logging.query_csv is on. Never raises — logging is best-effort.
+        """
+        try:
+            usage = _extract_usage(resp)
+            logger.info(
+                f"geo-download {acc}: file-selection usage mode={mode} "
+                f"prompt={usage['prompt_tokens']} "
+                f"completion={usage['completion_tokens']} "
+                f"total={usage['total_tokens']} cached={usage['cached_tokens']} "
+                f"model={usage['api_model'] or '-'}")
+            path = getattr(self, "_selection_log_path", None)
+            if not path or not getattr(self, "_selection_csv_enabled", True):
+                return
+            with self._selection_log_lock:
+                new_file = not path.exists()
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with open(path, "a", newline="", encoding="utf-8-sig") as f:
+                    w = csv.writer(f)
+                    if new_file:
+                        w.writerow([
+                            "timestamp", "accession", "mode", "n_candidates",
+                            "n_keep", "n_drop", "prompt_tokens",
+                            "completion_tokens", "total_tokens", "cached_tokens",
+                            "api_model"])
+                    w.writerow([
+                        datetime.now(timezone.utc).isoformat()[:19], acc, mode,
+                        n_candidates, n_keep, n_drop,
+                        usage["prompt_tokens"], usage["completion_tokens"],
+                        usage["total_tokens"], usage["cached_tokens"],
+                        usage["api_model"]])
+        except Exception as exc:
+            logger.warning(f"geo-download {acc}: selection-usage log failed: {exc}")
+
     def _select_relevant_files(
         self, acc: str, done_results: List[Dict[str, Any]], rec: Dict[str, Any],
         sm: Optional[pd.DataFrame], download_gsms: Optional[List[str]] = None,
@@ -807,7 +860,12 @@ class DownloadSkill:
             HumanMessage(content=user_msg),
         ])
         raw = resp.content if isinstance(resp.content, str) else str(resp.content)
-        verdict = _safe_json(raw)
+        try:
+            verdict = _safe_json(raw)
+        except Exception:
+            # Token accounting even for a dead call (usage precedes parsing).
+            self._log_selection_usage(acc, "legacy", resp, len(candidates), 0, 0)
+            raise
         files_verdict = verdict.get("files") or []
         keep_set = {
             str(f.get("name", "")).strip(): f for f in files_verdict
@@ -838,6 +896,8 @@ class DownloadSkill:
         reasoning = (verdict.get("reasoning") or "").replace("\n", " ")[:200]
         note = (f"LLM selected {len(kept)}/{len(candidates)} file(s)"
                 + (f": {reasoning}" if reasoning else ""))
+        self._log_selection_usage(acc, "legacy", resp, len(candidates),
+                                  len(kept), len(discarded))
         return kept, discarded, note
 
     def _llm_select_files(self, acc: str, candidates: List[Dict[str, Any]],
@@ -874,6 +934,7 @@ class DownloadSkill:
             HumanMessage(content=user_msg),
         ])
         raw = resp.content if isinstance(resp.content, str) else str(resp.content)
+        used_mode, used_resp = "spec", resp
         try:
             verdict = _safe_json(raw)
         except Exception:
@@ -882,14 +943,21 @@ class DownloadSkill:
             # failure raises and the caller's conservative fallback applies.
             logger.warning(f"geo-download {acc}: selection JSON parse failed "
                            f"→ one compact retry")
+            self._log_selection_usage(acc, "spec", resp, len(candidates), 0, 0)
             compact = _compact_file_selection_user_msg(acc, candidates, rec,
                                                        target_summary)
-            resp = self.llm.invoke([
+            resp2 = self.llm.invoke([
                 SystemMessage(content=_FILE_SELECTION_SYSTEM_PROMPT),
                 HumanMessage(content=compact),
             ])
-            raw = resp.content if isinstance(resp.content, str) else str(resp.content)
-            verdict = _safe_json(raw)
+            raw2 = resp2.content if isinstance(resp2.content, str) else str(resp2.content)
+            used_mode, used_resp = "spec_retry", resp2
+            try:
+                verdict = _safe_json(raw2)
+            except Exception:
+                self._log_selection_usage(acc, "spec_retry", resp2,
+                                          len(candidates), 0, 0)
+                raise
 
         files_verdict = verdict.get("files") or []
         keep_set = {
@@ -933,6 +1001,8 @@ class DownloadSkill:
         reasoning = (verdict.get("reasoning") or "").replace("\n", " ")[:200]
         note = (f"LLM selected {len(kept)}/{len(candidates)} file(s)"
                 + (f": {reasoning}" if reasoning else ""))
+        self._log_selection_usage(acc, used_mode, used_resp, len(candidates),
+                                  len(kept), len(discarded))
 
         # Report-only: kept files spanning conflicting value semantics must not be
         # merged downstream (SPEC: within_assay_only must not mix with β/M/比例).

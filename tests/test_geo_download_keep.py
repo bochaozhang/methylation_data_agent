@@ -506,3 +506,101 @@ class TestTargetSampleSummary(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestSelectionUsageLogging(unittest.TestCase):
+    """Filter-style token accounting: one CSV row per selection invoke."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = self.tmp.name
+        self.csv_path = Path(self.dir) / "fs_logs" / "selections.csv"
+        self.plasma = _write_gz(
+            os.path.join(self.dir, "sumP_plasma.txt.gz"),
+            "ID_REF\tPcrc90\tPn43\nr1\t0.2\t0.1\nr2\t0.3\t0.2\n")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    class _UsageResp:
+        def __init__(self, content, prompt, completion):
+            self.content = content
+            self.usage_metadata = {
+                "input_tokens": prompt, "output_tokens": completion,
+                "total_tokens": prompt + completion}
+
+    def _skill(self, llm, flag, with_csv=True, enabled=True):
+        skill = DownloadSkill.__new__(DownloadSkill)
+        skill.llm = llm
+        skill.llm_file_selection = flag
+        skill.registry = None
+        if with_csv:
+            skill._selection_log_path = self.csv_path
+            skill._selection_csv_enabled = enabled
+            import threading
+            skill._selection_log_lock = threading.Lock()
+        return skill
+
+    def _rows(self):
+        import csv as csvmod
+        with open(self.csv_path, encoding="utf-8-sig") as f:
+            return list(csvmod.DictReader(f))
+
+    def test_legacy_row_written(self):
+        llm = FakeLLM({"reasoning": "ok", "files": [
+            {"name": "sumP_plasma.txt.gz", "keep": True,
+             "sample_type": "plasma", "reason": "plasma"}]})
+        llm.invoke = lambda msgs: self._UsageResp(
+            json.dumps(llm._payload), 3210, 210)
+        skill = self._skill(llm, flag=False)
+        kept, _, note, forced, warn = skill._select_relevant_files(
+            "GSETEST", [_done_result(self.plasma)], {"sample_type": "cfdna"}, None)
+        rows = self._rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["mode"], "legacy")
+        self.assertEqual(rows[0]["prompt_tokens"], "3210")
+        self.assertEqual(rows[0]["completion_tokens"], "210")
+        self.assertEqual(rows[0]["n_keep"], "1")
+        self.assertEqual(rows[0]["n_drop"], "0")
+
+    def test_spec_retry_writes_two_rows(self):
+        import threading
+
+        good = json.dumps({"reasoning": "plasma", "files": [
+            {"name": "sumP_plasma.txt.gz", "keep": True, "sample_type": "plasma",
+             "data_form": "region_matrix", "reason": "plasma"}]})
+        outputs = [self._UsageResp("garbage {{{", 900, 5),
+                   self._UsageResp(good, 1500, 300)]
+
+        class RetryLLM:
+            def invoke(self, msgs):
+                return outputs.pop(0)
+
+        skill = self._skill(RetryLLM(), flag=True)
+        kept, _, note, forced, warn = skill._select_relevant_files(
+            "GSETEST", [_done_result(self.plasma)], {"sample_type": "cfdna"}, None)
+        rows = self._rows()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual([r["mode"] for r in rows], ["spec", "spec_retry"])
+        self.assertEqual(rows[0]["prompt_tokens"], "900")   # dead first call
+        self.assertEqual(rows[0]["n_keep"], "0")
+        self.assertEqual(rows[1]["prompt_tokens"], "1500")  # rescued retry
+        self.assertEqual(rows[1]["n_keep"], "1")
+
+    def test_bypassed_init_writes_no_file(self):
+        llm = FakeLLM({"reasoning": "ok", "files": [
+            {"name": "sumP_plasma.txt.gz", "keep": True,
+             "sample_type": "plasma", "reason": "plasma"}]})
+        skill = self._skill(llm, flag=False, with_csv=False)
+        skill._select_relevant_files(
+            "GSETEST", [_done_result(self.plasma)], {"sample_type": "cfdna"}, None)
+        self.assertFalse(self.csv_path.exists())
+
+    def test_csv_gate_off_writes_no_file(self):
+        llm = FakeLLM({"reasoning": "ok", "files": [
+            {"name": "sumP_plasma.txt.gz", "keep": True,
+             "sample_type": "plasma", "reason": "plasma"}]})
+        skill = self._skill(llm, flag=False, enabled=False)
+        skill._select_relevant_files(
+            "GSETEST", [_done_result(self.plasma)], {"sample_type": "cfdna"}, None)
+        self.assertFalse(self.csv_path.exists())
